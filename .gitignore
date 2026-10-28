@@ -1,25 +1,5 @@
-# Unreal generated data and build output
-# Share compiled binaries; exclude debugging symbols.
-*.pdb
-Intermediate/
-Saved/
-DerivedDataCache/
-Packaged/
-.vs/
-.vscode/
-*.sln
-*.suo
-*.opensdf
-*.sdf
-*.VC.db
-*.VC.opendb
-Build/**/FileOpenOrder/
-# Local tooling and credentials
-__pycache__/
-*.pyc
-.env
-.env.*
-!.env.example
-.codex/
-.agents/
-.aws/
+# Only accept new files under Content during level/asset collaboration.
+/*
+!/Content/
+!/.gitignore
+!/.gitattributes
