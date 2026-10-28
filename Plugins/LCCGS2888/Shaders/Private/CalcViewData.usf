@@ -2640,6 +2640,28 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	float3 viewDirForLighting = normalize(CameraPosition - worldPos.xyz);
 	float proxyNormalConfidence = 0.0;
 	float3 lightingNormal = SelectLightingNormal(rotation, scale, localToWorldRot, viewDirForLighting, localPos, proxyNormalConfidence);
+	// J02 restoration: the surveyed tiled annex of jg_g_021 only. This asset
+	// signature and local-space envelope exclude neighboring thatch and timber.
+	// Keep original covariance/silhouette and source SH data unchanged.
+	float j02RoofMask = 0.0;
+	if (SplatCount == 1653047u && localPos.x > -3050.0 && localPos.x < -1795.0 &&
+		localPos.y > 280.0 && localPos.y < 2250.0)
+	{
+		j02RoofMask = smoothstep(265.0, 288.0, localPos.z);
+		float roofLuma = SceneLinearLuminance(baseLinear);
+		float maintainedLuma = 0.018 + 0.64 * roofLuma;
+		float3 maintainedTile = maintainedLuma * float3(0.91, 0.98, 1.06);
+		baseLinear = lerp(baseLinear, maintainedTile, j02RoofMask * 0.96);
+		float roofU = localPos.x * 0.97698 + localPos.y * 0.21335;
+		float roofV = -localPos.x * 0.21335 + localPos.y * 0.97698;
+		float3 roofSlope = localPos.y < 1100.0 ?
+			float3(-0.21335, 0.97698, 0.0) * clamp((roofV - 1240.0) * 0.004, -0.70, 0.70) :
+			float3(0.97698, 0.21335, 0.0) * clamp((roofU + 2300.0) * 0.005, -0.85, 0.85);
+		float3 roofAxis = SelectRawSplatAxisNormal(rotation, scale, localToWorldRot);
+		if (roofAxis.z < 0.0) roofAxis = -roofAxis;
+		float3 roofNormal = normalize(lerp(normalize(roofSlope + float3(0,0,1)), roofAxis, 0.30));
+		lightingNormal = normalize(lerp(lightingNormal, roofNormal, j02RoofMask));
+	}
 	// Reduce proxy influence on strongly green foliage while preserving the cache fallback.
 	float baseLumaForNormal = max(SceneLinearLuminance(baseLinear), 0.02);
 	float foliageMaskForNormal = saturate((baseLinear.g - max(baseLinear.r, baseLinear.b)) / baseLumaForNormal);
@@ -3011,6 +3033,15 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	// Captured proxy shadow visibility is therefore applied only to DirectLinear.
 	float3 baseIndirectLinear = ComputeRelitIndirectBase(
 		baseLinear, approximateAlbedo, lightingNormal, postLightMask);
+	if (j02RoofMask > 0.0)
+	{
+		float3 roofLightDirection, roofLightTint;
+		float roofLightWeight;
+		GetStrongestDirectionalState(roofLightDirection, roofLightTint, roofLightWeight);
+		float roofFacing = saturate(dot(lightingNormal, roofLightDirection));
+		float roofDay = saturate(roofLightWeight) * smoothstep(-0.02, 0.15, roofLightDirection.z);
+		baseIndirectLinear *= lerp(1.0, 0.74 + 0.48 * roofFacing, j02RoofMask * roofDay);
+	}
 	float3 directLinear = ComputeBoundedDirectionalLightContribution(
 		approximateAlbedo, lightingNormal, postLightMask);
 	directLinear += ComputeLocalLightContribution(
