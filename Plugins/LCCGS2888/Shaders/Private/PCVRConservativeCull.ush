@@ -1,0 +1,49 @@
+// Conservative geometry only: final coverage, color, fog and depth equations stay unchanged.
+#pragma once
+bool GSBoxContainsPoint(float3 P,float4 Center,float4 X,float4 Y,float4 Z)
+{
+ float3 D=P-Center.xyz;
+ // Strict interior with a world-coordinate error margin. Boundary cases stay on the old path.
+ float guard=max(.1,1e-5*max(max(abs(P.x),abs(P.y)),abs(P.z)));
+ return all(isfinite(P)) && abs(dot(D,X.xyz))+guard<X.w && abs(dot(D,Y.xyz))+guard<Y.w && abs(dot(D,Z.xyz))+guard<Z.w;
+}
+bool GSProjectedQuadInsideBox(float2 NDC,float2 Axis1,float2 Axis2,float3 TranslatedCenter,float3 PreTranslation,float4x4 ClipToWorld,float4 Center,float4 X,float4 Y,float4 Z)
+{
+ float3 C=TranslatedCenter-PreTranslation;
+ if(!all(isfinite(float4(Axis1,Axis2))) || !GSBoxContainsPoint(C,Center,X,Y,Z))return false;
+ float len2=dot(TranslatedCenter,TranslatedCenter);if(!isfinite(len2) || len2<1e-8)return false;
+ float3 normal=TranslatedCenter*rsqrt(len2);
+ [unroll] for(uint corner=0;corner<4;++corner)
+ {
+  float2 sign=float2((corner&1)!=0?1:-1,(corner&2)!=0?1:-1);
+  // Cover the complete untrimmed raster quad plus rounding padding.
+  float2 q=NDC+1.004*(sign.x*Axis1+sign.y*Axis2);
+  float4 nh=mul(float4(q,1,1),ClipToWorld),fh=mul(float4(q,.5,1),ClipToWorld);
+  if(!all(isfinite(nh)) || !all(isfinite(fh)) || abs(nh.w)<1e-6 || abs(fh.w)<1e-6 || nh.w*fh.w<=0)return false;
+  float3 n=nh.xyz/nh.w,ray=fh.xyz/fh.w-n;float l2=dot(ray,ray);
+  if(!isfinite(l2)||l2<1e-8)return false;ray*=rsqrt(l2);
+  float div=dot(ray,normal);if(div<=.001)return false;
+  float t=dot(C-n,normal)/div;if(!isfinite(t)||t<0)return false;
+  if(!GSBoxContainsPoint(n+t*ray,Center,X,Y,Z))return false;
+ }
+ return true;
+}
+float GSConservativeAlphaRadiusSq(float opacity,uint quality)
+{
+ if(!isfinite(opacity)||opacity<=0)return 1.001;
+ // Chords lie above exp(-k*x). Their inverse is an upper bound on the
+ // radius at which the unchanged alpha reaches 1/255. No per-test log/exp.
+ const float e4[9]={1,0.6065306597,0.3678794412,0.2231301601,0.1353352832,0.08208499862,0.04978706837,0.03019738342,0.01831563889};
+ const float e5[9]={1,0.5253187803,0.275959821,0.1449668766,0.0761538228,0.04000503331,0.02101539531,0.01103978183,0.005799404727};
+ float edge=quality==3?e5[8]:e4[8];
+ float y=edge+(1-edge)*(1.0/255.0)/opacity;
+ if(!isfinite(y))return 1.001;
+ if(y>=1)return .002;
+ float upper=1;
+ [unroll] for(uint i=0;i<8;++i)
+ {
+  float a=quality==3?e5[i]:e4[i],b=quality==3?e5[i+1]:e4[i+1];
+  if(y<=a && y>=b)upper=(float(i)+(a-y)/(a-b))*.125;
+ }
+ return min(1.001,upper+.002);
+}

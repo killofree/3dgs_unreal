@@ -1,0 +1,22 @@
+{
+  "FileVersion": 3,
+  "Version": 5,
+  "VersionName": "0.5.0",
+  "FriendlyName": "VR 360 Skybox",
+  "Description": "PC VR mono panoramic video sky cube with horizon pitch alignment and optional world-height floor reference.",
+  "Category": "Media",
+  "CreatedBy": "OpenAI",
+  "CanContainContent": true,
+  "IsBetaVersion": true,
+  "Installed": false,
+  "SupportedTargetPlatforms": [
+    "Win64"
+  ],
+  "Modules": [
+    {
+      "Name": "VR360Skybox",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ]
+}

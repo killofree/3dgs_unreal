@@ -1,0 +1,14 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1",
+  "FriendlyName": "Scene Environment",
+  "Description": "General mesh weather and scene preview utilities, independent of Gaussian Splatting.",
+  "CanContainContent": true,
+  "EnabledByDefault": true,
+  "Plugins": [{ "Name": "Niagara", "Enabled": true }],
+  "Modules": [
+    { "Name": "SceneEnvironment", "Type": "Runtime", "LoadingPhase": "Default" },
+    { "Name": "SceneEnvironmentEditor", "Type": "Editor", "LoadingPhase": "Default" }
+  ]
+}

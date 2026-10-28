@@ -1,0 +1,353 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Public/Platform.ush"
+
+// v2751 continuous light-dependent proxy vertex visibility.
+// The splat<->proxy binding and geometry closure remain stable. Only this lightweight
+// vertex visibility field follows Directional Light changes. Unlike the v2750 path,
+// light-space UV is never quantized to a single integer texel before classification:
+// each PCF sample bilinearly blends four continuous blocker/receiver tests.
+Texture2D<float> ProxyLightDepth;
+Texture2D<float> ProxyReceiverLightDepth;
+StructuredBuffer<uint> ReceiverTriangleId;
+StructuredBuffer<float4> StableProxyVertexBuffer;
+StructuredBuffer<uint4> StableProxyTriangleBuffer;
+StructuredBuffer<float4> PreviousVertexProof;
+StructuredBuffer<uint> PreviousVertexOwner;
+RWStructuredBuffer<float4> OutVertexProof;
+RWStructuredBuffer<uint> OutVertexOwner;
+
+float4x4 LocalToWorld;
+float4 LightOriginWidth;
+float4 LightForwardEnabled;
+float4 LightRightRange;
+float4 LightUpSettings;
+uint VertexCount;
+uint PreviousFieldValid;
+float DepthBiasCm;
+uint StabilityDiagnosticMode;
+
+bool IsValidBlockerDepth(float blockerDepth)
+{
+    return blockerDepth > 0.01 && blockerDepth < 60000.0;
+}
+
+float EvaluateContinuousVisibility(
+    float blockerDepth,
+    float receiverDepth,
+    float biasCm,
+    float transitionCm)
+{
+    // Missing depth remains fail-open, matching the validated production path.
+    if (!IsValidBlockerDepth(blockerDepth))
+    {
+        return 1.0;
+    }
+
+    // Positive delta means the receiver is in front of / coincident with the blocker
+    // and therefore lit. Negative delta means a real blocker exists in front.
+    // v2750 returned exactly 0 or 1 here. The smooth transition keeps light motion
+    // continuous as either depth moves across the comparison threshold.
+    float depthDelta = blockerDepth + biasCm - receiverDepth;
+    // A proxy vertex sees its own surface in the combined depth texture. Coincident
+    // depth (including the positive self-rejection bias) must be exactly lit; only a
+    // genuinely closer surface may create a self-cast shadow on this receiver vertex.
+    return smoothstep(-transitionCm, 0.0, depthDelta);
+}
+
+float LoadContinuousVisibility(
+    int2 pixel,
+    uint2 dims,
+    float receiverDepth,
+    float biasCm,
+    float transitionCm)
+{
+    int2 clampedPixel = clamp(pixel, int2(0, 0), int2(dims) - int2(1, 1));
+    float blockerDepth = ProxyLightDepth.Load(int3(clampedPixel, 0)).r;
+    return EvaluateContinuousVisibility(blockerDepth, receiverDepth, biasCm, transitionCm);
+}
+
+float LoadDepthSafe(int2 pixel, uint2 dims, float fallbackDepth)
+{
+    int2 p = clamp(pixel, int2(0, 0), int2(dims) - int2(1, 1));
+    float d = ProxyLightDepth.Load(int3(p, 0)).r;
+    return IsValidBlockerDepth(d) ? d : fallbackDepth;
+}
+
+void LoadReceiverDepthInterval(
+    float2 uv,
+    uint2 dims,
+    float fallbackDepth,
+    out float intervalMin,
+    out float intervalMax)
+{
+    float2 texelPos = saturate(uv) * float2(dims) - 0.5;
+    int2 center = int2(floor(texelPos + 0.5));
+    intervalMin = fallbackDepth;
+    intervalMax = fallbackDepth;
+
+    // A 3x3 receiver-only interval represents the local proxy surface footprint.
+    // A vertex inside this interval is coincident with that surface, not blocked by
+    // it. A vertex materially behind the interval is a real proxy self-shadow.
+    [unroll]
+    for (int oy = -1; oy <= 1; ++oy)
+    {
+        [unroll]
+        for (int ox = -1; ox <= 1; ++ox)
+        {
+            int2 p = clamp(center + int2(ox, oy), int2(0, 0), int2(dims) - int2(1, 1));
+            float d = ProxyReceiverLightDepth.Load(int3(p, 0)).r;
+            if (IsValidBlockerDepth(d))
+            {
+                intervalMin = min(intervalMin, d);
+                intervalMax = max(intervalMax, d);
+            }
+        }
+    }
+}
+
+float ComputeDepthGradientBias(float2 uv, uint2 dims, float receiverDepth, float worldUnitsPerTexel)
+{
+    float2 texelPos = saturate(uv) * float2(dims) - 0.5;
+    int2 c = int2(floor(texelPos + 0.5));
+    float center = LoadDepthSafe(c, dims, receiverDepth);
+    float dl = LoadDepthSafe(c + int2(-1, 0), dims, center);
+    float dr = LoadDepthSafe(c + int2( 1, 0), dims, center);
+    float dd = LoadDepthSafe(c + int2(0, -1), dims, center);
+    float du = LoadDepthSafe(c + int2(0,  1), dims, center);
+    float depthGradient = max(abs(dr - dl), abs(du - dd)) * 0.5;
+    // Diagnostic 22 only: approximate receiver-plane/slope error from the local
+    // LightDepth gradient. Limit the extra self-rejection to 1.5 light texels so
+    // this test cannot hide a real blocker with an unbounded bias.
+    return clamp(depthGradient * 0.35, 0.0, worldUnitsPerTexel * 1.5);
+}
+
+float SampleBilinearContinuousVisibility(
+    float2 sampleUV,
+    uint2 dims,
+    float receiverDepth,
+    float biasCm,
+    float transitionCm)
+{
+    // Convert normalized UV to texel-center coordinates. Keeping the fractional
+    // component is the critical v2751 change: crossing a LightDepth texel boundary
+    // blends into the neighboring result instead of jumping to it.
+    float2 texelPos = saturate(sampleUV) * float2(dims) - 0.5;
+    int2 basePixel = int2(floor(texelPos));
+    float2 f = frac(texelPos);
+
+    float v00 = LoadContinuousVisibility(basePixel + int2(0, 0), dims, receiverDepth, biasCm, transitionCm);
+    float v10 = LoadContinuousVisibility(basePixel + int2(1, 0), dims, receiverDepth, biasCm, transitionCm);
+    float v01 = LoadContinuousVisibility(basePixel + int2(0, 1), dims, receiverDepth, biasCm, transitionCm);
+    float v11 = LoadContinuousVisibility(basePixel + int2(1, 1), dims, receiverDepth, biasCm, transitionCm);
+
+    float vx0 = lerp(v00, v10, f.x);
+    float vx1 = lerp(v01, v11, f.x);
+    return lerp(vx0, vx1, f.y);
+}
+
+// v2783 self-cast stability fix: classify receiver-only depth continuously at each
+// bilinear/PCF tap instead of collapsing a quantized 3x3 footprint to one max depth.
+// This keeps genuine proxy self-occlusion while removing the texel-membership jump
+// that could flip one welded vertex between lit/shadow as the light rotates slightly.
+float EvaluateOwnedReceiverVisibility(
+    float blockerDepth,
+    uint ownerTriangleId,
+    uint vertexId,
+    float receiverDepth,
+    float biasCm,
+    float transitionCm)
+{
+    if (!IsValidBlockerDepth(blockerDepth) || ownerTriangleId == 0xFFFFFFFFu)
+        return 1.0;
+    uint4 ownerTriangle = StableProxyTriangleBuffer[ownerTriangleId];
+    if (ownerTriangle.w != 0u &&
+        (ownerTriangle.x == vertexId || ownerTriangle.y == vertexId || ownerTriangle.z == vertexId))
+    {
+        return 1.0;
+    }
+    return EvaluateContinuousVisibility(blockerDepth, receiverDepth, biasCm, transitionCm);
+}
+
+bool TriangleOwnsVertex(uint triangleId, uint vertexId)
+{
+    if (triangleId == 0xFFFFFFFFu)
+        return false;
+    uint4 tri = StableProxyTriangleBuffer[triangleId];
+    return tri.w != 0u && (tri.x == vertexId || tri.y == vertexId || tri.z == vertexId);
+}
+
+float SampleBilinearReceiverSelfVisibility(
+    float2 sampleUV,
+    uint2 dims,
+    float receiverDepth,
+    float biasCm,
+    float transitionCm,
+    uint vertexId,
+    out float validCoverage)
+{
+    float2 texelPos = saturate(sampleUV) * float2(dims) - 0.5;
+    int2 basePixel = int2(floor(texelPos));
+    float2 f = frac(texelPos);
+
+    float4 weights = float4(
+        (1.0 - f.x) * (1.0 - f.y),
+        f.x * (1.0 - f.y),
+        (1.0 - f.x) * f.y,
+        f.x * f.y);
+    int2 p00 = clamp(basePixel + int2(0, 0), int2(0, 0), int2(dims) - 1);
+    int2 p10 = clamp(basePixel + int2(1, 0), int2(0, 0), int2(dims) - 1);
+    int2 p01 = clamp(basePixel + int2(0, 1), int2(0, 0), int2(dims) - 1);
+    int2 p11 = clamp(basePixel + int2(1, 1), int2(0, 0), int2(dims) - 1);
+    float4 depths = float4(
+        ProxyReceiverLightDepth.Load(int3(p00, 0)).r,
+        ProxyReceiverLightDepth.Load(int3(p10, 0)).r,
+        ProxyReceiverLightDepth.Load(int3(p01, 0)).r,
+        ProxyReceiverLightDepth.Load(int3(p11, 0)).r);
+    uint4 owners = uint4(
+        ReceiverTriangleId[p00.y * dims.x + p00.x],
+        ReceiverTriangleId[p10.y * dims.x + p10.x],
+        ReceiverTriangleId[p01.y * dims.x + p01.x],
+        ReceiverTriangleId[p11.y * dims.x + p11.x]);
+    float4 valid = float4(
+        IsValidBlockerDepth(depths.x) && owners.x != 0xFFFFFFFFu,
+        IsValidBlockerDepth(depths.y) && owners.y != 0xFFFFFFFFu,
+        IsValidBlockerDepth(depths.z) && owners.z != 0xFFFFFFFFu,
+        IsValidBlockerDepth(depths.w) && owners.w != 0xFFFFFFFFu);
+    float4 validWeights = weights * valid;
+    validCoverage = dot(validWeights, 1.0.xxxx);
+    if (validCoverage <= 1.0e-5)
+    {
+        return 1.0;
+    }
+    float4 visibility = float4(
+        EvaluateOwnedReceiverVisibility(depths.x, owners.x, vertexId, receiverDepth, biasCm, transitionCm),
+        EvaluateOwnedReceiverVisibility(depths.y, owners.y, vertexId, receiverDepth, biasCm, transitionCm),
+        EvaluateOwnedReceiverVisibility(depths.z, owners.z, vertexId, receiverDepth, biasCm, transitionCm),
+        EvaluateOwnedReceiverVisibility(depths.w, owners.w, vertexId, receiverDepth, biasCm, transitionCm));
+    return dot(visibility, validWeights) / validCoverage;
+}
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint vertexId = DTid.x;
+    if (vertexId >= VertexCount)
+        return;
+
+    float3 localP = StableProxyVertexBuffer[vertexId].xyz;
+    float3 worldP = mul(float4(localP, 1.0), LocalToWorld).xyz;
+
+    if (LightForwardEnabled.w < 0.0)
+    {
+        OutVertexProof[vertexId] = float4(1.0, 1.0, 0.0, -1.0);
+        OutVertexOwner[vertexId] = 0xFFFFFFFFu;
+        return;
+    }
+
+    float3 R = worldP - LightOriginWidth.xyz;
+    float widthCm = max(LightOriginWidth.w, 1.0);
+    float2 uv = float2(
+        0.5 + dot(R, LightRightRange.xyz) / widthCm,
+        0.5 - dot(R, LightUpSettings.xyz) / widthCm);
+    float receiverDepth = dot(R, LightForwardEnabled.xyz);
+
+    if (receiverDepth <= 0.0 || any(uv < 0.0) || any(uv > 1.0))
+    {
+        OutVertexProof[vertexId] = float4(1.0, 1.0, receiverDepth, -1.0);
+        OutVertexOwner[vertexId] = 0xFFFFFFFFu;
+        return;
+    }
+
+    uint width = 1u, height = 1u;
+    ProxyLightDepth.GetDimensions(width, height);
+    uint2 dims = max(uint2(width, height), uint2(1u, 1u));
+    float2 invDims = 1.0 / max(float2(dims), float2(1.0, 1.0));
+    float worldUnitsPerTexel = widthCm / max(float(dims.x), 1.0);
+
+    // Keep the proven self-rejection window, but make the actual blocker crossing
+    // continuous over roughly one LightDepth texel. This is spatial filtering only;
+    // no temporal history or camera-dependent interpolation is introduced.
+    float selfRejectCm = clamp(worldUnitsPerTexel * 0.36, 0.65, 8.0);
+    float slopeBiasCm = 0.0; // v2774: depth-gradient cause sweep retired from baseline.
+    float biasCm = max(max(DepthBiasCm, 0.0), selfRejectCm) + slopeBiasCm;
+    float transitionCm = clamp(worldUnitsPerTexel * 0.80, 0.75, 12.0);
+
+    // Self and external cast remain independent. The important change is that the
+    // receiver-only self-cast is now evaluated with the same continuous bilinear
+    // classification used by external cast. No integer-centered 3x3 max-depth value
+    // is allowed to control the whole welded vertex anymore.
+    float centerCoverage = 0.0;
+    float selfVisibility = SampleBilinearReceiverSelfVisibility(
+        uv, dims, receiverDepth, biasCm, transitionCm, vertexId, centerCoverage);
+    float externalVisibility = SampleBilinearContinuousVisibility(
+        uv, dims, receiverDepth, biasCm, transitionCm);
+    float centerVisibility = min(selfVisibility, externalVisibility);
+
+    // Production 3x3 PCF. Both self-cast and external-cast are recomputed per tap.
+    // Previously only external cast varied across the nine taps while one unstable
+    // selfVisibility value was copied to all of them, so PCF could not suppress a
+    // self-cast classification flip.
+    float pcfVisibilitySum = 0.0;
+    float pcfCoverageSum = 0.0;
+    [unroll]
+    for (int oy = -1; oy <= 1; ++oy)
+    {
+        [unroll]
+        for (int ox = -1; ox <= 1; ++ox)
+        {
+            float2 tapUV = uv + float2(float(ox), float(oy)) * invDims;
+            float tapCoverage = 0.0;
+            float tapSelfVisibility = SampleBilinearReceiverSelfVisibility(
+                tapUV, dims, receiverDepth, biasCm, transitionCm, vertexId, tapCoverage);
+            float tapExternalVisibility = SampleBilinearContinuousVisibility(
+                tapUV, dims, receiverDepth, biasCm, transitionCm);
+            pcfVisibilitySum += min(tapSelfVisibility, tapExternalVisibility) * tapCoverage;
+            pcfCoverageSum += tapCoverage;
+        }
+    }
+    float pcfVisibility = pcfCoverageSum > 1.0e-5
+        ? pcfVisibilitySum / pcfCoverageSum
+        : 1.0;
+
+    float2 centerTexelPos = saturate(uv) * float2(dims) - 0.5;
+    int2 centerPixel = clamp(int2(floor(centerTexelPos + 0.5)), int2(0, 0), int2(dims) - int2(1, 1));
+    float centerSelfDepth = ProxyReceiverLightDepth.Load(int3(centerPixel, 0)).r;
+    uint centerOwnerTriangleId = ReceiverTriangleId[centerPixel.y * dims.x + centerPixel.x];
+
+    // Raster coverage of thin/discontinuous receiver triangles changes while the
+    // directional light rotates. Do not let missing texels vote as lit. When the
+    // current footprint has weak receiver support, retain the last completed field;
+    // well-covered samples remain fully current-frame and therefore do not lag.
+    if (PreviousFieldValid != 0u)
+    {
+        float4 previousProof = PreviousVertexProof[vertexId];
+        float centerConfidence = smoothstep(0.35, 0.70, centerCoverage);
+        float pcfCoverage = saturate(pcfCoverageSum / 9.0);
+        float pcfConfidence = smoothstep(0.35, 0.70, pcfCoverage);
+        centerVisibility = lerp(saturate(previousProof.x), centerVisibility, centerConfidence);
+        pcfVisibility = lerp(saturate(previousProof.y), pcfVisibility, pcfConfidence);
+
+        // Compare semantic ownership, not raw triangle numbers. Adjacent incident
+        // triangles may legitimately alternate at a welded vertex and are all SELF.
+        // Only a SELF <-> OTHER/MISSING transition is treated as an unstable packet.
+        bool currentIsSelf = TriangleOwnsVertex(centerOwnerTriangleId, vertexId);
+        bool previousIsSelf = TriangleOwnsVertex(PreviousVertexOwner[vertexId], vertexId);
+        if (currentIsSelf != previousIsSelf)
+        {
+            centerVisibility = saturate(previousProof.x);
+            pcfVisibility = saturate(previousProof.y);
+        }
+
+    }
+
+    // Preserve channel layout expected by CalcViewData.usf. For the vertex-flip
+    // diagnostic, w stores the receiver-only self depth at the exact center texel;
+    // it never affects production shading.
+    OutVertexProof[vertexId] = float4(
+        saturate(centerVisibility),
+        saturate(pcfVisibility),
+        receiverDepth,
+        centerSelfDepth);
+    OutVertexOwner[vertexId] = centerOwnerTriangleId;
+}

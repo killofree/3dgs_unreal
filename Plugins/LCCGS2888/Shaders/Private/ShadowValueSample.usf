@@ -1,0 +1,27 @@
+// v2886: debug-only GPU proof readback, independent of beauty/HDR/UE exposure.
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/LCCCinematicGS/Private/GaussianDataTypes.ush"
+StructuredBuffer<FGaussianSplatViewData> ViewDataBuffer;
+RWStructuredBuffer<float4> OutSamples;
+uint SplatCount;
+uint SampleCount;
+[numthreads(64, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint id = DispatchThreadId.x;
+    if (id >= SampleCount || SplatCount == 0u) return;
+    // Stratified sampling across the full source set, not just the first 4096 splats.
+    uint index = min(id * (SplatCount / SampleCount), SplatCount - 1u);
+    FGaussianSplatViewData d = ViewDataBuffer[index];
+    float alpha = f16tof32(d.PackedColorBA >> 16u);
+    bool valid = d.ClipPosition.w > 0.0 && alpha > 0.0001;
+    float debugLinear = f16tof32(d.PackedDirectRG & 65535u);
+    float castLinear = f16tof32(d.PackedDirectBA >> 16u);
+    // This is per-splat source carrier before raster, NOT the final HDR pixel.
+    float3 carrier = max(float3(
+        f16tof32(d.PackedColorRG & 65535u),
+        f16tof32(d.PackedColorRG >> 16u),
+        f16tof32(d.PackedColorBA & 65535u)), 0.0);
+    float carrierLuma = dot(carrier, float3(0.2126, 0.7152, 0.0722));
+    OutSamples[id] = valid ? float4(debugLinear, castLinear, carrierLuma, 1.0) : float4(0, 0, 0, 0);
+}

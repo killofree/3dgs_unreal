@@ -1,0 +1,96 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> ReceiverLightDepth;
+StructuredBuffer<float4> StableProxyVertexBuffer;
+StructuredBuffer<uint4> StableProxyTriangleBuffer;
+RWStructuredBuffer<uint> OutReceiverTriangleId;
+
+float4x4 LocalToWorld;
+float4 LightOriginWidth;
+float4 LightForwardEnabled;
+float4 LightRightRange;
+float4 LightUpSettings;
+uint VertexCount;
+uint TriangleCount;
+uint GridWidth;
+uint GridHeight;
+float DepthMatchToleranceCm;
+uint PassMode;
+
+float Edge(float2 a, float2 b, float2 p)
+{
+    return (p.x - a.x) * (b.y - a.y) - (p.y - a.y) * (b.x - a.x);
+}
+
+void ProjectVertex(uint vertexId, out float2 pixel, out float depth)
+{
+    float3 worldP = mul(float4(StableProxyVertexBuffer[vertexId].xyz, 1.0), LocalToWorld).xyz;
+    float3 r = worldP - LightOriginWidth.xyz;
+    float widthCm = max(LightOriginWidth.w, 1.0);
+    float2 uv = float2(
+        0.5 + dot(r, LightRightRange.xyz) / widthCm,
+        0.5 - dot(r, LightUpSettings.xyz) / widthCm);
+    pixel = uv * float2(GridWidth, GridHeight);
+    depth = dot(r, LightForwardEnabled.xyz);
+}
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint id = DTid.x;
+    uint pixelCount = GridWidth * GridHeight;
+    if (PassMode == 0u)
+    {
+        if (id < pixelCount)
+            OutReceiverTriangleId[id] = 0xFFFFFFFFu;
+        return;
+    }
+
+    if (id >= TriangleCount)
+        return;
+    uint4 tri = StableProxyTriangleBuffer[id];
+    if (tri.w == 0u || tri.x >= VertexCount || tri.y >= VertexCount || tri.z >= VertexCount)
+        return;
+
+    float2 p0, p1, p2;
+    float d0, d1, d2;
+    ProjectVertex(tri.x, p0, d0);
+    ProjectVertex(tri.y, p1, d1);
+    ProjectVertex(tri.z, p2, d2);
+    if (max(max(d0, d1), d2) <= 0.0)
+        return;
+
+    float area = Edge(p0, p1, p2);
+    if (abs(area) < 1.0e-6)
+        return;
+    float invArea = rcp(area);
+    int2 lo = clamp(int2(floor(min(p0, min(p1, p2)) - 0.5)), int2(0, 0), int2(GridWidth, GridHeight) - 1);
+    int2 hi = clamp(int2(ceil(max(p0, max(p1, p2)) + 0.5)), int2(0, 0), int2(GridWidth, GridHeight) - 1);
+
+    // Match the real receiver SceneDepth, then conservatively extend the triangle
+    // by half a pixel so thin proxy triangles keep ownership while the light rotates.
+    [loop]
+    for (int y = lo.y; y <= hi.y; ++y)
+    {
+        [loop]
+        for (int x = lo.x; x <= hi.x; ++x)
+        {
+            float2 sampleP = float2(x, y) + 0.5;
+            float w0 = Edge(p1, p2, sampleP) * invArea;
+            float w1 = Edge(p2, p0, sampleP) * invArea;
+            float w2 = 1.0 - w0 - w1;
+            float conservative = -0.015;
+            if (w0 < conservative || w1 < conservative || w2 < conservative)
+                continue;
+            float triangleDepth = w0 * d0 + w1 * d1 + w2 * d2;
+            float capturedDepth = ReceiverLightDepth.Load(int3(x, y, 0)).r;
+            if (capturedDepth > 0.01 && capturedDepth < 60000.0 &&
+                abs(triangleDepth - capturedDepth) <= DepthMatchToleranceCm)
+            {
+                InterlockedMin(OutReceiverTriangleId[y * GridWidth + x], id);
+            }
+        }
+    }
+}

@@ -1,0 +1,68 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// v2891 conservative non-Nanite global work compaction.
+// IMPORTANT: visibility is NOT recalculated here. CalcViewData.usf already performs
+// the production covariance-aware frustum test and writes invalid entries with w <= 0.
+// This pass only packs accepted entries into contiguous distance/key arrays so the
+// existing indirect radix sort and draw can process fewer splats.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/LCCCinematicGS/Private/GaussianDataTypes.ush"
+
+#if GS_VISIBLE_DISTANCE_RESET
+RWStructuredBuffer<uint> VisibleCountBuffer;
+
+[numthreads(1, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    VisibleCountBuffer[0] = 0u;
+}
+#endif
+
+#if GS_VISIBLE_DISTANCE_COMPACT
+StructuredBuffer<FGaussianSplatViewData> ViewDataBuffer;
+RWStructuredBuffer<uint> DistanceBuffer;
+RWStructuredBuffer<uint> KeyBuffer;
+RWStructuredBuffer<uint> VisibleCountBuffer;
+uint SourceSplatCount;
+uint OutputCapacity;
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 256
+#endif
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    const uint sourceIndex = DispatchThreadId.x;
+    if (sourceIndex >= SourceSplatCount)
+    {
+        return;
+    }
+
+    const float4 clipPos = ViewDataBuffer[sourceIndex].ClipPosition;
+
+    // Exact authority from CalcViewData: behind-camera, covariance-aware frustum
+    // rejection, cluster rejection and other invalid entries all carry w <= 0.
+    if (clipPos.w <= 0.0)
+    {
+        return;
+    }
+
+    uint outputIndex = 0u;
+    InterlockedAdd(VisibleCountBuffer[0], 1u, outputIndex);
+    if (outputIndex >= OutputCapacity)
+    {
+        return;
+    }
+
+    // Match CalcDistances.usf exactly. UE reversed-Z: ascending sortable depth
+    // produces the same back-to-front ordering convention used by the existing path.
+    const float depth = clipPos.z / clipPos.w;
+    uint depthBits = asuint(depth);
+    depthBits ^= (-(int)(depthBits >> 31)) | 0x80000000;
+
+    DistanceBuffer[outputIndex] = depthBits;
+    KeyBuffer[outputIndex] = sourceIndex;
+}
+#endif

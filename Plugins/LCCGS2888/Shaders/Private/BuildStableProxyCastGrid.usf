@@ -1,0 +1,70 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float> CombinedLightDepth;
+Texture2D<float> ReceiverLightDepth;
+RWStructuredBuffer<float> OutCastVisibility;
+uint GridWidth;
+uint GridHeight;
+float DepthBiasCm;
+float WorldUnitsPerTexel;
+
+bool IsValidDepth(float d)
+{
+    return d > 0.01 && d < 60000.0;
+}
+
+float CompareVisibility(float blockerDepth, float receiverDepth)
+{
+    if (!IsValidDepth(receiverDepth) || !IsValidDepth(blockerDepth))
+        return 1.0;
+
+    float biasCm = max(max(DepthBiasCm, 0.0), clamp(WorldUnitsPerTexel * 0.22, 0.45, 6.0));
+    float transitionCm = clamp(WorldUnitsPerTexel * 0.55, 0.55, 8.0);
+    float delta = blockerDepth + biasCm - receiverDepth;
+	// CombinedLightDepth is external-caster-only. Missing external depth fails open;
+	// valid depth is compared continuously against the receiver-only surface.
+    return smoothstep(-transitionCm, 0.0, delta);
+}
+
+float TapVisibility(int2 p)
+{
+    int2 q = clamp(p, int2(0, 0), int2(int(GridWidth) - 1, int(GridHeight) - 1));
+    float receiver = ReceiverLightDepth.Load(int3(q, 0)).r;
+    float blocker = CombinedLightDepth.Load(int3(q, 0)).r;
+    return CompareVisibility(blocker, receiver);
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    if (DTid.x >= GridWidth || DTid.y >= GridHeight)
+        return;
+
+    int2 p = int2(DTid.xy);
+    uint outIndex = DTid.y * GridWidth + DTid.x;
+    float receiverCenter = ReceiverLightDepth.Load(int3(p, 0)).r;
+    if (!IsValidDepth(receiverCenter))
+    {
+        OutCastVisibility[outIndex] = 1.0;
+        return;
+    }
+
+    float sum = 0.0;
+    float weight = 0.0;
+    [unroll]
+    for (int oy = -1; oy <= 1; ++oy)
+    {
+        [unroll]
+        for (int ox = -1; ox <= 1; ++ox)
+        {
+            float wx = (ox == 0) ? 2.0 : 1.0;
+            float wy = (oy == 0) ? 2.0 : 1.0;
+            float ww = wx * wy;
+            sum += TapVisibility(p + int2(ox, oy)) * ww;
+            weight += ww;
+        }
+    }
+    OutCastVisibility[outIndex] = saturate(sum / max(weight, 1.0e-6));
+}

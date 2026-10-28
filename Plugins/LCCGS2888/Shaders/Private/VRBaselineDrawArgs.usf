@@ -1,0 +1,17 @@
+#include "/Engine/Public/Platform.ush"
+RWStructuredBuffer<uint> SortedDistances;
+RWBuffer<uint> DrawArgs;
+uint SourceCount;
+[numthreads(1,1,1)]
+void MainCS(uint3 id : SV_DispatchThreadID)
+{
+    uint lo = 0, hi = SourceCount;
+    while (lo < hi)
+    {
+        uint mid = lo + (hi-lo)/2;
+        if (SortedDistances[mid] == 0xFFFFFFFFu) hi = mid;
+        else lo = mid+1;
+    }
+    DrawArgs[0] = 6; DrawArgs[1] = lo;
+    DrawArgs[2] = 0; DrawArgs[3] = 0; DrawArgs[4] = 0;
+}

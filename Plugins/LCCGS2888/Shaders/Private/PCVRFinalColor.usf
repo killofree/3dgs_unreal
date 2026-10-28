@@ -1,0 +1,47 @@
+#include "/Plugin/LCCCinematicGS/Private/PCVRSharedLighting.ush"
+StructuredBuffer<FGaussianSplatViewData> ViewDataBuffer;
+StructuredBuffer<uint> SortKeysBuffer;
+StructuredBuffer<uint> SortParams;
+RWStructuredBuffer<float4> PCVRFinalColorsOut;
+uint SourceCapacity;
+#ifndef GS_PCVR_FINAL_INDIRECT
+#define GS_PCVR_FINAL_INDIRECT 0
+#endif
+
+// Exact same lighting code in both modes. Indirect mode reuses the 1024-key
+// sort dispatch built on GPU, avoiding workgroups for unused source capacity.
+// No cross-eye colour reuse: ViewData contains eye-dependent trained SH.
+void EvaluateSlot(uint Slot)
+{
+    if (Slot>=min(SortParams[0],SourceCapacity)) return;
+    uint Splat=SortKeysBuffer[Slot];
+    if (Splat>=SourceCapacity) return;
+    FGaussianSplatViewData D=ViewDataBuffer[Splat];
+    FVertexOutput Input=(FVertexOutput)0;
+    float2 RG=UnpackHalf2x16(D.PackedColorRG);
+    float2 BA=UnpackHalf2x16(D.PackedColorBA);
+    Input.Color=float4(RG,BA);
+    float2 DirectRG=UnpackHalf2x16(D.PackedDirectRG);
+    float2 DirectBA=UnpackHalf2x16(D.PackedDirectBA);
+    Input.DirectColor=float3(DirectRG,DirectBA.x);
+    float2 TRG=UnpackHalf2x16(D.StructPadding0);
+    float2 TB=UnpackHalf2x16(D.StructPadding1);
+    Input.PlantTransmissionColor=float3(TRG,TB.x);
+    Input.PostLightMask=float((D.Padding>>8)&0xFFu)/255.0;
+    Input.ProxyShadowMask=float((D.Padding>>16)&0xFFFFu)/65535.0;
+    Input.StableBindingDebug=DirectBA.y;
+    PCVRFinalColorsOut[Splat]=float4(EvaluateFinalSplatLighting(Input),Input.Color.a);
+}
+
+[numthreads(256,1,1)]
+void MainCS(uint3 DTid:SV_DispatchThreadID, uint3 Group:SV_GroupID, uint3 Lane:SV_GroupThreadID)
+{
+#if GS_PCVR_FINAL_INDIRECT
+    const uint Start=Group.x*1024u+Lane.x;
+    // Match RadixSort.usf TILE_SIZE exactly (256 lanes * 4 keys).
+    [unroll] for(uint I=0u;I<4u;++I)
+        EvaluateSlot(Start+I*256u);
+#else
+    EvaluateSlot(DTid.x);
+#endif
+}

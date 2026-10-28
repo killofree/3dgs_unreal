@@ -1,0 +1,1349 @@
+// Experimental PCVR tile compositor. Existing source order/effect color retained.
+// Conservative tile selection; optional front-to-back bounded color/fog termination.
+// Nearest GS depth remains exact: terminated pixels still test potentially nearer centers.
+#ifndef GS_TILE_NATIVE
+#include "/Engine/Public/Platform.ush"
+#endif
+#ifndef GS_RESOLVE_PART
+#define GS_RESOLVE_PART 0
+#endif
+#ifndef GS_TILE_REGION_LIST
+#define GS_TILE_REGION_LIST 0
+#endif
+#ifndef GS_TILE_RESOLVE_BATCH
+#define GS_TILE_RESOLVE_BATCH 0
+#endif
+#ifndef GS_TILE_PACKED_OUTPUT
+#define GS_TILE_PACKED_OUTPUT 0
+#endif
+#ifndef GS_TILE_RESOLVE_ORDER
+#define GS_TILE_RESOLVE_ORDER 0
+#endif
+#ifndef GS_TILE_SORT_QUEUE
+#define GS_TILE_SORT_QUEUE 0
+#endif
+#ifndef GS_TILE_WAVE_MASK
+#define GS_TILE_WAVE_MASK 0
+#endif
+#ifndef GS_TILE_MASK_FORCE_FALLBACK
+#define GS_TILE_MASK_FORCE_FALLBACK 0
+#endif
+#ifndef GS_TILE_COOPERATIVE
+#define GS_TILE_COOPERATIVE 0
+#endif
+#ifndef GS_TILE_POOL_CACHE
+#define GS_TILE_POOL_CACHE 0
+#endif
+#ifndef GS_TILE_WAVE_SORT
+#define GS_TILE_WAVE_SORT 0
+#endif
+#ifndef GS_TILE_DENSE_MERGE
+#define GS_TILE_DENSE_MERGE 0
+#endif
+#ifndef GS_TILE_WIDE_MASK
+#define GS_TILE_WIDE_MASK 0
+#endif
+#ifndef GS_TILE_BATCH_SKIP
+#define GS_TILE_BATCH_SKIP 0
+#endif
+#ifndef GS_TILE_SORT_BUCKET
+#define GS_TILE_SORT_BUCKET 0
+#endif
+#if GS_TILE_WIDE_MASK
+#define GS_MASK_WORDS 8
+#else
+#define GS_MASK_WORDS 2
+#endif
+#if GS_TILE_SORT_BUCKET == 1
+#define GS_SORT_SIZE 32
+#elif GS_TILE_SORT_BUCKET == 2
+#define GS_SORT_SIZE 256
+#elif GS_TILE_SORT_BUCKET == 3
+#define GS_SORT_SIZE 1024
+#else
+#define GS_SORT_SIZE 8192
+#endif
+
+#ifndef GS_TILE_COUNTERS
+#define GS_TILE_COUNTERS 0
+#endif
+#ifndef GS_TILE_PROBE
+#define GS_TILE_PROBE 0
+#endif
+#ifdef GS_TILE_NATIVE
+#define TILE_REG(x) : register(x)
+cbuffer TileConstants : register(b0) {
+#else
+#define TILE_REG(x)
+#endif
+uint TileSourceCapacity;
+uint TileCountOverride;
+uint TileWidth;
+uint TileHeight;
+uint TileOriginX;
+uint TileOriginY;
+uint TileCountX;
+uint TileCountY;
+uint TileEntryCapacity;
+uint TileQuality;
+uint TileTrim;
+uint TileHalfRound;
+uint TileCandidateCull;
+uint TileFrontToBack;
+float TileEarlyThreshold;
+uint TileSubtileCull;
+uint TileReuseMask;
+uint TileProfileSplit;
+uint TileDensityClass;
+uint TileEmitClass;
+uint TileProfileSeed;
+uint TileProfileMetaOffset;
+uint TileProfileWords;
+uint TileDenseCapacity;
+uint TileAblation;
+uint TilePoolCapacity;
+uint TileRegionCapacity;
+#ifdef GS_TILE_NATIVE
+};
+#endif
+#ifndef GS_TILE_NATIVE
+uint TileRemovalCount;
+float3 TileRemovalPreViewTranslation;
+float4x4 TileRemovalClipToWorld;
+float4 TileRemovalCenters[8];
+float4 TileRemovalAxisX[8];
+float4 TileRemovalAxisY[8];
+float4 TileRemovalAxisZ[8];
+#endif
+#ifndef GS_TILE_NATIVE
+uint TileAlphaCull;
+#include "/Plugin/LCCCinematicGS/Private/PCVRConservativeCull.ush"
+#else
+#ifndef GS_TILE_ALPHA_TEST
+#define GS_TILE_ALPHA_TEST 0
+#endif
+#define TileAlphaCull GS_TILE_ALPHA_TEST
+#include "PCVRConservativeCull.ush"
+#endif
+struct TileViewData {
+ float4 ClipPosition; float3 TranslatedWorldPos; float Pad;
+ uint ColorRG; uint ColorBA; uint DirectRG; uint DirectBA;
+ float2 Axis1; float2 Axis2; uint Cluster; uint Padding; uint TransmissionRG; uint TransmissionBA;
+};
+struct TileRecord { float4 CenterInverse0; float4 Inverse1Depth; float4 Color; uint4 Bounds; };
+// Storage only: production color/fog are already half-rounded before this store.
+// Preserve nearest depth as FP32. Never enable with unrounded output.
+#if GS_TILE_PACKED_OUTPUT
+struct TilePixel { uint4 Packed; };
+#else
+struct TilePixel { float4 Color; float4 DepthFog; };
+#endif
+TilePixel MakeTilePixel(float4 color,float depth,float fog){
+ TilePixel p;
+#if GS_TILE_PACKED_OUTPUT
+ p.Packed=uint4(f32tof16(color.r)|(f32tof16(color.g)<<16),f32tof16(color.b)|(f32tof16(color.a)<<16),asuint(depth),f32tof16(fog));
+#else
+ p.Color=color;p.DepthFog=float4(depth,fog,0,0);
+#endif
+ return p;
+}
+void DecodeTilePixel(TilePixel p,out float4 color,out float depth,out float fog){
+#if GS_TILE_PACKED_OUTPUT
+ uint4 v=p.Packed;
+ color=float4(f16tof32(v.x&65535),f16tof32(v.x>>16),f16tof32(v.y&65535),f16tof32(v.y>>16));
+ depth=asfloat(v.z);fog=f16tof32(v.w&65535);
+#else
+ color=p.Color;depth=p.DepthFog.x;fog=p.DepthFog.y;
+#endif
+}
+StructuredBuffer<TileViewData> TileViewDataBuffer TILE_REG(t0);
+StructuredBuffer<uint> TileSortKeys TILE_REG(t1);
+StructuredBuffer<uint> TileDrawArgs TILE_REG(t2);
+StructuredBuffer<float4> TileFinalColors TILE_REG(t3);
+Texture2D<float> TileSceneDepth TILE_REG(t4);
+RWStructuredBuffer<TileRecord> TileRecords TILE_REG(u0);
+RWStructuredBuffer<uint> TileCounts TILE_REG(u1);
+RWStructuredBuffer<uint> TileOffsets TILE_REG(u2);
+RWStructuredBuffer<uint> TileCursors TILE_REG(u3);
+RWStructuredBuffer<uint> TileEntries TILE_REG(u4);
+RWStructuredBuffer<TilePixel> TilePixels TILE_REG(u5);
+RWStructuredBuffer<uint> TileStats TILE_REG(u6);
+RWStructuredBuffer<uint> TileRasterArgs TILE_REG(u7);
+RWStructuredBuffer<uint2> TileBoundsLimits TILE_REG(u8);
+RWStructuredBuffer<uint> TileMembershipMasks TILE_REG(u9);
+// TileDrawArgs is an immutable GPU copy for this dispatch chain.
+RWStructuredBuffer<uint> TileFrozenDrawArgs TILE_REG(u10);
+#if GS_TILE_COUNTERS
+RWStructuredBuffer<uint> TileProfileData TILE_REG(u11);
+#define PC_INC(i) if(samplePixel) pc[i]++
+void GSStatus(uint slot,uint status,uint area,uint hits,uint cached) {
+ if((slot&255u)==(TileProfileSeed&255u)){
+  uint at=16+(slot>>8)*4;TileProfileData[at]=status;TileProfileData[at+1]=area;
+  TileProfileData[at+2]=hits;TileProfileData[at+3]=cached;
+ }
+}
+#else
+#define PC_INC(i)
+#endif
+#if GS_TILE_REGION_LIST
+RWStructuredBuffer<uint> TileRegionEntries TILE_REG(u22);
+RWStructuredBuffer<uint4> TileRegionMeta TILE_REG(u23);
+#endif
+#if GS_RESOLVE_PART
+RWStructuredBuffer<uint4> TileCostTrace TILE_REG(u24);
+RWStructuredBuffer<uint4> TileCostMeta TILE_REG(u25);
+RWStructuredBuffer<uint2> TileCostDigest TILE_REG(u26);
+uint CostSampleIndex(uint tile,uint seed,uint width,uint height){
+ uint h=seed*747796405u+2891336453u;
+ h=((h>>((h>>28u)+4u))^h)*277803737u;h=(h>>22u)^h;
+ return (tile*1664525u+h*1013904223u)%(width*height);
+}
+#endif
+uint DensityClass(uint n){return n==0?6:n<=32?1:n<=256?2:n<=1024?3:n<=8192?4:5;}
+bool DensitySelected(uint n){return TileDensityClass==0 || TileDensityClass==DensityClass(n);}
+#if GS_TILE_DENSE_MERGE
+RWStructuredBuffer<uint> TileDenseEntries TILE_REG(u12);
+RWStructuredBuffer<uint2> TileDenseMeta TILE_REG(u13);
+#endif
+#if GS_TILE_POOL_CACHE
+RWStructuredBuffer<uint> TileExtendedMembership TILE_REG(u14);
+#endif
+#if GS_TILE_COOPERATIVE
+RWStructuredBuffer<uint> TileCooperativeQueue TILE_REG(u15);
+RWStructuredBuffer<uint> TileCooperativeArgs TILE_REG(u16);
+#endif
+#if GS_TILE_PROBE == 3 || GS_TILE_PROBE == 4
+RWStructuredBuffer<uint4> TileAuditMasks TILE_REG(u17);
+#endif
+#if GS_TILE_PROBE == 6 || GS_TILE_PROBE == 8
+RWStructuredBuffer<uint4> TileAuditPacked TILE_REG(u18);
+#endif
+#if GS_TILE_STAGE == 17 || GS_TILE_PROBE == 9
+RWStructuredBuffer<uint> TileAuditDigest TILE_REG(u19);
+#endif
+#if GS_TILE_SORT_QUEUE
+RWStructuredBuffer<uint> TileSortQueue TILE_REG(u20);
+RWStructuredBuffer<uint> TileSortQueueArgs TILE_REG(u21);
+uint SortQueueClass(uint n){return n<=32?0:n<=256?1:n<=1024?2:n<=8192?3:4;}
+#endif
+uint InputCount() { return TileCountOverride!=0 ? TileCountOverride : TileDrawArgs[1]; }
+uint ActiveCount() { return min(InputCount(),TileSourceCapacity); }
+bool TileFallback() { return TileStats[0]>TileEntryCapacity || TileStats[6]!=0 || TileStats[7]!=0; }
+void SortFault() { InterlockedOr(TileStats[7],4u);uint ignored;InterlockedExchange(TileRasterArgs[1],ActiveCount(),ignored); }
+float RoundHalf(float v) { return f16tof32(f32tof16(v)); }
+float4 RoundHalf4(float4 v) { return f16tof32(f32tof16(v)); }
+// Minimise the ellipse quadratic over the rectangle of pixel centres.
+// Checking all four constrained edges includes corners; an enclosed centre has minimum zero.
+bool RectIntersectsEllipse(TileRecord r,uint2 origin,uint extent) {
+ float2 lo=float2(origin)+.5-r.CenterInverse0.xy;
+ float2 hi=min(float2(origin+extent-1)+.5,float2(TileWidth,TileHeight)-.5)-r.CenterInverse0.xy;
+ if(any(lo>hi))return false;
+ if(all(lo<=0)&&all(hi>=0))return true;
+ float2 u=r.CenterInverse0.zw,v=r.Inverse1Depth.xy;
+ float xx=u.x*u.x+v.x*v.x,xy=u.x*u.y+v.x*v.y,yy=u.y*u.y+v.y*v.y;
+ if(!all(isfinite(float3(xx,xy,yy))) || xx<=0 || yy<=0)return true;
+ float best=3.402823e38;
+ for(uint i=0;i<2;++i){
+  float x=i==0?lo.x:hi.x;float2 d=float2(x,clamp(-xy*x/yy,lo.y,hi.y));
+  float2 e=float2(dot(u,d),dot(v,d));best=min(best,dot(e,e));
+  float y=i==0?lo.y:hi.y;d=float2(clamp(-xy*y/xx,lo.x,hi.x),y);
+  e=float2(dot(u,d),dot(v,d));best=min(best,dot(e,e));
+ }
+ return best<=((TileAlphaCull!=0 && extent==8)?GSConservativeAlphaRadiusSq(r.Color.a,TileQuality):1.001); // Registration stays unchanged; tighten only Resolve masks.
+}
+bool TileIntersectsEllipse(TileRecord r,uint2 tile) {
+ return TileCandidateCull==0 || RectIntersectsEllipse(r,tile*16,16);
+}
+[numthreads(256,1,1)]
+void ClearCS(uint3 id:SV_DispatchThreadID) {
+ uint i=id.x;
+ #if GS_TILE_COUNTERS
+ if(i>=16 && i<TileProfileMetaOffset)TileProfileData[i]=0;
+ if(i==0){TileProfileData[0]=1;TileProfileData[1]=TileProfileSeed;TileProfileData[2]=TileWidth;
+ TileProfileData[3]=TileHeight;TileProfileData[4]=TileSourceCapacity;TileProfileData[5]=min(InputCount(),TileSourceCapacity);
+ TileProfileData[6]=256;TileProfileData[7]=TileCountX*TileCountY;TileProfileData[8]=TileProfileMetaOffset;TileProfileData[9]=TileProfileWords;}
+#endif
+#if GS_TILE_COOPERATIVE
+ if(i==0)TileCooperativeQueue[0]=0;
+#endif
+ if(i<5)TileFrozenDrawArgs[i]=TileDrawArgs[i];
+ if(i<TileCountX*TileCountY) { TileCounts[i]=0;TileOffsets[i]=0;TileCursors[i]=0;TileBoundsLimits[i]=0; }
+#if GS_TILE_SORT_QUEUE
+ if(i<15)TileSortQueueArgs[i]=(i%3)==0?0:1;
+#endif
+#if GS_TILE_REGION_LIST
+ if(i<TileCountX*TileCountY)TileRegionMeta[i]=0;
+#endif
+ if(i<16) TileStats[i]=i==3 ? min(InputCount(),TileSourceCapacity) : (i==6 && InputCount()>TileSourceCapacity ? 1u : 0u);
+}
+#if GS_TILE_COOPERATIVE
+// Queue stores one GS slot per deferred record, never one entry per tile.
+// Capacity is the full source GS capacity, so each valid GS has a slot.
+bool CooperativeEligible(uint area){return area>max(64u,uint(GS_MASK_WORDS*32));}
+[numthreads(1,1,1)]
+void CooperativeArgsCS(uint3 id:SV_DispatchThreadID){
+ uint requested=TileCooperativeQueue[0],n=min(requested,TileSourceCapacity);
+ if(requested>TileSourceCapacity)InterlockedOr(TileStats[6],8u);
+ TileStats[15]=n;
+ TileCooperativeArgs[0]=min(max(n,1u),65535u);
+ TileCooperativeArgs[1]=max(1u,(n+65534u)/65535u);
+ TileCooperativeArgs[2]=1;
+}
+groupshared TileRecord CoopRecord;
+groupshared uint CoopPoolOffset,CoopPooled,CoopMask,CoopHits[32],CoopValid,CoopSlot;
+void CooperativeFault(){InterlockedOr(TileStats[6],8u);uint ignored;InterlockedExchange(TileRasterArgs[1],ActiveCount(),ignored);}
+[numthreads(32,1,1)]
+void CooperativeRegisterCS(uint3 group:SV_GroupID,uint lane:SV_GroupIndex){
+ uint task=group.y*65535u+group.x;
+ // Publish a uniform group decision before any later group barriers.
+ if(lane==0){CoopValid=0;CoopSlot=0;
+  if(TileStats[6]==0 && task<min(TileCooperativeQueue[0],TileSourceCapacity)){
+   CoopSlot=TileCooperativeQueue[task+1];if(CoopSlot<ActiveCount())CoopValid=1;else CooperativeFault();
+  }
+ }
+ GroupMemoryBarrierWithGroupSync();if(CoopValid==0)return;uint slot=CoopSlot;
+ if(lane==0){
+  CoopRecord=TileRecords[slot];CoopPoolOffset=0;CoopPooled=0;
+  uint span=CoopRecord.Bounds.z-CoopRecord.Bounds.x+1;
+  uint area=span*(CoopRecord.Bounds.w-CoopRecord.Bounds.y+1);
+  TileMembershipMasks[slot*GS_MASK_WORDS]=0;
+#if GS_TILE_POOL_CACHE
+  if(TileReuseMask!=0 && area<=4096){
+   uint words=(area+31)/32,offset;InterlockedAdd(TileStats[11],words,offset);
+   if(offset<=TilePoolCapacity && words<=TilePoolCapacity-offset){
+    CoopPoolOffset=offset;CoopPooled=1;TileMembershipMasks[slot*GS_MASK_WORDS]=offset|0x80000000u;InterlockedAdd(TileStats[12],1);
+   }else InterlockedAdd(TileStats[13],1);
+  }
+#endif
+ }
+ GroupMemoryBarrierWithGroupSync();
+ TileRecord r=CoopRecord;uint span=r.Bounds.z-r.Bounds.x+1;
+ uint area=span*(r.Bounds.w-r.Bounds.y+1),hits=0;
+ for(uint base=0;base<area;base+=32){
+  uint bit=base+lane;bool hit=false;
+  if(bit<area){uint2 tile=r.Bounds.xy+uint2(bit%span,bit/span);hit=TileIntersectsEllipse(r,tile);
+   if(hit){InterlockedAdd(TileCounts[tile.y*TileCountX+tile.x],1);++hits;}
+  }
+#if GS_TILE_POOL_CACHE
+  if(CoopPooled!=0){
+   if(WaveGetLaneCount()==32){
+    uint mask=WaveActiveBallot(hit).x;
+    if(lane==0)TileExtendedMembership[CoopPoolOffset+(base>>5)]=mask;
+   }else{
+    if(lane==0)CoopMask=0;GroupMemoryBarrierWithGroupSync();
+    if(hit)InterlockedOr(CoopMask,1u<<lane);GroupMemoryBarrierWithGroupSync();
+    if(lane==0)TileExtendedMembership[CoopPoolOffset+(base>>5)]=CoopMask;
+    GroupMemoryBarrierWithGroupSync();
+   }
+  }
+#endif
+ }
+ CoopHits[lane]=hits;GroupMemoryBarrierWithGroupSync();
+ if(lane==0){uint total=0;for(uint i=0;i<32;++i)total+=CoopHits[i];
+#if GS_TILE_POOL_CACHE
+  if(CoopPooled!=0)InterlockedAdd(TileStats[14],total);
+#endif
+#if GS_TILE_COUNTERS
+  GSStatus(slot,7,area,total,CoopPooled);
+#endif
+ }
+}
+[numthreads(32,1,1)]
+void CooperativeEmitCS(uint3 group:SV_GroupID,uint lane:SV_GroupIndex){
+ uint task=group.y*65535u+group.x;
+ if(lane==0){CoopValid=0;CoopSlot=0;
+  if(TileStats[0]<=TileEntryCapacity && TileStats[6]==0 && task<min(TileCooperativeQueue[0],TileSourceCapacity)){
+   CoopSlot=TileCooperativeQueue[task+1];if(CoopSlot<ActiveCount())CoopValid=1;else CooperativeFault();
+  }
+ }
+ GroupMemoryBarrierWithGroupSync();if(CoopValid==0)return;uint slot=CoopSlot;
+ if(lane==0){
+  CoopRecord=TileRecords[slot];CoopPooled=0;CoopPoolOffset=0;
+#if GS_TILE_POOL_CACHE
+  uint span=CoopRecord.Bounds.z-CoopRecord.Bounds.x+1,area=span*(CoopRecord.Bounds.w-CoopRecord.Bounds.y+1);
+  if(TileReuseMask!=0 && area<=4096){uint marker=TileMembershipMasks[slot*GS_MASK_WORDS],offset=marker&0x7fffffffu,words=(area+31)/32;
+   if((marker&0x80000000u)!=0 && offset<=TilePoolCapacity && words<=TilePoolCapacity-offset){CoopPooled=1;CoopPoolOffset=offset;}
+  }
+#endif
+ }
+ GroupMemoryBarrierWithGroupSync();
+ if((TileEmitClass==1 && CoopPooled==0)||(TileEmitClass==2 && CoopPooled!=0))return;
+ TileRecord r=CoopRecord;uint span=r.Bounds.z-r.Bounds.x+1,area=span*(r.Bounds.w-r.Bounds.y+1);
+ for(uint bit=lane;bit<area;bit+=32){uint2 xy=r.Bounds.xy+uint2(bit%span,bit/span);bool hit;
+#if GS_TILE_POOL_CACHE
+  if(CoopPooled!=0)hit=(TileExtendedMembership[CoopPoolOffset+(bit>>5)]&(1u<<(bit&31)))!=0;else
+#endif
+  hit=TileIntersectsEllipse(r,xy);
+  if(hit){uint tile=xy.y*TileCountX+xy.x,index;InterlockedAdd(TileCursors[tile],1,index);index+=TileOffsets[tile];
+   if(index<TileEntryCapacity)TileEntries[index]=slot;
+  }
+ }
+}
+#endif
+
+void RegisterRecord(uint slot,TileRecord r){
+ uint2 lo=r.Bounds.xy,hi=r.Bounds.zw;uint membership[GS_MASK_WORDS];for(uint mw=0;mw<GS_MASK_WORDS;++mw)membership[mw]=0;
+ uint span=hi.x-lo.x+1,area=span*(hi.y-lo.y+1),hits=0;
+#if GS_TILE_COOPERATIVE
+ if(CooperativeEligible(area)){
+  uint index;InterlockedAdd(TileCooperativeQueue[0],1,index);
+  if(index<TileSourceCapacity)TileCooperativeQueue[index+1]=slot;else InterlockedOr(TileStats[6],8u);
+  return;
+ }
+#endif
+ bool cache=TileReuseMask!=0 && area<=GS_MASK_WORDS*32;
+ uint poolOffset=0;bool pooled=false;
+#if GS_TILE_POOL_CACHE
+ if(TileReuseMask!=0 && !cache && area<=4096){
+  uint words=(area+31)/32;InterlockedAdd(TileStats[11],words,poolOffset);
+  pooled=poolOffset<=TilePoolCapacity && words<=TilePoolCapacity-poolOffset;
+  if(pooled){InterlockedAdd(TileStats[12],1);TileMembershipMasks[slot*GS_MASK_WORDS]=poolOffset|0x80000000u;}
+  else {InterlockedAdd(TileStats[13],1);TileMembershipMasks[slot*GS_MASK_WORDS]=0;}
+ }else if(!cache)TileMembershipMasks[slot*GS_MASK_WORDS]=0;
+#endif
+ uint currentWord=0;
+ for(uint y=lo.y;y<=hi.y;++y)for(uint x=lo.x;x<=hi.x;++x){
+  uint bit=(y-lo.y)*span+x-lo.x;bool hit=TileIntersectsEllipse(r,uint2(x,y));
+  if(hit){InterlockedAdd(TileCounts[y*TileCountX+x],1);++hits;
+   if(cache)membership[bit>>5]|=1u<<(bit&31);
+   if(pooled)currentWord|=1u<<(bit&31);
+  }
+#if GS_TILE_POOL_CACHE
+  if(pooled && ((bit&31)==31 || bit==area-1)){TileExtendedMembership[poolOffset+(bit>>5)]=currentWord;currentWord=0;}
+#endif
+ }
+ if(cache)for(uint mw=0;mw<GS_MASK_WORDS;++mw)TileMembershipMasks[slot*GS_MASK_WORDS+mw]=membership[mw];
+#if GS_TILE_POOL_CACHE
+ if(pooled)InterlockedAdd(TileStats[14],hits);
+#endif
+#if GS_TILE_COUNTERS
+ GSStatus(slot,7,area,hits,(cache||pooled)?1:0);
+#endif
+}
+
+[numthreads(256,1,1)]
+void BuildCS(uint3 id:SV_DispatchThreadID) {
+ uint slot=id.x;if(TileStats[6]!=0 || slot>=ActiveCount())return;
+ TileRecord r=(TileRecord)0;r.Bounds=uint4(1,1,0,0);TileRecords[slot]=r;
+#if GS_TILE_COUNTERS
+ GSStatus(slot,1,0,0,0);
+#endif
+ uint source=TileSortKeys[slot];if(source>=TileSourceCapacity)return;
+ 
+#if GS_TILE_COUNTERS
+ GSStatus(slot,2,0,0,0);
+#endif
+ TileViewData d=TileViewDataBuffer[source];float w=d.ClipPosition.w;
+ if(w<=0 || d.ClipPosition.z<0 || d.ClipPosition.z>w)return;
+ 
+#if GS_TILE_COUNTERS
+ GSStatus(slot,3,0,0,0);
+#endif
+ float alpha=f16tof32(d.ColorBA>>16);if(alpha<1.0/255.0)return;
+ 
+#if GS_TILE_COUNTERS
+ GSStatus(slot,4,0,0,0);
+#endif
+ float2 size=float2(TileWidth,TileHeight);
+ float2 center=d.ClipPosition.xy/w*float2(.5,-.5)*size+.5*size;
+ float2 a=d.Axis1*size*float2(.5,-.5),b=d.Axis2*size*float2(.5,-.5);
+ float det=a.x*b.y-a.y*b.x;if(abs(det)<1e-12 || !all(isfinite(float4(a,b))) || !all(isfinite(center)))return;
+ 
+#if GS_TILE_COUNTERS
+ GSStatus(slot,5,0,0,0);
+#endif
+ float k=TileQuality==3 ? 5.15 : 4.0;float edge=exp(-k);
+ float radius=1;
+ if(TileTrim!=0 && f16tof32(d.TransmissionBA>>16)>=-1.5)
+  radius=min(1.0,sqrt(max(0.0,-log(min(1.0,edge+(1-edge)*(1.0/255.0)/max(alpha,1e-10)))/k))+.002);
+ float2 extent=(TileCandidateCull!=0?sqrt(a*a+b*b):abs(a)+abs(b))*radius;
+ // Conservative binning only. Per-pixel Gaussian cutoff is unchanged.
+ int2 lo=int2(floor((center-extent-1.0)/16.0)),hi=int2(floor((center+extent+1.0)/16.0));
+ if(any(hi<0)||any(lo>=int2(TileCountX,TileCountY)))return;
+ 
+#if GS_TILE_COUNTERS
+ GSStatus(slot,6,0,0,0);
+#endif
+ lo=clamp(lo,0,int2(TileCountX,TileCountY)-1);hi=clamp(hi,0,int2(TileCountX,TileCountY)-1);
+ r.CenterInverse0=float4(center,b.y/det,-b.x/det);
+ r.Inverse1Depth=float4(-a.y/det,a.x/det,d.ClipPosition.z/w,length(d.TranslatedWorldPos));
+ r.Color=float4(TileFinalColors[source].rgb,alpha);r.Bounds=uint4(lo,hi);TileRecords[slot]=r;
+ if(TileProfileSplit==0)RegisterRecord(slot,r);
+}
+[numthreads(256,1,1)]
+void RegisterCS(uint3 id:SV_DispatchThreadID){
+ uint slot=id.x;if(TileStats[6]!=0 || slot>=ActiveCount())return;
+ TileRecord r=TileRecords[slot];if(any(r.Bounds.xy>r.Bounds.zw))return;RegisterRecord(slot,r);
+}
+
+groupshared uint PrefixSums[256];
+[numthreads(256,1,1)]
+void PrefixCS(uint3 id:SV_DispatchThreadID,uint lane:SV_GroupIndex) {
+ uint tiles=TileCountX*TileCountY,chunk=(tiles+255)/256,start=lane*chunk,end=min(start+chunk,tiles);
+ uint sum=0,maximum=0;
+ for(uint i=start;i<end;++i){uint n=TileCounts[i];sum=min(TileEntryCapacity+1,sum+n);maximum=max(maximum,n);}
+ PrefixSums[lane]=sum;GroupMemoryBarrierWithGroupSync();
+ for(uint step=1;step<256;step<<=1){uint v=lane>=step?PrefixSums[lane-step]:0;GroupMemoryBarrierWithGroupSync();PrefixSums[lane]=min(TileEntryCapacity+1,PrefixSums[lane]+v);GroupMemoryBarrierWithGroupSync();}
+ uint offset=lane==0?0:PrefixSums[lane-1],overflow=0;
+ for(uint i=start;i<end;++i){uint n=TileCounts[i];TileOffsets[i]=offset;offset=min(TileEntryCapacity+1,offset+n);if(offset>TileEntryCapacity)++overflow;}
+#if GS_TILE_SORT_QUEUE
+ // One reservation per density class per prefix lane; never one atomic per tile.
+ uint classes[5],heads[5];for(uint c=0;c<5;++c){classes[c]=0;heads[c]=0;}
+ for(uint q=start;q<end;++q){uint n=TileCounts[q];if(n!=0)++classes[SortQueueClass(n)];}
+ for(uint c=0;c<5;++c)if(classes[c]!=0)InterlockedAdd(TileSortQueueArgs[c*3],classes[c],heads[c]);
+ for(uint q=start;q<end;++q){uint n=TileCounts[q];if(n!=0){uint c=SortQueueClass(n);uint slot=heads[c]++;if(slot<tiles)TileSortQueue[c*tiles+slot]=q;}}
+#endif
+ InterlockedMax(TileStats[2],maximum);InterlockedAdd(TileStats[1],overflow);
+ if(lane==255){TileStats[0]=PrefixSums[255];TileRasterArgs[0]=6;TileRasterArgs[1]=(PrefixSums[255]>TileEntryCapacity || TileStats[6]!=0)?ActiveCount():0;TileRasterArgs[2]=0;TileRasterArgs[3]=0;TileRasterArgs[4]=0;}
+
+}
+[numthreads(256,1,1)]
+void EmitCS(uint3 id:SV_DispatchThreadID) {
+ if(TileStats[0]>TileEntryCapacity || TileStats[6]!=0)return;
+ uint slot=id.x;if(TileStats[6]!=0 || slot>=ActiveCount())return;TileRecord r=TileRecords[slot];
+ if(any(r.Bounds.xy>r.Bounds.zw))return;
+ uint span=r.Bounds.z-r.Bounds.x+1;
+ uint area=span*(r.Bounds.w-r.Bounds.y+1);
+#if GS_TILE_COOPERATIVE
+ if(CooperativeEligible(area))return;
+#endif
+ bool cached=TileReuseMask!=0 && area<=GS_MASK_WORDS*32;
+ bool pooled=false;uint poolOffset=0;
+#if GS_TILE_POOL_CACHE
+ if(TileReuseMask!=0 && !cached && area<=4096){uint marker=TileMembershipMasks[slot*GS_MASK_WORDS];poolOffset=marker&0x7fffffffu;uint words=(area+31)/32;pooled=(marker&0x80000000u)!=0 && poolOffset<=TilePoolCapacity && words<=TilePoolCapacity-poolOffset;}
+#endif
+ if((TileEmitClass==1 && !cached && !pooled)||(TileEmitClass==2 && (cached||pooled)))return;
+ uint membership[GS_MASK_WORDS];for(uint mw=0;mw<GS_MASK_WORDS;++mw)membership[mw]=0;if(cached)for(uint mw=0;mw<GS_MASK_WORDS;++mw)membership[mw]=TileMembershipMasks[slot*GS_MASK_WORDS+mw];
+ for(uint y=r.Bounds.y;y<=r.Bounds.w;++y)for(uint x=r.Bounds.x;x<=r.Bounds.z;++x){uint bit=(y-r.Bounds.y)*span+x-r.Bounds.x;bool intersects;if(cached){intersects=(membership[min(bit>>5,uint(GS_MASK_WORDS-1))]&(1u<<(bit&31)))!=0;}else{
+#if GS_TILE_POOL_CACHE
+ if(pooled)intersects=(TileExtendedMembership[poolOffset+(bit>>5)]&(1u<<(bit&31)))!=0;else
+#endif
+ intersects=TileIntersectsEllipse(r,uint2(x,y));}if(!intersects)continue;uint tile=y*TileCountX+x,index;InterlockedAdd(TileCursors[tile],1,index);index+=TileOffsets[tile];if(index<TileEntryCapacity)TileEntries[index]=slot;}
+}
+// One thread per tile; no full-GS validation scan.
+// Validate all producer cursors before any sorter can read an entry list.
+[numthreads(256,1,1)]
+void ValidateCS(uint3 id:SV_DispatchThreadID) {
+ uint tile=id.x;if(tile>=TileCountX*TileCountY || TileStats[0]>TileEntryCapacity)return;
+ uint n=TileCounts[tile],offset=TileOffsets[tile];
+ bool invalid=n>ActiveCount() || offset>TileEntryCapacity;
+ if(!invalid)invalid=n>TileEntryCapacity-offset || TileCursors[tile]!=n;
+ if(invalid){InterlockedOr(TileStats[6],2u);uint ignored;InterlockedExchange(TileRasterArgs[1],ActiveCount(),ignored);}
+}
+groupshared uint4 GroupHeader;
+groupshared uint Ordered[GS_SORT_SIZE];
+[numthreads(256,1,1)]
+void SortCS(uint3 group:SV_GroupID,uint lane:SV_GroupIndex) {
+ uint tile=group.x+group.y*TileCountX;
+#if GS_TILE_SORT_QUEUE
+ tile=TileSortQueue[(TileDensityClass-1)*TileCountX*TileCountY+group.x];
+#endif
+ // Reuse the sort scratch header: keep this entry point within the 32 KiB shared limit.
+ if(lane==0){Ordered[0]=TileCounts[tile];Ordered[1]=TileOffsets[tile];Ordered[2]=TileStats[6];Ordered[3]=TileStats[0];}
+ GroupMemoryBarrierWithGroupSync();
+ uint n=Ordered[0],offset=Ordered[1],abortFlags=Ordered[2],entries=Ordered[3];
+ // Every lane must capture the header before sorting overwrites the scratch array.
+ GroupMemoryBarrierWithGroupSync();
+ // Sort faults are published separately in [7]; do not read a flag mutated by peer groups.
+ if(n==0 || abortFlags!=0 || entries>TileEntryCapacity || !DensitySelected(n))return;
+ #if GS_TILE_SORT_BUCKET > 0 && GS_TILE_SORT_BUCKET < 4
+ if(n>GS_SORT_SIZE){if(lane==0)SortFault();return;}
+#endif
+#if GS_TILE_REGION_LIST
+ if(lane==0)TileRegionMeta[tile]=0;
+#endif
+ if(n>8192 && lane==0)InterlockedAdd(TileStats[4],1);
+ // Sort bounded runs, preserving every tile member. Resolve merges these runs.
+ for(uint start=0;start<n;start+=8192){
+  uint count=min(8192,n-start),size=1;while(size<count)size<<=1;
+  for(uint i=lane;i<size;i+=256){uint slot=i<count?TileEntries[offset+start+i]:0xffffffff;
+   if(i<count && slot>=ActiveCount()){SortFault();slot=0xffffffff;}
+   Ordered[i]=slot;
+  }
+  GroupMemoryBarrierWithGroupSync();
+  uint firstBlock=2;
+#if GS_TILE_WAVE_SORT
+  if(WaveGetLaneCount()==32){
+   for(uint i=lane;i<size;i+=256){uint value=Ordered[i];
+    for(uint block=2;block<=min(size,32u);block<<=1)for(uint step=block>>1;step>0;step>>=1){
+     uint other=WaveReadLaneAt(value,WaveGetLaneIndex()^step);
+     bool takeMin=((i&block)==0)==((i&step)==0);value=takeMin?min(value,other):max(value,other);
+    }
+    Ordered[i]=value;
+   }
+   GroupMemoryBarrierWithGroupSync();firstBlock=64;
+  }
+#endif
+  for(uint block=firstBlock;block<=size;block<<=1)for(uint step=block>>1;step>0;step>>=1){
+   for(uint i=lane;i<size;i+=256){uint j=i^step;if(j>i){uint a=Ordered[i],b=Ordered[j];bool ascending=(i&block)==0;Ordered[i]=ascending?min(a,b):max(a,b);Ordered[j]=ascending?max(a,b):min(a,b);}}
+   GroupMemoryBarrierWithGroupSync();
+  }
+  for(uint i=lane;i<count;i+=256)TileEntries[offset+start+i]=Ordered[i];
+  GroupMemoryBarrierWithGroupSync();
+ }
+ if(TileProfileSplit!=0)return;
+ // Reuse sorting shared memory after every run has been written.
+ float maxColor=0,maxFog=0;
+#if GS_TILE_REGION_LIST
+ // Reuse the bounds-read phase: construct stable 8x8 lists from sorted slots.
+ // A tile owns [4*offset,4*(offset+n)); no allocator or cross-tile overlap.
+ // Tiny/dense/overflow/unusual-wave cases keep the exact original Resolve.
+ bool regionEligible=n>32 && n<=8192 && offset<=TileRegionCapacity/4 && n<=TileRegionCapacity/4-offset;
+#if GS_TILE_SORT_BUCKET != 1
+ if(lane==0)Ordered[0]=1;
+ GroupMemoryBarrierWithGroupSync();
+ if(WaveGetLaneCount()!=32 || WaveGetLaneIndex()!=(lane&31u) || WaveReadLaneFirst(lane)!=(lane&~31u))InterlockedAnd(Ordered[0],0);
+ GroupMemoryBarrierWithGroupSync();regionEligible=regionEligible && Ordered[0]!=0;
+ // Uniform decision captured before the shared scratch is overwritten.
+ GroupMemoryBarrierWithGroupSync();
+#else
+ regionEligible=false;
+#endif
+ uint4 regionTotal=0;
+ if(regionEligible){
+  for(uint base=0;base<n;base+=256){
+   uint i=base+lane,slot=0,mask=0;TileRecord record;
+   if(i<n){slot=TileEntries[offset+i];if(slot>=ActiveCount()){SortFault();}else{record=TileRecords[slot];
+    maxColor=max(maxColor,max(abs(record.Color.r),max(abs(record.Color.g),abs(record.Color.b))));maxFog=max(maxFog,record.Inverse1Depth.w*.01);
+    for(uint q=0;q<4;++q){uint2 origin=uint2(tile%TileCountX,tile/TileCountX)*16+uint2(q&1,q>>1)*8;
+     if(RectIntersectsEllipse(record,origin,8))mask|=1u<<q;}
+   }}
+   uint waveIndex=lane>>5,waveLane=WaveGetLaneIndex();uint4 prefix,count;
+   for(uint q=0;q<4;++q){bool hit=(mask&(1u<<q))!=0;
+    prefix[q]=WavePrefixCountBits(hit);count[q]=WaveActiveCountBits(hit);
+    if(waveLane==0)Ordered[q*8+waveIndex]=count[q];}
+   GroupMemoryBarrierWithGroupSync();
+   for(uint q=0;q<4;++q){uint preceding=0,total=0;
+    for(uint w=0;w<8;++w){uint c=Ordered[q*8+w];if(w<waveIndex)preceding+=c;total+=c;}
+    if((mask&(1u<<q))!=0)TileRegionEntries[offset*4+q*n+regionTotal[q]+preceding+prefix[q]]=slot;
+    regionTotal[q]+=total;
+   }
+   // Protect wave counts until every thread has consumed them.
+   GroupMemoryBarrierWithGroupSync();
+  }
+  if(lane==0)TileRegionMeta[tile]=regionTotal|uint4(0x80000000u,0,0,0);
+ }else
+#endif
+ for(uint i=lane;i<n;i+=256){uint slot=TileEntries[offset+i];if(slot>=ActiveCount()){SortFault();continue;}TileRecord r=TileRecords[slot];maxColor=max(maxColor,max(abs(r.Color.r),max(abs(r.Color.g),abs(r.Color.b))));maxFog=max(maxFog,r.Inverse1Depth.w*.01);}
+ if(lane==0){Ordered[0]=0;Ordered[1]=0;}
+ GroupMemoryBarrierWithGroupSync();
+ InterlockedMax(Ordered[0],asuint(maxColor));InterlockedMax(Ordered[1],asuint(maxFog));
+ GroupMemoryBarrierWithGroupSync();
+ if(lane==0)TileBoundsLimits[tile]=uint2(Ordered[0],Ordered[1]);
+}
+
+[numthreads(256,1,1)]
+void BoundsCS(uint3 group:SV_GroupID,uint lane:SV_GroupIndex){
+ uint tile=group.x+group.y*TileCountX;
+ if(lane==0){Ordered[0]=TileCounts[tile];Ordered[1]=TileOffsets[tile];Ordered[2]=TileStats[6]|TileStats[7];Ordered[3]=TileStats[0];}
+ GroupMemoryBarrierWithGroupSync();
+ uint n=Ordered[0],offset=Ordered[1],flags=Ordered[2],total=Ordered[3];GroupMemoryBarrierWithGroupSync();
+ if(n==0||flags!=0||total>TileEntryCapacity)return;
+ // Reuse sorting shared memory after every run has been written.
+ float maxColor=0,maxFog=0;
+ for(uint i=lane;i<n;i+=256){uint slot=TileEntries[offset+i];if(slot>=ActiveCount()){SortFault();continue;}TileRecord r=TileRecords[slot];maxColor=max(maxColor,max(abs(r.Color.r),max(abs(r.Color.g),abs(r.Color.b))));maxFog=max(maxFog,r.Inverse1Depth.w*.01);}
+ if(lane==0){Ordered[0]=0;Ordered[1]=0;}
+ GroupMemoryBarrierWithGroupSync();
+ InterlockedMax(Ordered[0],asuint(maxColor));InterlockedMax(Ordered[1],asuint(maxFog));
+ GroupMemoryBarrierWithGroupSync();
+ if(lane==0)TileBoundsLimits[tile]=uint2(Ordered[0],Ordered[1]);
+}
+
+#if GS_TILE_DENSE_MERGE
+// Compact offsets only for dense tiles. Capacity excess keeps the original exact merge.
+[numthreads(256,1,1)]
+void DensePrefixCS(uint lane:SV_GroupIndex){
+ uint tiles=TileCountX*TileCountY,chunk=(tiles+255)/256,start=lane*chunk,end=min(start+chunk,tiles);
+ uint sum=0;
+ for(uint t=start;t<end;++t){uint n=TileCounts[t];if(n>8192)sum=min(TileDenseCapacity+1,sum+n);}
+ PrefixSums[lane]=sum;GroupMemoryBarrierWithGroupSync();
+ for(uint step=1;step<256;step<<=1){uint v=lane>=step?PrefixSums[lane-step]:0;GroupMemoryBarrierWithGroupSync();PrefixSums[lane]=min(TileDenseCapacity+1,PrefixSums[lane]+v);GroupMemoryBarrierWithGroupSync();}
+ uint offset=lane==0?0:PrefixSums[lane-1];
+ for(uint t=start;t<end;++t){uint n=TileCounts[t];bool dense=n>8192,enabled=dense && offset<=TileDenseCapacity && n<=TileDenseCapacity-offset;
+  TileDenseMeta[t]=uint2(offset,enabled?1:0);
+  if(dense){InterlockedAdd(TileStats[enabled?8:10],1);if(enabled)InterlockedAdd(TileStats[9],n);offset=min(TileDenseCapacity+1,offset+n);}
+ }
+}
+[numthreads(256,1,1)]
+void DenseMergeCS(uint3 group:SV_GroupID,uint lane:SV_GroupIndex){
+ uint tile=group.x+group.y*TileCountX;
+ if(lane==0)GroupHeader=uint4(TileCounts[tile],TileOffsets[tile],TileStats[6]|TileStats[7],TileStats[0]);
+ GroupMemoryBarrierWithGroupSync();uint n=GroupHeader.x,offset=GroupHeader.y;uint2 meta=TileDenseMeta[tile];
+ if(GroupHeader.z!=0||GroupHeader.w>TileEntryCapacity||n<=8192||meta.y==0)return;
+ uint runs=(n+8191)/8192;
+ // Unique source-order slots: rank in own run plus lower_bound in every other run.
+ for(uint i=lane;i<n;i+=256){uint slot=TileEntries[offset+i],own=i/8192,rank=i-own*8192;
+  if(slot>=ActiveCount()){SortFault();continue;}
+  for(uint r=0;r<runs;++r)if(r!=own){uint first=r*8192,lo=first,hi=min(n,first+8192);
+   while(lo<hi){uint mid=lo+(hi-lo)/2;if(TileEntries[offset+mid]<slot)lo=mid+1;else hi=mid;}rank+=lo-first;
+  }
+  if(rank>=n||meta.x>TileDenseCapacity||rank>=TileDenseCapacity-meta.x){SortFault();continue;}
+  TileDenseEntries[meta.x+rank]=slot;
+ }
+}
+#endif
+
+#if GS_TILE_REGION_LIST
+groupshared TileRecord RegionBatch[128];
+groupshared uint RegionTerminated;
+// Four independent sorted candidate lists; group-wide loop bounds/barriers stay uniform.
+void ResolveRegionCS(uint3 group,uint3 local,uint lane,uint4 meta){
+ uint tile=group.y*TileCountX+group.x,n=TileCounts[tile],offset=TileOffsets[tile];
+ uint2 pixel=group.xy*16+local.xy;bool valid=all(pixel<uint2(TileWidth,TileHeight));
+ uint q=(local.y/8)*2+local.x/8,regionLane=(local.y&7u)*8+(local.x&7u);
+ uint4 counts=meta&uint4(0x7fffffffu,0xffffffffu,0xffffffffu,0xffffffffu);
+ uint count=counts[q],longest=max(max(counts.x,counts.y),max(counts.z,counts.w));
+ if(lane==0)RegionTerminated=0;
+ GroupMemoryBarrierWithGroupSync();
+ float sceneZ=valid?TileSceneDepth.Load(int3(pixel+uint2(TileOriginX,TileOriginY),0)):1;
+ float4 color=0;float nearest=4398046511104.0,fog=0,transmission=1;bool terminated=false;
+ float2 bounds=asfloat(TileBoundsLimits[tile]);float k=TileQuality==3?5.15:4.0,edge=exp(-k);
+ for(uint base=0;base<longest;base+=32){
+  uint batchSize=base<count?min(32u,count-base):0;
+  if(regionLane<batchSize){uint rank=TileFrontToBack!=0?count-1-base-regionLane:base+regionLane;
+   RegionBatch[q*32+regionLane]=TileRecords[TileRegionEntries[offset*4+q*n+rank]];}
+  GroupMemoryBarrierWithGroupSync();
+  if(valid)for(uint j=0;j<batchSize;++j){
+   TileRecord r=RegionBatch[q*32+j];if(any(r.Bounds.xy>r.Bounds.zw))continue;
+   if(terminated && r.Inverse1Depth.w>=nearest)continue;
+   if(r.Inverse1Depth.z<sceneZ)continue;
+   float2 delta=float2(pixel)+.5-r.CenterInverse0.xy;
+   float2 p=float2(dot(delta,r.CenterInverse0.zw),dot(delta,r.Inverse1Depth.xy));
+   float d2=dot(p,p);if(d2>1)continue;
+   float alpha=saturate((exp(-k*d2)-edge)/max(1-edge,.0001)*r.Color.a);if(alpha<1.0/255.0)continue;
+   nearest=min(nearest,r.Inverse1Depth.w);
+   if(terminated)continue;
+   if(TileFrontToBack!=0){float weight=transmission*alpha;
+    color.rgb+=r.Color.rgb*weight;fog+=r.Inverse1Depth.w*.01*weight;
+    transmission*=1-alpha;color.a=1-transmission;
+    terminated=TileEarlyThreshold>0 && transmission<=TileEarlyThreshold && transmission*bounds.x<=TileEarlyThreshold && transmission*bounds.y<=.0001;
+   }else{color=float4(r.Color.rgb*alpha,alpha)+color*(1-alpha);fog=r.Inverse1Depth.w*.01*alpha+fog*(1-alpha);
+    if(TileHalfRound!=0){color=RoundHalf4(color);fog=RoundHalf(fog);}}
+  }
+  GroupMemoryBarrierWithGroupSync();
+ }
+ if(valid && terminated)InterlockedAdd(RegionTerminated,1);
+ GroupMemoryBarrierWithGroupSync();
+#if GS_TILE_PROBE == 0
+ if(lane==0)InterlockedAdd(TileStats[5],RegionTerminated);
+#endif
+ if(TileFrontToBack!=0 && TileHalfRound!=0){color=RoundHalf4(color);fog=RoundHalf(fog);}
+ if(valid)TilePixels[pixel.y*TileWidth+pixel.x]=MakeTilePixel(color,nearest,fog);
+}
+#endif
+
+#if GS_TILE_RESOLVE_BATCH == 1 || GS_TILE_RESOLVE_BATCH == 2
+// One field per bank across the 32 candidates. All bits remain FP32/uint.
+groupshared uint BatchSoA[16][32];
+void StoreBatch(uint j,TileRecord r){
+ uint4 a=asuint(r.CenterInverse0),b=asuint(r.Inverse1Depth),c=asuint(r.Color),d=r.Bounds;
+ BatchSoA[0][j]=a.x;BatchSoA[1][j]=a.y;BatchSoA[2][j]=a.z;BatchSoA[3][j]=a.w;
+ BatchSoA[4][j]=b.x;BatchSoA[5][j]=b.y;BatchSoA[6][j]=b.z;BatchSoA[7][j]=b.w;
+ BatchSoA[8][j]=c.x;BatchSoA[9][j]=c.y;BatchSoA[10][j]=c.z;BatchSoA[11][j]=c.w;
+ BatchSoA[12][j]=d.x;BatchSoA[13][j]=d.y;BatchSoA[14][j]=d.z;BatchSoA[15][j]=d.w;
+}
+TileRecord LoadBatch(uint j){
+ TileRecord r;
+ r.CenterInverse0=asfloat(uint4(BatchSoA[0][j],BatchSoA[1][j],BatchSoA[2][j],BatchSoA[3][j]));
+ r.Inverse1Depth=asfloat(uint4(BatchSoA[4][j],BatchSoA[5][j],BatchSoA[6][j],BatchSoA[7][j]));
+ r.Color=asfloat(uint4(BatchSoA[8][j],BatchSoA[9][j],BatchSoA[10][j],BatchSoA[11][j]));
+ r.Bounds=uint4(BatchSoA[12][j],BatchSoA[13][j],BatchSoA[14][j],BatchSoA[15][j]);return r;
+}
+#else
+groupshared TileRecord Batch[32];
+#if GS_TILE_RESOLVE_BATCH == 3
+// One validity test per prepared candidate, preserving the original AoS layout.
+groupshared uint BatchLive[32];
+#endif
+void StoreBatch(uint j,TileRecord r){Batch[j]=r;
+#if GS_TILE_RESOLVE_BATCH == 3
+ BatchLive[j]=all(r.Bounds.xy<=r.Bounds.zw)?1u:0u;
+#endif
+}
+TileRecord LoadBatch(uint j){return Batch[j];}
+#endif
+#ifndef GS_TILE_NATIVE
+groupshared float3 RemovalCentersBatch[32];
+void StoreRemovalCenter(uint j,uint slot){if(TileRemovalCount!=0)RemovalCentersBatch[j]=TileViewDataBuffer[TileSortKeys[slot]].TranslatedWorldPos;}
+bool TileInsideRemovalBox(float4 ScreenPos, float3 TranslatedCenter)
+{
+    if (TileRemovalCount == 0u) return false;
+    const float3 Center = TranslatedCenter - TileRemovalPreViewTranslation;
+    float2 ndc = float2(
+        (ScreenPos.x - float(TileOriginX)) / max(float(TileWidth), 1.0) * 2.0 - 1.0,
+        1.0 - (ScreenPos.y - float(TileOriginY)) / max(float(TileHeight), 1.0) * 2.0);
+    float4 NearH = mul(float4(ndc, 1.0, 1.0), TileRemovalClipToWorld);
+    float4 FarH = mul(float4(ndc, 0.5, 1.0), TileRemovalClipToWorld);
+    if (abs(NearH.w) < 1.0e-7 || abs(FarH.w) < 1.0e-7) return false;
+    float3 NearPos = NearH.xyz / NearH.w;
+    float3 RayDir = normalize(FarH.xyz / FarH.w - NearPos);
+    float3 PlaneNormal = normalize(Center + TileRemovalPreViewTranslation); // camera-to-splat
+    float Div = dot(RayDir, PlaneNormal);
+    if (Div <= 1.0e-5) return false;
+    float T = dot(Center - NearPos, PlaneNormal) / Div;
+    if (T < 0.0) return false;
+    const float3 WorldSample = NearPos + T * RayDir;
+    [loop] for (uint i = 0u; i < min(TileRemovalCount, 8u); ++i)
+    {
+        const float3 Delta = WorldSample - TileRemovalCenters[i].xyz;
+        if (abs(dot(Delta, TileRemovalAxisX[i].xyz)) <= TileRemovalAxisX[i].w &&
+            abs(dot(Delta, TileRemovalAxisY[i].xyz)) <= TileRemovalAxisY[i].w &&
+            abs(dot(Delta, TileRemovalAxisZ[i].xyz)) <= TileRemovalAxisZ[i].w)
+            return true;
+    }
+    return false;
+}
+#endif
+groupshared uint RunHeads[367];
+groupshared uint MergedSlots[32];
+groupshared uint TerminatedPixels;
+#if GS_RESOLVE_PART == 1
+groupshared uint CostHashes[32];
+#endif
+#if GS_RESOLVE_PART == 3
+groupshared uint CostSlots[32];
+#endif
+// Four ordered bit sets share the original 16x16 sorted list and batch.
+groupshared uint SubtileMasks[4];
+#if GS_TILE_BATCH_SKIP
+groupshared float SubtileMinDepth[4];
+#endif
+groupshared uint SubtileHits[128];
+#if GS_TILE_WAVE_MASK
+groupshared uint MaskWaveValid,MaskNextWave;
+#if GS_TILE_PROBE == 9
+groupshared uint MaskFailureReasons,MaskMismatchLanes;
+#endif
+#endif
+[numthreads(16,16,1)]
+void ResolveCS(uint3 group:SV_GroupID,uint3 local:SV_GroupThreadID,uint lane:SV_GroupIndex) {
+#if GS_TILE_RESOLVE_ORDER
+ // Bijective launch remap, including the partial last stripe. Per-tile math,
+ // sorted member order and every output address remain unchanged.
+ const uint stripeWidth=GS_TILE_RESOLVE_ORDER==1?8:16;
+ uint linearGroup=group.y*TileCountX+group.x;
+ uint stripe=linearGroup/(stripeWidth*TileCountY),baseX=stripe*stripeWidth;
+ uint width=min(stripeWidth,TileCountX-baseX),within=linearGroup-stripe*stripeWidth*TileCountY;
+ group.xy=uint2(baseX+within%width,within/width);
+#endif
+ uint2 pixel=group.xy*16+local.xy;bool valid=all(pixel<uint2(TileWidth,TileHeight));
+ uint tile=group.y*TileCountX+group.x;
+#if GS_RESOLVE_PART == 3
+ if(tile==0 && lane==0){uint total=TileCountX*TileCountY,selectedCount=(total+15)/16;if((selectedCount-1)*16+(TileProfileSeed&15u)>=total)TileCostMeta[selectedCount-1]=0;}
+#endif
+ if(lane==0)GroupHeader=uint4(TileCounts[tile],TileOffsets[tile],TileStats[6]|TileStats[7],TileStats[0]);
+ GroupMemoryBarrierWithGroupSync();
+ uint n=GroupHeader.x,offset=GroupHeader.y;
+#if GS_TILE_PROBE == 9
+ // Exact lane layout in the real compiled Resolve, even for an empty tile0.
+#if GS_TILE_WAVE_MASK
+ if(tile==0)TileAuditDigest[TileCountX*TileCountY*2+lane]=(WaveGetLaneCount()<<16)|(WaveGetLaneIndex()<<8)|lane;
+#endif
+ // Two independent halves: wave (0) and reference (1). Both timed shaders
+ // perform the same per-group proof stores; no global atomics in timing.
+ if(lane==0)TileAuditDigest[tile+(GS_TILE_WAVE_MASK?0:TileCountX*TileCountY)]=0;
+#endif
+ // Every lane takes the same return, before the first loop barrier.
+ if(GroupHeader.z!=0 || GroupHeader.w>TileEntryCapacity || !DensitySelected(n))return;
+ #if GS_TILE_COUNTERS
+ uint validW=min(16u,TileWidth-group.x*16),validH=min(16u,TileHeight-group.y*16);
+ uint sampleLane=((tile*1664525u+TileProfileSeed*1013904223u)%(validW*validH));
+ uint sampleX=sampleLane%validW,sampleY=sampleLane/validW;
+ bool samplePixel=valid && local.x==sampleX && local.y==sampleY;
+ uint pc[24];for(uint z=0;z<24;++z)pc[z]=0;
+ uint meta=TileProfileMetaOffset+tile*32;
+ uint mergeReads=0,rectangleTests=0,maskHits=0,cachedEntries=0,recheckEntries=0;
+#endif
+ if(lane==0){TerminatedPixels=0;
+#if GS_TILE_WAVE_MASK
+ MaskWaveValid=1;MaskNextWave=0;
+#if GS_TILE_PROBE == 9
+ MaskFailureReasons=0;MaskMismatchLanes=0;
+#endif
+#endif
+ }
+ uint runs=(n+8191)/8192;
+#if GS_TILE_DENSE_MERGE
+ uint2 denseMeta=TileDenseMeta[tile];bool denseMerged=n>8192 && denseMeta.y!=0;if(denseMerged)runs=1;
+#endif
+ if(TileAblation==5)runs=1;
+ for(uint i=lane;i<runs;i+=256)RunHeads[i]=TileFrontToBack!=0?min(n,(i+1)*8192):i*8192;
+ GroupMemoryBarrierWithGroupSync();
+#if GS_TILE_WAVE_MASK
+ // Assign one unique job per actual wave, independent of group index order.
+ // All 256 threads are active here. Only the leader of each wave increments.
+ uint maskWaveJob=0;
+ if(WaveIsFirstLane())InterlockedAdd(MaskNextWave,1,maskWaveJob);
+ maskWaveJob=WaveReadLaneFirst(maskWaveJob);
+#if GS_TILE_PROBE == 9
+ uint reasons=(WaveGetLaneCount()!=32?1u:0u)|(GS_TILE_MASK_FORCE_FALLBACK?4u:0u);
+ if(reasons!=0){InterlockedAnd(MaskWaveValid,0);InterlockedOr(MaskFailureReasons,reasons);}
+#else
+ if(GS_TILE_MASK_FORCE_FALLBACK || WaveGetLaneCount()!=32)InterlockedAnd(MaskWaveValid,0);
+#endif
+ GroupMemoryBarrierWithGroupSync();
+ // Eight full 32-lane waves cover this 16x16 group. Other sizes use fallback.
+ bool useWaveMasks=MaskWaveValid!=0 && MaskNextWave==8;
+#if GS_TILE_PROBE == 9
+ if(lane==0 && MaskNextWave!=8)MaskFailureReasons|=2;
+#endif
+#endif
+#if GS_TILE_PROBE == 9
+ if(lane==0 && n>0){
+#if GS_TILE_WAVE_MASK
+  TileAuditDigest[tile]=(useWaveMasks?1u:2u)|(MaskFailureReasons<<2)|(WaveGetLaneCount()<<8)|(MaskMismatchLanes<<16);
+#else
+  TileAuditDigest[tile+TileCountX*TileCountY]=3;
+#endif
+ }
+#endif
+#if GS_RESOLVE_PART == 1
+ uint recordHash=2166136261u;
+#endif
+#if GS_RESOLVE_PART == 3
+ uint validWidth=min(16u,TileWidth-group.x*16),validHeight=min(16u,TileHeight-group.y*16);
+ uint sampled=CostSampleIndex(tile,TileProfileSeed,validWidth,validHeight);
+ bool costSample=(tile&15u)==(TileProfileSeed&15u) && valid && local.x==sampled%validWidth && local.y==sampled/validWidth;
+ uint traceCount=0,traceGeometry=0,traceExp=0,selected=tile/16;
+#endif
+ bool fusedBatch=false;
+#if GS_TILE_RESOLVE_BATCH == 2 && GS_TILE_WAVE_MASK
+ // Uniform group decision. Non-32-lane devices keep the original barriers.
+ fusedBatch=useWaveMasks && (TileSubtileCull!=0 || GS_TILE_BATCH_SKIP!=0);
+#endif
+ float sceneZ=valid?TileSceneDepth.Load(int3(pixel+uint2(TileOriginX,TileOriginY),0)):1;
+ float4 color=0;float nearest=4398046511104.0,fog=0,transmission=1;bool terminated=false;
+ float2 bounds=asfloat(TileBoundsLimits[tile]);
+ float k=TileQuality==3?5.15:4.0,edge=exp(-k);
+ for(uint base=0;base<n;base+=32){
+  uint batchSize=min(32,n-base);
+  if(runs>1){
+   if(lane==0)for(uint j=0;j<batchSize;++j){
+    uint best=TileFrontToBack!=0?0:0xffffffff,bestRun=0;bool found=false;
+    for(uint k=0;k<runs;++k){uint head=RunHeads[k];bool available=TileFrontToBack!=0?head>k*8192:head<min(n,(k+1)*8192);
+     if(available){
+#if GS_TILE_COUNTERS
+     ++mergeReads;
+#endif
+     uint slot=TileEntries[offset+(TileFrontToBack!=0?head-1:head)];if(!found || (TileFrontToBack!=0?slot>best:slot<best)){best=slot;bestRun=k;found=true;}}}
+    MergedSlots[j]=best;if(TileFrontToBack!=0)--RunHeads[bestRun];else ++RunHeads[bestRun];
+   }
+   GroupMemoryBarrierWithGroupSync();
+  }
+  if(!fusedBatch){
+  if(lane<batchSize){uint slot;
+#if GS_TILE_DENSE_MERGE
+   if(denseMerged)slot=TileDenseEntries[denseMeta.x+(TileFrontToBack!=0?n-1-base-lane:base+lane)];else
+#endif
+   slot=runs>1?MergedSlots[lane]:TileEntries[offset+(TileFrontToBack!=0?n-1-base-lane:base+lane)];
+   StoreBatch(lane,TileRecords[slot]);
+#ifndef GS_TILE_NATIVE
+   StoreRemovalCenter(lane,slot);
+#endif
+#if GS_RESOLVE_PART == 3
+   CostSlots[lane]=slot;
+#endif
+  }
+  GroupMemoryBarrierWithGroupSync();
+  }
+#if GS_RESOLVE_PART == 1
+  if(lane<batchSize){TileRecord r=LoadBatch(lane);uint4 a=asuint(r.CenterInverse0),b=asuint(r.Inverse1Depth),c=asuint(r.Color),d=r.Bounds;
+   recordHash=(recordHash*16777619u)^a.x^(a.y*3u)^(a.z*5u)^(a.w*7u)^b.x^(b.y*11u)^(b.z*13u)^(b.w*17u)^c.x^(c.y*19u)^(c.z*23u)^(c.w*29u)^d.x^(d.y*31u)^(d.z*37u)^(d.w*41u);}
+  GroupMemoryBarrierWithGroupSync();continue;
+#endif
+  uint candidates=0xffffffffu>>(32-batchSize);
+#if GS_TILE_PROBE == 4
+  // Identical conservative masks from a separate same-input preparation pass.
+  // This probe still pays global mask loads and one group synchronization.
+  uint maskAt=((offset>>5)+tile+(base>>5))*2;
+  if(lane<4){
+   SubtileMasks[lane]=TileAuditMasks[maskAt][lane];
+#if GS_TILE_BATCH_SKIP
+   SubtileMinDepth[lane]=asfloat(TileAuditMasks[maskAt+1][lane]);
+#endif
+  }
+  GroupMemoryBarrierWithGroupSync();
+  candidates=SubtileMasks[(local.y/8)*2+local.x/8];
+#else
+  if(TileSubtileCull!=0 || GS_TILE_BATCH_SKIP!=0){
+#if GS_TILE_WAVE_MASK
+  if(useWaveMasks){
+   // Exactly four complete waves, one conservative 8x8 region each.
+   // Reduce bit positions explicitly rather than assuming ballot lane bits.
+   if(maskWaveJob<4){
+    uint quadrant=maskWaveJob,j=WaveGetLaneIndex();uint hit=0;TileRecord maskRecord;
+    if(j<batchSize){
+     if(fusedBatch){uint slot;
+#if GS_TILE_DENSE_MERGE
+      if(denseMerged)slot=TileDenseEntries[denseMeta.x+(TileFrontToBack!=0?n-1-base-j:base+j)];else
+#endif
+      slot=runs>1?MergedSlots[j]:TileEntries[offset+(TileFrontToBack!=0?n-1-base-j:base+j)];
+      maskRecord=TileRecords[slot];
+      // Only one actual wave writes shared records; all four form masks from registers.
+      if(quadrant==0){StoreBatch(j,maskRecord);
+#ifndef GS_TILE_NATIVE
+       StoreRemovalCenter(j,slot);
+#endif
+      }
+     }else maskRecord=LoadBatch(j);
+     uint2 origin=group.xy*16+uint2(quadrant&1,quadrant>>1)*8;
+     hit=TileSubtileCull==0 || RectIntersectsEllipse(maskRecord,origin,8);
+#if GS_TILE_RESOLVE_BATCH
+     hit=hit && all(maskRecord.Bounds.xy<=maskRecord.Bounds.zw);
+#endif
+    }
+    uint mask=WaveActiveBitOr(hit<<j);
+#if GS_TILE_BATCH_SKIP
+    float d=3.402823e38;
+    if(hit!=0){float depth=maskRecord.Inverse1Depth.w;d=isfinite(depth)&&depth>=0?depth:0;}
+    float minimumDepth=WaveActiveMin(d);
+#endif
+    if(WaveIsFirstLane()){SubtileMasks[quadrant]=mask;
+#if GS_TILE_BATCH_SKIP
+     SubtileMinDepth[quadrant]=minimumDepth;
+#endif
+    }
+   }
+   GroupMemoryBarrierWithGroupSync();
+  }else
+#endif
+  {
+  if(lane<128){
+   uint quadrant=lane/32,j=lane&31;uint hit=0;
+   if(j<batchSize){uint2 origin=group.xy*16+uint2(quadrant&1,quadrant>>1)*8;
+    TileRecord maskRecord=LoadBatch(j);
+    hit=TileSubtileCull==0 || RectIntersectsEllipse(maskRecord,origin,8);
+#if GS_TILE_RESOLVE_BATCH
+    hit=hit && all(maskRecord.Bounds.xy<=maskRecord.Bounds.zw);
+#endif
+   }
+   SubtileHits[lane]=hit;
+  }
+  GroupMemoryBarrierWithGroupSync();
+  if(lane<4){uint mask=0;
+#if GS_TILE_BATCH_SKIP
+   float minimumDepth=3.402823e38;
+#endif
+   for(uint j=0;j<batchSize;++j){uint hit=SubtileHits[lane*32+j];mask|=hit<<j;
+#if GS_TILE_BATCH_SKIP
+    if(hit!=0){float depth=LoadBatch(j).Inverse1Depth.w;minimumDepth=min(minimumDepth,isfinite(depth)&&depth>=0?depth:0);}
+#endif
+   }
+   SubtileMasks[lane]=mask;
+#if GS_TILE_BATCH_SKIP
+   SubtileMinDepth[lane]=minimumDepth;
+#endif
+  }
+  GroupMemoryBarrierWithGroupSync();
+  }
+  candidates=SubtileMasks[(local.y/8)*2+local.x/8];
+#if GS_TILE_COUNTERS
+  if(lane==0){rectangleTests+=TileSubtileCull!=0?batchSize*4:0;for(uint q=0;q<4;++q)maskHits+=countbits(SubtileMasks[q]);}
+#endif
+  }
+#endif
+#if GS_TILE_PROBE == 3
+  // Materialize mask/depth only; preserve all original loading, ordering and
+  // mask preparation. Global writes make the work observable to the compiler.
+  if(lane==0){
+   uint at=((offset>>5)+tile+(base>>5))*2;
+   TileAuditMasks[at]=uint4(SubtileMasks[0],SubtileMasks[1],SubtileMasks[2],SubtileMasks[3]);
+#if GS_TILE_BATCH_SKIP
+   TileAuditMasks[at+1]=asuint(float4(SubtileMinDepth[0],SubtileMinDepth[1],SubtileMinDepth[2],SubtileMinDepth[3]));
+#else
+   TileAuditMasks[at+1]=0;
+#endif
+  }
+  GroupMemoryBarrierWithGroupSync();continue;
+#endif
+  uint beforeBatchSkip=candidates;
+#if GS_TILE_BATCH_SKIP
+  if(terminated && SubtileMinDepth[(local.y/8)*2+local.x/8]>=nearest)candidates=0;
+#endif
+  #if GS_TILE_COUNTERS
+  if(samplePixel && beforeBatchSkip!=candidates){pc[17]+=countbits(beforeBatchSkip);++pc[18];}
+  if(lane==0)for(uint cj=0;cj<batchSize;++cj){TileRecord cr=LoadBatch(cj);uint area=(cr.Bounds.z-cr.Bounds.x+1)*(cr.Bounds.w-cr.Bounds.y+1);if(TileReuseMask!=0 && area<=GS_MASK_WORDS*32)++cachedEntries;else ++recheckEntries;}
+  if(samplePixel){pc[0]+=batchSize;pc[1]+=countbits(beforeBatchSkip);++pc[2];}
+#endif
+#if GS_TILE_PROBE == 5
+  // Diagnostic scratch output only. RGB/fog remain equivalent; nearest depth
+  // can change because depth-only continuation is deliberately removed.
+  if(terminated)candidates=0;
+#endif
+  if(valid)while(candidates!=0){
+#if GS_TILE_PROBE == 5
+   if(terminated)break;
+#endif
+   uint j=firstbitlow(candidates);candidates&=candidates-1;
+   PC_INC(3);
+#if GS_RESOLVE_PART == 3
+   uint traceAt=0xffffffffu;
+   if(costSample){if(traceCount<1024){traceAt=selected*1024+traceCount;TileCostTrace[traceAt]=uint4(CostSlots[j],0,0,0);}++traceCount;}
+#endif
+#if GS_TILE_RESOLVE_BATCH == 1 || GS_TILE_RESOLVE_BATCH == 2
+   // Bounds validity was shared by the conservative masks. Read geometry first;
+   // color is loaded only if alpha passes and color accumulation is still active.
+   TileRecord r;
+   r.CenterInverse0=asfloat(uint4(BatchSoA[0][j],BatchSoA[1][j],BatchSoA[2][j],BatchSoA[3][j]));
+   r.Inverse1Depth=asfloat(uint4(BatchSoA[4][j],BatchSoA[5][j],BatchSoA[6][j],BatchSoA[7][j]));
+#elif GS_TILE_RESOLVE_BATCH == 3
+   if(BatchLive[j]==0){PC_INC(4);continue;}
+   TileRecord r;
+   r.Inverse1Depth.w=Batch[j].Inverse1Depth.w;
+   if(terminated && r.Inverse1Depth.w>=nearest){PC_INC(5);continue;}
+   r.Inverse1Depth.z=Batch[j].Inverse1Depth.z;
+   PC_INC(6);if(r.Inverse1Depth.z<sceneZ){PC_INC(7);continue;}
+   r.CenterInverse0=Batch[j].CenterInverse0;
+   r.Inverse1Depth.xy=Batch[j].Inverse1Depth.xy;
+#else
+   TileRecord r=LoadBatch(j);if(any(r.Bounds.xy>r.Bounds.zw)){PC_INC(4);continue;}
+#endif
+#if GS_TILE_RESOLVE_BATCH != 3
+   if(terminated && r.Inverse1Depth.w>=nearest){PC_INC(5);continue;}
+   PC_INC(6);if(r.Inverse1Depth.z<sceneZ){PC_INC(7);continue;}
+#endif
+   PC_INC(8);
+   float2 delta=float2(pixel)+.5-r.CenterInverse0.xy;
+   float2 p=float2(dot(delta,r.CenterInverse0.zw),dot(delta,r.Inverse1Depth.xy));
+   float d2=dot(p,p);
+#if GS_RESOLVE_PART == 3
+   if(costSample){++traceGeometry;if(traceAt!=0xffffffffu)TileCostTrace[traceAt]=uint4(CostSlots[j],1,asuint(d2),0);}
+#endif
+   if(d2>1){PC_INC(9);continue;}
+#ifndef GS_TILE_NATIVE
+   if(TileRemovalCount!=0 && TileInsideRemovalBox(float4(float2(pixel+uint2(TileOriginX,TileOriginY))+.5,0,1),RemovalCentersBatch[j]))continue;
+#endif
+   PC_INC(10);
+#if GS_TILE_RESOLVE_BATCH == 1 || GS_TILE_RESOLVE_BATCH == 2
+   r.Color.a=asfloat(BatchSoA[11][j]);
+#elif GS_TILE_RESOLVE_BATCH == 3
+   r.Color.a=Batch[j].Color.a;
+#endif
+   float alpha=saturate((exp(-k*d2)-edge)/max(1-edge,.0001)*r.Color.a);
+#if GS_RESOLVE_PART == 3
+   if(costSample){++traceExp;if(traceAt!=0xffffffffu)TileCostTrace[traceAt]=uint4(CostSlots[j],2,asuint(d2),asuint(alpha));}
+#endif
+   if(alpha<1.0/255.0){PC_INC(11);continue;}
+   PC_INC(12);
+   nearest=min(nearest,r.Inverse1Depth.w);
+   if(terminated){PC_INC(13);continue;} // Depth-only continuation preserves the original minimum-depth output.
+   PC_INC(14);
+#if GS_TILE_RESOLVE_BATCH == 1 || GS_TILE_RESOLVE_BATCH == 2
+   r.Color.rgb=asfloat(uint3(BatchSoA[8][j],BatchSoA[9][j],BatchSoA[10][j]));
+#elif GS_TILE_RESOLVE_BATCH == 3
+   r.Color.rgb=Batch[j].Color.rgb;
+#endif
+   if(TileFrontToBack!=0){
+    float weight=transmission*alpha;
+    #if GS_TILE_PROBE != 2 && GS_RESOLVE_PART != 2
+    color.rgb+=r.Color.rgb*weight;fog+=r.Inverse1Depth.w*.01*weight;
+#endif
+    transmission*=1-alpha;color.a=1-transmission;
+    // Bounds are over the complete tile, including negative/HDR radiance.
+    // Pre-quantization omitted alpha/radiance <= threshold; omitted weighted fog <= 0.1 mm.
+    // Final half conversion and reversed accumulation introduce separate rounding differences.
+    terminated=TileEarlyThreshold>0 && transmission<=TileEarlyThreshold && transmission*bounds.x<=TileEarlyThreshold && transmission*bounds.y<=.0001;
+   }else{
+    #if GS_TILE_PROBE != 2 && GS_RESOLVE_PART != 2
+    color=float4(r.Color.rgb*alpha,alpha)+color*(1-alpha);
+    fog=r.Inverse1Depth.w*.01*alpha+fog*(1-alpha);
+#else
+    color.a=alpha+color.a*(1-alpha);
+#endif
+    if(TileHalfRound!=0){color=RoundHalf4(color);fog=RoundHalf(fog);}
+   }
+  }
+  GroupMemoryBarrierWithGroupSync();
+ }
+#if GS_RESOLVE_PART == 1
+ if(lane<32)CostHashes[lane]=recordHash;
+ GroupMemoryBarrierWithGroupSync();
+ if(lane==0){uint digest=0;for(uint j=0;j<32;++j)digest^=CostHashes[j];TileCostDigest[tile]=uint2(digest,n);}
+ return;
+#endif
+#if GS_RESOLVE_PART == 3
+ if(costSample)TileCostMeta[selected]=uint4(min(traceCount,1024u),traceCount,traceGeometry,traceExp);
+#endif
+#if GS_TILE_PROBE == 3
+ return;
+#endif
+ if(valid && terminated)InterlockedAdd(TerminatedPixels,1);
+ GroupMemoryBarrierWithGroupSync();
+ #if GS_TILE_PROBE == 0
+ if(lane==0)InterlockedAdd(TileStats[5],TerminatedPixels);
+#endif
+#if GS_TILE_COUNTERS
+ if(lane==0){TileProfileData[meta]=n;TileProfileData[meta+1]=runs;TileProfileData[meta+2]=(n+31)/32;
+ TileProfileData[meta+3]=mergeReads;TileProfileData[meta+4]=rectangleTests;TileProfileData[meta+5]=maskHits;
+ TileProfileData[meta+6]=sampleY*16+sampleX;TileProfileData[meta+7]=validW*validH;
+ TileProfileData[meta+25]=cachedEntries;TileProfileData[meta+26]=recheckEntries;for(uint rz=29;rz<32;++rz)TileProfileData[meta+rz]=0;}
+ if(samplePixel){TileProfileData[meta+27]=pc[17];TileProfileData[meta+28]=pc[18];pc[15]=terminated?1:0;pc[16]=asuint(color.a);for(uint z=0;z<17;++z)TileProfileData[meta+8+z]=pc[z];}
+#endif
+ if(TileFrontToBack!=0 && TileHalfRound!=0){color=RoundHalf4(color);fog=RoundHalf(fog);}
+ if(valid){
+#if GS_TILE_PROBE == 6
+  uint4 packed;
+  packed.x=f32tof16(color.r)|(f32tof16(color.g)<<16);
+  packed.y=f32tof16(color.b)|(f32tof16(color.a)<<16);
+  packed.z=asuint(nearest);packed.w=f32tof16(fog);
+  TileAuditPacked[pixel.y*TileWidth+pixel.x]=packed;
+#else
+  TilePixels[pixel.y*TileWidth+pixel.x]=MakeTilePixel(color,nearest,fog);
+#endif
+ }
+}
+#if GS_TILE_STAGE == 17
+[numthreads(16,16,1)]
+void AuditReadCS(uint3 id:SV_DispatchThreadID){
+ if(any(id.xy>=uint2(TileWidth,TileHeight)))return;
+ uint index=id.y*TileWidth+id.x;uint4 color;uint depth,fog;
+#if GS_TILE_PROBE == 8
+ uint4 v=TileAuditPacked[index];
+ color=asuint(float4(f16tof32(v.x&65535),f16tof32(v.x>>16),f16tof32(v.y&65535),f16tof32(v.y>>16)));
+ depth=v.z;fog=asuint(f16tof32(v.w&65535));
+#else
+ float4 c;float d,f;DecodeTilePixel(TilePixels[index],c,d,f);color=asuint(c);depth=asuint(d);fog=asuint(f);
+#endif
+ // Read all six meaningful output components with a common observable write.
+ TileAuditDigest[index]=color.x^(color.y*3u)^(color.z*5u)^(color.w*7u)^(depth*11u)^(fog*13u);
+}
+#endif
+#if GS_RESOLVE_PART == 4 || GS_RESOLVE_PART == 5
+[numthreads(64,1,1)]
+void CostReplayCS(uint3 id:SV_DispatchThreadID){
+ uint selected=id.x,tiles=TileCountX*TileCountY,selectedCount=(tiles+15)/16;if(selected>=selectedCount)return;
+ uint tile=selected*16+(TileProfileSeed&15u);uint digest=2166136261u;
+ if(tile<tiles){
+  uint2 group=uint2(tile%TileCountX,tile/TileCountX);
+  uint validW=min(16u,TileWidth-group.x*16),validH=min(16u,TileHeight-group.y*16);
+  uint sample=CostSampleIndex(tile,TileProfileSeed,validW,validH);
+  float2 pixel=float2(group*16+uint2(sample%validW,sample/validW))+.5;
+  uint count=TileCostMeta[selected].x;
+  float k=TileQuality==3?5.15:4.0,edge=exp(-k);
+  for(uint i=0;i<count;++i){uint4 entry=TileCostTrace[selected*1024+i];
+   float d2=0,alpha=0;
+   if(entry.y>=1){
+#if GS_RESOLVE_PART == 4
+    TileRecord r=TileRecords[entry.x];float2 delta=pixel-r.CenterInverse0.xy;
+    float2 q=float2(dot(delta,r.CenterInverse0.zw),dot(delta,r.Inverse1Depth.xy));d2=dot(q,q);
+    if(entry.y>=2)alpha=saturate((exp(-k*d2)-edge)/max(1-edge,.0001)*r.Color.a);
+#else
+    d2=asfloat(entry.z);if(entry.y>=2)alpha=asfloat(entry.w);
+#endif
+   }
+   // Identical recorded control and observable sink; cached read is not free.
+   digest=(digest*16777619u)^entry.x^(entry.y*7u)^asuint(d2)^(asuint(alpha)*13u);
+  }
+ }
+#if GS_RESOLVE_PART == 4
+ TileCostDigest[selected].x=digest;
+#else
+ TileCostDigest[selected].y=digest;
+#endif
+}
+#endif
+
+void AuditUnusedTerminator(){
+}
+// Explicit empty output; never expose a stale/uninitialized pixel buffer.
+[numthreads(16,16,1)]
+void EmptyPixelsCS(uint3 group:SV_GroupID,uint3 local:SV_GroupThreadID){
+ uint2 pixel=group.xy*16+local.xy;
+ if(all(pixel<uint2(TileWidth,TileHeight))){TilePixels[pixel.y*TileWidth+pixel.x]=MakeTilePixel(0,4398046511104.0,0);}
+ if(all(group==0)&&all(local==0)){TileRasterArgs[0]=6;TileRasterArgs[1]=0;TileRasterArgs[2]=0;TileRasterArgs[3]=0;TileRasterArgs[4]=0;}
+}
+
+#if !defined(GS_TILE_NATIVE) || defined(GS_TILE_NATIVE_PIXEL)
+#ifdef GS_TILE_NATIVE_PIXEL
+StructuredBuffer<TilePixel> TileResolvedPixels : register(t5);
+StructuredBuffer<uint> TileOutputStats : register(t6);
+#else
+StructuredBuffer<TilePixel> TileResolvedPixels;
+StructuredBuffer<uint> TileOutputStats;
+#endif
+float4 TileVS(uint id:SV_VertexID):SV_Position {
+ float2 uv=float2((id<<1)&2,id&2);return float4(uv*float2(2,-2)+float2(-1,1),1,1);
+}
+struct TileTargets {float4 Color:SV_Target0;float Depth:SV_Target1;float4 Fog:SV_Target2;};
+TileTargets TilePS(float4 position:SV_Position){
+ if(TileOutputStats[0]>TileEntryCapacity || TileOutputStats[6]!=0 || TileOutputStats[7]!=0)discard;
+ uint2 pixel=uint2(position.xy)-uint2(TileOriginX,TileOriginY);
+ TilePixel p=TileResolvedPixels[pixel.y*TileWidth+pixel.x];
+ float4 color;float depth,fog;DecodeTilePixel(p,color,depth,fog);
+ TileTargets o;o.Color=color;o.Depth=depth;o.Fog=float4(fog,0,0,0);return o;
+}
+#endif
+
+#ifdef GS_TILE_STAGE
+#if GS_TILE_STAGE == 18
+[numthreads(64,1,1)] void MainCS(uint3 id:SV_DispatchThreadID){CostReplayCS(id);}
+#elif GS_TILE_STAGE == 17
+[numthreads(16,16,1)] void MainCS(uint3 id:SV_DispatchThreadID){AuditReadCS(id);}
+#elif GS_TILE_STAGE == 14
+[numthreads(1,1,1)] void MainCS(uint3 id:SV_DispatchThreadID){CooperativeArgsCS(id);}
+#elif GS_TILE_STAGE == 15 || GS_TILE_STAGE == 16
+[numthreads(32,1,1)] void MainCS(uint3 g:SV_GroupID,uint lane:SV_GroupIndex){
+#if GS_TILE_STAGE == 15
+ CooperativeRegisterCS(g,lane);
+#else
+ CooperativeEmitCS(g,lane);
+#endif
+}
+#elif GS_TILE_STAGE == 6 || GS_TILE_STAGE == 13
+[numthreads(16,16,1)]
+void MainCS(uint3 g:SV_GroupID,uint3 l:SV_GroupThreadID,uint lane:SV_GroupIndex){
+#if GS_TILE_STAGE == 13
+EmptyPixelsCS(g,l);
+#else
+#if GS_TILE_REGION_LIST
+ uint tile=g.y*TileCountX+g.x;uint4 meta=TileRegionMeta[tile];uint n=TileCounts[tile],offset=TileOffsets[tile];
+ bool ready=n>32 && n<=8192 && (meta.x&0x80000000u)!=0 && all((meta&uint4(0x7fffffffu,0xffffffffu,0xffffffffu,0xffffffffu))<=n) && TileStats[6]==0 && TileStats[7]==0 && TileStats[0]<=TileEntryCapacity && offset<=TileRegionCapacity/4 && n<=TileRegionCapacity/4-offset;
+ if(ready)ResolveRegionCS(g,l,lane,meta);else ResolveCS(g,l,lane);
+#else
+ ResolveCS(g,l,lane);
+#endif
+#endif
+}
+#else
+#if GS_TILE_STAGE == 5 && GS_TILE_SORT_BUCKET == 1
+[numthreads(32,1,1)]
+#else
+[numthreads(256,1,1)]
+#endif
+void MainCS(uint3 id:SV_DispatchThreadID,uint3 g:SV_GroupID,uint lane:SV_GroupIndex){
+#if GS_TILE_STAGE == 0
+ClearCS(id);
+#elif GS_TILE_STAGE == 1
+BuildCS(id);
+#elif GS_TILE_STAGE == 2
+PrefixCS(id,lane);
+#elif GS_TILE_STAGE == 3
+EmitCS(id);
+#elif GS_TILE_STAGE == 4
+ValidateCS(id);
+#elif GS_TILE_STAGE == 5
+SortCS(g,lane);
+#elif GS_TILE_STAGE == 7
+BuildCS(id);
+#elif GS_TILE_STAGE == 8
+RegisterCS(id);
+#elif GS_TILE_STAGE == 9
+EmitCS(id);
+#elif GS_TILE_STAGE == 10
+BoundsCS(g,lane);
+#elif GS_TILE_STAGE == 11
+#if GS_TILE_DENSE_MERGE
+DensePrefixCS(lane);
+#endif
+#elif GS_TILE_STAGE == 12
+#if GS_TILE_DENSE_MERGE
+DenseMergeCS(g,lane);
+#endif
+#endif
+}
+#endif
+#endif
+
+
+
+

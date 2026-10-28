@@ -1,0 +1,2150 @@
+#include "/Plugin/LCCCinematicGS/Private/PCVRSharedLighting.ush"
+
+uint PCVRShadowBlueOverlay;
+float3 ApplyPCVRShadowBlueOverlay(float3 finalColor, FVertexOutput Input)
+{
+    // Use the actual cast payload consumed by Final, before its carrier floor,
+    // grading and reflected fill. Closure/AO and photographed shadows do not
+    // create this mask. Invalid/unbound sentinels must not become blue.
+    if (PCVRShadowBlueOverlay == 0u || Input.StableBindingDebug < 0.0)
+        return finalColor;
+    float castShadow = 1.0 - saturate(Input.StableBindingDebug);
+    float coverage = smoothstep(0.02, 0.80, castShadow);
+    return lerp(finalColor, float3(0.015, 0.12, 1.0), coverage * 0.95);
+}
+
+FVertexOutput MainVS(
+	uint VertexId : SV_VertexID,
+	uint InstanceId : SV_InstanceID)
+{
+	FVertexOutput Output;
+#if GS_VR_RASTER_CLIP
+    Output.CornerClipDistance=1.0.xxxx;
+#endif
+
+	// Quad corners based on vertex ID:
+	// 0=(-1,-1), 1=(1,-1), 2=(-1,1), 3=(1,1)
+	float2 corner;
+	corner.x = (VertexId & 1) ? 1.0 : -1.0;
+	corner.y = (VertexId & 2) ? 1.0 : -1.0;
+
+	// Get sorted splat index
+	uint splatIndex = SortKeysBuffer[InstanceId];
+	FGaussianSplatViewData viewData = ViewDataBuffer[splatIndex];
+
+#if GS_VR_BASELINE
+    // Keep trained SH colour and projection; strip all weather payload unpacking.
+    Output = (FVertexOutput)0;
+    if (viewData.ClipPosition.w <= 0.0) { Output.Position = float4(0,0,0,1); return Output; }
+    float2 rg = UnpackHalf2x16(viewData.PackedColorRG);
+    float2 ba = UnpackHalf2x16(viewData.PackedColorBA);
+    Output.Color = float4(rg, ba);
+    // Solve the existing 1/255 alpha cutoff analytically. A small margin handles
+    // half packing / floating point rounding. LocalPos stays in ORIGINAL units.
+    float k = BaselineRenderQualityMode == 3u ? 5.15 : 4.0;
+    float edge = exp(-k);
+    float minWeight = (1.0 / 255.0) / max(ba.y, 1.0e-10);
+    float radius = min(1.0, sqrt(max(0.0, -log(min(1.0, edge + (1.0-edge)*minWeight)) / k)) + 0.002);
+    float2 local = corner * radius;
+    float2 offset = local.x * viewData.Axis1 + local.y * viewData.Axis2;
+    Output.Position = float4(viewData.ClipPosition.xy + offset * viewData.ClipPosition.w,
+                             viewData.ClipPosition.zw);
+#if GS_VR_RASTER_CLIP
+    // In original Gaussian local coordinates, the accepted disk is contained
+    // in this circumscribed octagon. Its four diagonal planes cut only empty
+    // square corners; the pixel falloff and 1/255 cutoff remain unchanged.
+    // Skip small splats, where extra clipping/setup can cost more than shading.
+    float determinant = abs(viewData.Axis1.x*viewData.Axis2.y-viewData.Axis1.y*viewData.Axis2.x);
+    float quadAreaPixels = radius*radius*determinant*BaselineRasterClipParams.x*BaselineRasterClipParams.y;
+    float limit = radius*1.4142137 + 0.0001;
+    float4 diagonal = float4(local.x+local.y,local.x-local.y,-local.x+local.y,-local.x-local.y);
+    Output.CornerClipDistance = quadAreaPixels>=BaselineRasterClipParams.z ? limit-diagonal : 1.0.xxxx;
+#endif
+    Output.LocalPos = local;
+    Output.TranslatedWorldPos = float4(viewData.TranslatedWorldPos,
+        PCVRReuseRadialDepth != 0u ? length(viewData.TranslatedWorldPos) : 0.0);
+    return Output;
+#else
+	// Default: normal rendering mode
+	Output.DebugFlag = 0;
+	Output.DirectColor = float3(0.0, 0.0, 0.0);
+	float2 transmissionRG = UnpackHalf2x16(viewData.StructPadding0);
+	float2 transmissionBMask = UnpackHalf2x16(viewData.StructPadding1);
+	Output.PlantTransmissionColor = float3(transmissionRG.x, transmissionRG.y, transmissionBMask.x);
+	Output.TranslatedWorldPos = float4(viewData.TranslatedWorldPos,
+        PCVRReuseRadialDepth != 0u ? length(viewData.TranslatedWorldPos) : 0.0);
+	Output.CenterClipPos = viewData.ClipPosition;
+	Output.PostLightMask = float((viewData.Padding >> 8) & 0xFFu) / 255.0;
+	Output.ProxyShadowMask = float((viewData.Padding >> 16) & 0xFFFFu) / 65535.0;
+	Output.SplatRadiusNDC = 0.0;
+	float2 directBADebug = UnpackHalf2x16(viewData.PackedDirectBA);
+	Output.StableBindingDebug = directBADebug.y;
+	Output.StableTriangleID = 0xFFFFFFFFu;
+	uint packedWeatherSurface = asuint(viewData.TranslatedWorldPosPad);
+	Output.SurfaceNormal = DecodeWeatherOctNormal10(packedWeatherSurface & 0xFFFFFu);
+	Output.SurfaceMembership = float((packedWeatherSurface >> 20) & 0x3Fu) / 63.0;
+	Output.SurfacePuddleMembership = transmissionBMask.y < -1.5 ? 2.0 :
+		float((packedWeatherSurface >> 26) & 0x3Fu) / 63.0;
+	// v29 Rain payload: in Rain mode bits 20..31 are one 12-bit intrinsic world-size value.
+	// Snow retains its legacy two 6-bit fields; Wet only reads this value while Rain is active.
+	Output.SurfaceWorldSizeCm = float((packedWeatherSurface >> 20) & 0xFFFu) * (1.0 / 4095.0);
+
+	// Check validity (w <= 0 means invalid/behind camera)
+	if (viewData.ClipPosition.w <= 0.0)
+	{
+		// Output degenerate triangle
+		Output.Position = float4(0, 0, 0, 1);
+		Output.LocalPos = float2(0, 0);
+		Output.Color = float4(0, 0, 0, 0);
+		Output.DirectColor = float3(0, 0, 0);
+		Output.PlantTransmissionColor = float3(0, 0, 0);
+		Output.TranslatedWorldPos = float4(0, 0, 0, 0);
+		Output.CenterClipPos = float4(0, 0, 0, 1);
+		Output.PostLightMask = 1.0;
+		Output.ProxyShadowMask = 0.0;
+		Output.SplatRadiusNDC = 0.0;
+		Output.StableBindingDebug = -1.0;
+		Output.StableTriangleID = 0xFFFFFFFFu;
+		Output.SurfaceNormal = float3(0.0, 0.0, 1.0);
+		Output.SurfaceMembership = 0.0;
+		Output.SurfacePuddleMembership = 0.0;
+		Output.SurfaceWorldSizeCm = 0.0;
+		return Output;
+	}
+
+	// NDC position of splat center
+	float2 ndc = viewData.ClipPosition.xy / viewData.ClipPosition.w;
+
+	// Use covariance-based axes for quad offset
+	float2 offset = corner.x * viewData.Axis1 + corner.y * viewData.Axis2;
+	Output.SplatRadiusNDC = max(length(viewData.Axis1), length(viewData.Axis2));
+
+	// Unpack color
+	float2 rg = UnpackHalf2x16(viewData.PackedColorRG);
+	float2 ba = UnpackHalf2x16(viewData.PackedColorBA);
+	float2 directRG = UnpackHalf2x16(viewData.PackedDirectRG);
+	float2 directBA = UnpackHalf2x16(viewData.PackedDirectBA);
+	float4 color = float4(rg.x, rg.y, ba.x, ba.y);
+    // The Final source pass never raises alpha. Solve its existing pixel cutoff
+    // before rasterization, retaining original local coordinates and a margin.
+    // Water can raise alpha and is explicitly exempt; debug/preview are gated
+    // on CPU. Normal/depth/fog/bloom/shadow payloads retain their original values.
+    float2 rasterCorner=corner;
+    [branch] if(BaselineRasterClipParams.w>0.5 && Output.SurfacePuddleMembership<=1.5)
+    {
+        float cutoffK=BaselineRenderQualityMode==3u?5.15:4.0;
+        float cutoffEdge=exp(-cutoffK);
+        float cutoffWeight=(1.0/255.0)/max(ba.y,1.e-10);
+        float cutoffRadius=min(1.0,sqrt(max(0.0,-log(min(1.0,cutoffEdge+(1.0-cutoffEdge)*cutoffWeight))/cutoffK))+0.002);
+        rasterCorner*=cutoffRadius;
+        offset=rasterCorner.x*viewData.Axis1+rasterCorner.y*viewData.Axis2;
+    }
+	float3 directColor = float3(directRG.x, directRG.y, directBA.x);
+
+	// Debug mode: override color with cluster-based coloring (Nanite-style)
+	// Only show debug visualization for Nanite-enabled assets; non-Nanite assets are not rendered
+	if (DebugMode == 1)
+	{
+		if (EnableNanite == 1)
+		{
+			// Show cluster colors - each cluster gets a unique random color
+			// Use opaque rendering for clear debug visualization (like Nanite)
+			color.rgb = HashToColor(viewData.ClusterID);
+			directColor = float3(0.0, 0.0, 0.0);
+			color.a = 1.0;  // Fully opaque for solid colors
+			Output.DebugFlag = 1;  // Skip Gaussian falloff in pixel shader
+		}
+		else
+		{
+			// Non-Nanite asset: don't render (background is already cleared to black)
+			Output.Position = float4(0, 0, 0, 1);
+			Output.LocalPos = float2(0, 0);
+			Output.Color = float4(0, 0, 0, 0);
+			Output.DirectColor = float3(0, 0, 0);
+			Output.PlantTransmissionColor = float3(0, 0, 0);
+			Output.PostLightMask = 1.0;
+			Output.ProxyShadowMask = 0.0;
+			Output.SplatRadiusNDC = 0.0;
+			return Output;
+		}
+	}
+
+	Output.Color = color;
+#if GS_PCVR_COLOR_CACHE
+    Output.Color.rgb=PCVRFinalColors[splatIndex].rgb;
+#endif
+	Output.DirectColor = directColor;
+	[branch] if (PerSplatLightingEnabled == 1u)
+	{
+		Output.Color.rgb = EvaluateFinalSplatLighting(Output);
+	}
+
+	// Final clip position
+	Output.Position = float4(
+		(ndc + offset) * viewData.ClipPosition.w,
+		viewData.ClipPosition.z,
+		viewData.ClipPosition.w
+	);
+
+	Output.LocalPos = rasterCorner;
+#if GS_VR_RASTER_CLIP
+    // Circumscribe the existing accepted disk. No alpha threshold, source
+    // opacity, Gaussian falloff or effect equation is changed.
+    float clipRadius=max(abs(rasterCorner.x),abs(rasterCorner.y));
+    float clipDeterminant=abs(viewData.Axis1.x*viewData.Axis2.y-viewData.Axis1.y*viewData.Axis2.x);
+    float clipArea=clipRadius*clipRadius*clipDeterminant*BaselineRasterClipParams.x*BaselineRasterClipParams.y;
+    float4 clipDiagonal=float4(rasterCorner.x+rasterCorner.y,rasterCorner.x-rasterCorner.y,
+        -rasterCorner.x+rasterCorner.y,-rasterCorner.x-rasterCorner.y);
+    Output.CornerClipDistance=clipArea>=BaselineRasterClipParams.z ?
+        clipRadius*1.4142137+0.0001-clipDiagonal : 1.0.xxxx;
+#endif
+	return Output;
+#endif // GS_VR_BASELINE
+}
+
+float3 ApplyPostProcessLightGrade(float3 srgbColor, float lightMask)
+{
+	float3 color = max(srgbColor, 0.0);
+	float luma = max(dot(color, float3(0.2126, 0.7152, 0.0722)), 0.0001);
+	float shadowAmount = 1.0 - smoothstep(0.08, 0.74, lightMask);
+	float sunAmount = smoothstep(0.16, 0.92, lightMask);
+	float gradeGradient = saturate(lightMask);
+
+	// Reference target: warm broken sunlight with readable cool shadows. The old
+	// 2.55x exposure and 0.62 gamma clipped pale roofs/foliage and crushed the
+	// opposite side of the scan. Keep the trained GS exposure as the anchor.
+	float exposureScale = lerp(0.72, 1.48, pow(gradeGradient, 0.82));
+	float gamma = lerp(1.04, 0.88, pow(gradeGradient, 1.10));
+	float contrast = lerp(1.035, 1.00, sunAmount);
+
+	float targetLuma = pow(max(luma * exposureScale, 0.0), gamma);
+	targetLuma = max((targetLuma - 0.5) * contrast + 0.5, 0.0);
+	// Do not create a shadow from this analytic mask. It is only a sun/air grade;
+	// real shadow shape should come from the proxy receiver / UE shadowing path.
+	targetLuma *= lerp(1.0, 0.92, shadowAmount);
+	targetLuma = max(targetLuma, luma * lerp(0.86, 1.02, sunAmount));
+
+	// Filmic highlight shoulder. Retain a small amount above 1 for bloom, but do
+	// not let already-bright captured pixels become flat white plates.
+	if (targetLuma > 1.22)
+	{
+		float over = targetLuma - 1.22;
+		targetLuma = 1.22 + over / (1.0 + over * 1.15);
+	}
+	float3 graded = color * (targetLuma / luma);
+
+	// Warm direct sun / cool forest shadow split, normalized to preserve the
+	// luminance computed above. This is a grade, not replacement RGB lighting.
+	float3 coolShadowTint = float3(0.92, 0.98, 1.06);
+	float3 warmSunTint = float3(1.06, 1.025, 0.90);
+	float3 cinematicTint = lerp(coolShadowTint, warmSunTint, pow(sunAmount, 0.72));
+	graded *= cinematicTint;
+	float tintedLuma = max(dot(graded, float3(0.2126, 0.7152, 0.0722)), 0.0001);
+	graded *= targetLuma / tintedLuma;
+
+	// Color-grade style saturation. Do not desaturate broad mid-shadow areas:
+	// the shadow mask is approximate, so only the deepest unlit regions should
+	// lose meaningful saturation. Sunlit areas still get a small chroma lift.
+	float gradedLuma = dot(graded, float3(0.2126, 0.7152, 0.0722));
+	float deepShadowDesat = 1.0 - smoothstep(0.015, 0.10, lightMask);
+	float saturation = lerp(0.92, 1.08, pow(sunAmount, 0.72));
+	saturation = lerp(saturation, 0.90, deepShadowDesat * 0.45);
+	graded = lerp(float3(gradedLuma, gradedLuma, gradedLuma), graded, saturation);
+
+	// White-hot sun cores: let the strongest highlights become warm white, not just
+	// a saturated version of the original splat color.
+	float whiteHot = smoothstep(0.72, 0.96, sunAmount) * smoothstep(0.88, 1.18, targetLuma);
+	float3 warmWhite = targetLuma * float3(1.04, 1.02, 0.94);
+	graded = lerp(graded, max(graded, warmWhite * 1.12), whiteHot * 0.46);
+
+	// Preserve bloom energy. Only compress extreme values, and leave values above 1.0
+	// available for UE's bloom/tonemapper instead of clamping them away.
+	float peak = max(max(graded.r, graded.g), graded.b);
+	if (peak > 1.85)
+	{
+		float compressedPeak = 1.85 + (peak - 1.85) / (1.0 + (peak - 1.85) * 1.8);
+		graded *= compressedPeak / peak;
+	}
+
+	return lerp(color, graded, 0.72);
+}
+
+
+float3 VisualizeLightingMask(float lightMask, uint previewMode)
+{
+	float mask = saturate(lightMask);
+	float previewMask = smoothstep(0.04, 0.92, mask);
+	previewMask = pow(saturate(previewMask), 0.82);
+
+	if (previewMode == 1u)
+	{
+		return float3(previewMask, previewMask, previewMask);
+	}
+
+	if (previewMode == 2u)
+	{
+		float shadowMask = 1.0 - previewMask;
+		return float3(shadowMask, shadowMask, shadowMask);
+	}
+
+	if (previewMode == 3u)
+	{
+		float3 cold = float3(0.03, 0.07, 0.28);
+		float3 mid = float3(0.08, 0.75, 0.26);
+		float3 hot = float3(1.0, 0.72, 0.08);
+		float3 white = float3(1.0, 1.0, 1.0);
+		float3 lowToMid = lerp(cold, mid, saturate(previewMask * 2.0));
+		float3 highToHot = lerp(hot, white, saturate((previewMask - 0.62) * 2.63));
+		return (previewMask < 0.5) ? lowToMid : lerp(mid, highToHot, saturate((previewMask - 0.5) * 2.0));
+	}
+
+	if (previewMode == 4u)
+	{
+		float proxyShadow = saturate(lightMask);
+		float shapedShadow = pow(smoothstep(0.02, 0.88, proxyShadow), 0.82);
+		return lerp(float3(1.0, 1.0, 1.0), float3(0.02, 0.025, 0.03), shapedShadow);
+	}
+
+	if (previewMode == 6u)
+	{
+		float proxyShadow = saturate(lightMask);
+		return lerp(float3(1.0, 0.0, 0.0), float3(0.0, 0.25, 1.0), pow(proxyShadow, 0.65));
+	}
+
+	return float3(-1.0, -1.0, -1.0);
+}
+
+float CalculateBlockerDistanceFactor(float3 translatedWorldPosition)
+{
+	float blockerDistanceFactor = 0.0;
+	if (ProxyLightDepthForwardEnabled.w >= 0.0)
+	{
+		float3 worldPosition = translatedWorldPosition - PreViewTranslation;
+		float3 lightRelative = worldPosition - ProxyLightDepthOriginWidth.xyz;
+		float lightWidth = max(ProxyLightDepthOriginWidth.w, 1.0);
+		float2 lightUV = float2(
+			0.5 + dot(lightRelative, ProxyLightDepthRightRange.xyz) / lightWidth,
+			0.5 - dot(lightRelative, ProxyLightDepthUpSettings.xyz) / lightWidth);
+		if (all(lightUV >= 0.0) && all(lightUV <= 1.0))
+		{
+			uint lightDepthWidth = 1u;
+			uint lightDepthHeight = 1u;
+			ProxyLightDepthCapture.GetDimensions(lightDepthWidth, lightDepthHeight);
+			float2 lightDepthTexel = 1.0 / max(float2(lightDepthWidth, lightDepthHeight), float2(1.0, 1.0));
+			// A single low-resolution depth texel made DistanceLightening jump at
+			// texel boundaries, visible as broad floor stripes. Use a compact cross
+			// filter here; it is far cheaper than widening the 16-tap color capture.
+			float blockerDepth =
+				ProxyLightDepthCapture.SampleLevel(ProxyLightDepthSampler, lightUV, 0).r * 0.50 +
+				ProxyLightDepthCapture.SampleLevel(ProxyLightDepthSampler, lightUV + float2( lightDepthTexel.x, 0.0), 0).r * 0.125 +
+				ProxyLightDepthCapture.SampleLevel(ProxyLightDepthSampler, lightUV + float2(-lightDepthTexel.x, 0.0), 0).r * 0.125 +
+				ProxyLightDepthCapture.SampleLevel(ProxyLightDepthSampler, lightUV + float2(0.0,  lightDepthTexel.y), 0).r * 0.125 +
+				ProxyLightDepthCapture.SampleLevel(ProxyLightDepthSampler, lightUV + float2(0.0, -lightDepthTexel.y), 0).r * 0.125;
+			float receiverDepth = dot(lightRelative, ProxyLightDepthForwardEnabled.xyz);
+			float blockerDistance = max(receiverDepth - blockerDepth - 2.0, 0.0);
+			blockerDistanceFactor = saturate(blockerDistance / max(ProxyLightDepthRightRange.w, 1.0));
+		}
+	}
+	return blockerDistanceFactor;
+}
+
+float SampleProxyLightVisibilityAtWorld(float3 worldPosition)
+{
+	if (ProxyLightDepthForwardEnabled.w < 0.0)
+	{
+		return 0.0;
+	}
+
+	float3 lightRelative = worldPosition - ProxyLightDepthOriginWidth.xyz;
+	float lightWidth = max(ProxyLightDepthOriginWidth.w, 1.0);
+	float2 lightUV = float2(
+		0.5 + dot(lightRelative, ProxyLightDepthRightRange.xyz) / lightWidth,
+		0.5 - dot(lightRelative, ProxyLightDepthUpSettings.xyz) / lightWidth);
+	if (any(lightUV < 0.0) || any(lightUV > 1.0))
+	{
+		return 0.0;
+	}
+
+	float blockerDepth = ProxyLightDepthCapture.SampleLevel(
+		ProxyLightDepthSampler, lightUV, 0).r;
+	float sampleDepth = dot(lightRelative, ProxyLightDepthForwardEnabled.xyz);
+	float depthSoftness = max(2.0, ProxyLightDepthForwardEnabled.w * 3.0);
+	return 1.0 - smoothstep(
+		blockerDepth + 2.0,
+		blockerDepth + 2.0 + depthSoftness,
+		sampleDepth);
+}
+
+float3 ComputeProxyVolumetricShaft(float3 translatedWorldPosition)
+{
+	float strength = clamp(ProxyVolumetricShaftSettings.x, 0.0, 2.0);
+	float density = clamp(ProxyVolumetricShaftSettings.y, 0.0, 2.0);
+	if (strength <= 0.0001 || density <= 0.0001 || ProxyLightDepthForwardEnabled.w < 0.0)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+
+	float3 worldPosition = translatedWorldPosition - PreViewTranslation;
+	float3 cameraWorldPosition = -PreViewTranslation;
+	float3 cameraRay = worldPosition - cameraWorldPosition;
+	float fullDistance = length(cameraRay);
+	if (fullDistance <= 1.0)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+
+	float maxDistance = clamp(ProxyVolumetricShaftSettings.z, 100.0, 50000.0);
+	float integrationDistance = min(fullDistance, maxDistance);
+	float3 rayDirection = cameraRay / fullDistance;
+	float3 integrationEnd = cameraWorldPosition + rayDirection * integrationDistance;
+
+	// Four fixed taps keep the path predictable in viewport and MRQ. Each tap
+	// queries the same proxy light-depth field that owns final cast shadows.
+	float visibilitySum = 0.0;
+	float visibilitySquaredSum = 0.0;
+	[unroll]
+	for (int shaftSampleIndex = 0; shaftSampleIndex < 4; ++shaftSampleIndex)
+	{
+		float sampleT = (float(shaftSampleIndex) + 0.5) / 4.0;
+		float3 sampleWorld = lerp(cameraWorldPosition, integrationEnd, sampleT);
+		float sampleVisibility = SampleProxyLightVisibilityAtWorld(sampleWorld);
+		visibilitySum += sampleVisibility;
+		visibilitySquaredSum += sampleVisibility * sampleVisibility;
+	}
+
+	float meanVisibility = visibilitySum / 4.0;
+	float visibilityVariance = max(
+		visibilitySquaredSum / 4.0 - meanVisibility * meanVisibility,
+		0.0);
+	float structuredLight = saturate(
+		meanVisibility * 0.28 + sqrt(visibilityVariance) * 1.85);
+
+	float3 lightTravelDirection = normalize(ProxyLightDepthForwardEnabled.xyz);
+	// rayDirection travels from the camera to the splat, while the directional
+	// light forward vector travels from the sun into the scene. A backlit view
+	// therefore aligns -rayDirection with lightTravelDirection.
+	float forwardAlignment = saturate(dot(-rayDirection, lightTravelDirection));
+	float scatteringConcentration = saturate(ProxyVolumetricShaftSettings.w);
+	float focusedScattering = pow(
+		forwardAlignment,
+		lerp(1.5, 5.0, scatteringConcentration));
+	float forwardScattering = lerp(
+		0.18,
+		0.04 + 0.96 * focusedScattering,
+		scatteringConcentration);
+	float opticalDepth = 1.0 - exp(
+		-(integrationDistance / maxDistance) * density * 1.35);
+
+	float3 tint = max(ProxyVolumetricShaftTint, 0.0);
+	float tintLuma = max(dot(tint, float3(0.2126, 0.7152, 0.0722)), 0.001);
+	tint /= tintLuma;
+
+	// Keep this as a bounded HDR in-scattering term. UE bloom and tonemapping
+	// remain responsible for the final halo; this pass only creates the ray mask.
+	float shaftEnergy = structuredLight * forwardScattering * opticalDepth * strength * 0.32;
+	return min(tint * shaftEnergy, float3(0.55, 0.48, 0.36));
+}
+
+bool SampleShadowedCaptureDirect(
+	float3 translatedWorldPosition,
+	out float3 capturedColor)
+{
+	float3 worldPosition = translatedWorldPosition - PreViewTranslation;
+	float3 captureRelative = worldPosition - ProxyCaptureOriginTanFOV.xyz;
+	float captureDepth = dot(captureRelative, ProxyCaptureForwardAspect.xyz);
+	float tanHalfFOV = max(ProxyCaptureOriginTanFOV.w, 0.001);
+	float2 captureNDC = float2(
+		dot(captureRelative, ProxyCaptureRightEnabled.xyz) / (max(captureDepth, 0.001) * tanHalfFOV),
+		dot(captureRelative, ProxyCaptureUp.xyz) * ProxyCaptureForwardAspect.w /
+			(max(captureDepth, 0.001) * tanHalfFOV));
+	if (ProxyCaptureRightEnabled.w <= 0.0 ||
+		captureDepth <= 0.001 ||
+		any(abs(captureNDC) > 1.0))
+	{
+		capturedColor = 1.0.xxx;
+		return false;
+	}
+
+	float2 uv = float2(
+		0.5 + 0.5 * captureNDC.x,
+		0.5 - 0.5 * captureNDC.y);
+	capturedColor = max(
+		ProxyShadowedCapture.SampleLevel(ProxyCaptureSampler, uv, 0).rgb,
+		0.0);
+	return true;
+}
+
+// Extract the lighting transition directly from the authoritative shadowed
+// capture. This deliberately does not reconstruct or threshold visibility.
+// White remains light, black remains shadow, and only the continuous boundary
+// becomes an HDR glare emitter.
+bool SampleShadowedCaptureMaskAndGlare(
+	float3 translatedWorldPosition,
+	out float capturedMask,
+	out float boundaryGlare)
+{
+	float3 worldPosition = translatedWorldPosition - PreViewTranslation;
+	float3 captureRelative = worldPosition - ProxyCaptureOriginTanFOV.xyz;
+	float captureDepth = dot(captureRelative, ProxyCaptureForwardAspect.xyz);
+	float tanHalfFOV = max(ProxyCaptureOriginTanFOV.w, 0.001);
+	float2 captureNDC = float2(
+		dot(captureRelative, ProxyCaptureRightEnabled.xyz) /
+			(max(captureDepth, 0.001) * tanHalfFOV),
+		dot(captureRelative, ProxyCaptureUp.xyz) * ProxyCaptureForwardAspect.w /
+			(max(captureDepth, 0.001) * tanHalfFOV));
+	if (ProxyCaptureRightEnabled.w <= 0.0 ||
+		captureDepth <= 0.001 ||
+		any(abs(captureNDC) > 1.0))
+	{
+		capturedMask = 1.0;
+		boundaryGlare = 0.0;
+		return false;
+	}
+
+	float2 uv = float2(
+		0.5 + 0.5 * captureNDC.x,
+		0.5 - 0.5 * captureNDC.y);
+	float2 texel = 1.0 / max(ProxyCaptureViewRect.zw, float2(1.0, 1.0));
+	const float3 LumaWeights = float3(0.2126, 0.7152, 0.0722);
+	capturedMask = saturate(dot(
+		max(ProxyShadowedCapture.SampleLevel(ProxyCaptureSampler, uv, 0).rgb, 0.0),
+		LumaWeights));
+
+	// A wider four-axis derivative catches the actual proxy penumbra without
+	// converting the complete white region into bloom.
+	const float BoundaryRadiusPixels = 2.5;
+	float maskXP = saturate(dot(ProxyShadowedCapture.SampleLevel(
+		ProxyCaptureSampler, uv + float2(texel.x, 0.0) * BoundaryRadiusPixels, 0).rgb,
+		LumaWeights));
+	float maskXN = saturate(dot(ProxyShadowedCapture.SampleLevel(
+		ProxyCaptureSampler, uv - float2(texel.x, 0.0) * BoundaryRadiusPixels, 0).rgb,
+		LumaWeights));
+	float maskYP = saturate(dot(ProxyShadowedCapture.SampleLevel(
+		ProxyCaptureSampler, uv + float2(0.0, texel.y) * BoundaryRadiusPixels, 0).rgb,
+		LumaWeights));
+	float maskYN = saturate(dot(ProxyShadowedCapture.SampleLevel(
+		ProxyCaptureSampler, uv - float2(0.0, texel.y) * BoundaryRadiusPixels, 0).rgb,
+		LumaWeights));
+	float captureGradient = length(float2(maskXP - maskXN, maskYP - maskYN));
+	// Return a restrained edge term. Final bloom additionally requires the
+	// capture itself and the original GS source to both be genuinely bright.
+	boundaryGlare = smoothstep(0.14, 0.52, captureGradient);
+	return true;
+}
+
+float GetProxySunHorizonGate();
+
+bool SampleValidProxySurfaceDepth(float2 uv, out float depth)
+{
+	depth = 0.0;
+	if (ProxySurfaceDepthEnabled < 0.5 || any(uv < 0.0) || any(uv > 1.0))
+	{
+		return false;
+	}
+	depth = ProxySurfaceDepthTexture.SampleLevel(ProxySurfaceDepthSampler, uv, 0).r;
+	return depth > 0.01 && depth < 60000.0;
+}
+
+float3 GetProxyCaptureRayDirection(float2 uv)
+{
+	float2 ndc = float2((uv.x - 0.5) * 2.0, (0.5 - uv.y) * 2.0);
+	float tanHalfFOV = max(ProxyCaptureOriginTanFOV.w, 0.001);
+	float aspect = max(ProxyCaptureForwardAspect.w, 0.001);
+	return normalize(
+		ProxyCaptureForwardAspect.xyz +
+		ProxyCaptureRightEnabled.xyz * (ndc.x * tanHalfFOV) +
+		ProxyCaptureUp.xyz * (ndc.y * tanHalfFOV / aspect));
+}
+
+float3 ReconstructProxySurfaceWorld(float2 uv, float forwardDepth)
+{
+	float3 rayDirection = GetProxyCaptureRayDirection(uv);
+	// SceneDepth is compared and reconstructed in the same capture-forward space.
+	// Convert the forward-axis depth into distance along the current pixel ray so
+	// off-axis positions are not pulled toward the capture camera.
+	float rayForward = max(dot(rayDirection, ProxyCaptureForwardAspect.xyz), 0.0001);
+	float rayDistance = max(forwardDepth, 0.0) / rayForward;
+	return ProxyCaptureOriginTanFOV.xyz + rayDirection * rayDistance;
+}
+
+float GetProxyDepthTolerance(float depth)
+{
+	return max(1.0, ProxyShadowDetailSettings.x) +
+		max(depth, 0.0) * max(ProxyShadowDetailSettings.y, 0.0);
+}
+
+float ShapeProxyCastVisibility(float rawVisibility)
+{
+	float castGamma = clamp(ProxyCaptureSettings.y, 0.10, 2.0);
+	float castMinimum = saturate(ProxyCaptureSettings.z);
+	float shapedCast = lerp(castMinimum, 1.0, pow(saturate(rawVisibility), castGamma));
+	return lerp(1.0, shapedCast, saturate(ProxyCaptureSettings.w));
+}
+
+float ComputeProxyCastVisibility(float shadowLuma, float baseLuma)
+{
+	float captureConfidence = smoothstep(0.0005, 0.006, baseLuma);
+	float castRatio = (captureConfidence > 0.0001)
+		? saturate(shadowLuma / max(baseLuma, 0.002))
+		: 1.0;
+	return ShapeProxyCastVisibility(castRatio);
+}
+
+float SampleStableProxyCastVisibility(float3 worldPosition)
+{
+	// This is the production proxy-shadow authority. The depth texture, basis and
+	// bounds are fixed in directional-light space, so camera translation/rotation
+	// cannot change which shadow texels describe a world-space receiver.
+	if (ProxyLightDepthForwardEnabled.w < 0.0)
+	{
+		return 1.0;
+	}
+
+	float3 lightRelative = worldPosition - ProxyLightDepthOriginWidth.xyz;
+	float lightWidth = max(ProxyLightDepthOriginWidth.w, 1.0);
+	float2 lightUV = float2(
+		0.5 + dot(lightRelative, ProxyLightDepthRightRange.xyz) / lightWidth,
+		0.5 - dot(lightRelative, ProxyLightDepthUpSettings.xyz) / lightWidth);
+	float receiverDepth = dot(lightRelative, ProxyLightDepthForwardEnabled.xyz);
+	if (receiverDepth <= 0.0 || any(lightUV < 0.0) || any(lightUV > 1.0))
+	{
+		return 1.0;
+	}
+
+	uint depthWidth = 1u;
+	uint depthHeight = 1u;
+	ProxyLightDepthCapture.GetDimensions(depthWidth, depthHeight);
+	float2 depthTexel = 1.0 / max(float2(depthWidth, depthHeight), float2(1.0, 1.0));
+	float worldUnitsPerTexel = lightWidth / max(float(depthWidth), 1.0);
+	// The proxy and the GS shell are close but not mathematically coincident. A
+	// small world-space bias prevents the receiver proxy itself from becoming an
+	// acne field while remaining far below real blocker-to-receiver distances.
+	float depthBias = clamp(ProxyShadowDetailSettings.x, 2.0, 40.0)
+		+ worldUnitsPerTexel * 0.20;
+	float depthTransition = max(1.0, abs(ProxyLightDepthForwardEnabled.w) * 3.0);
+	float filterRadius = min(max(ProxyCaptureSettings.x, 0.0), 2.5);
+	float2 offsets[9] =
+	{
+		float2( 0.00,  0.00),
+		float2(-0.70,  0.00), float2( 0.70,  0.00),
+		float2( 0.00, -0.70), float2( 0.00,  0.70),
+		float2(-0.52, -0.52), float2( 0.52, -0.52),
+		float2(-0.52,  0.52), float2( 0.52,  0.52)
+	};
+
+	float visibilitySum = 0.0;
+	float weightSum = 0.0;
+	[unroll]
+	for (int sampleIndex = 0; sampleIndex < 9; ++sampleIndex)
+	{
+		float2 sampleUV = lightUV + offsets[sampleIndex] * depthTexel * filterRadius;
+		if (any(sampleUV < 0.0) || any(sampleUV > 1.0))
+		{
+			continue;
+		}
+
+		float blockerDepth = ProxyLightDepthCapture.SampleLevel(
+			ProxyLightDepthSampler, sampleUV, 0).r;
+		float sampleVisibility = 1.0;
+		if (blockerDepth > 0.01 && blockerDepth < 60000.0)
+		{
+			float blockerSeparation = receiverDepth - blockerDepth;
+			sampleVisibility = 1.0 - smoothstep(
+				depthBias, depthBias + depthTransition, blockerSeparation);
+		}
+		float sampleWeight = (sampleIndex == 0) ? 1.0 : 0.72;
+		visibilitySum += sampleVisibility * sampleWeight;
+		weightSum += sampleWeight;
+	}
+
+	float rawVisibility = (weightSum > 0.0001)
+		? saturate(visibilitySum / weightSum)
+		: 1.0;
+	return ShapeProxyCastVisibility(rawVisibility);
+}
+
+bool SampleProxyCastHistory(
+	float3 worldPosition,
+	float currentMinVisibility,
+	float currentMaxVisibility,
+	out float historyVisibility)
+{
+	historyVisibility = 1.0;
+	if (ProxyShadowTemporalSettings.x < 0.5 || ProxyHistoryRightEnabled.w < 0.5)
+	{
+		return false;
+	}
+
+	float3 captureRelative = worldPosition - ProxyHistoryOriginTanFOV.xyz;
+	float captureDepth = dot(captureRelative, ProxyHistoryForwardAspect.xyz);
+	float tanHalfFOV = max(ProxyHistoryOriginTanFOV.w, 0.001);
+	float2 captureNDC = float2(
+		dot(captureRelative, ProxyHistoryRightEnabled.xyz) / (captureDepth * tanHalfFOV),
+		dot(captureRelative, ProxyHistoryUp.xyz) * ProxyHistoryForwardAspect.w / (captureDepth * tanHalfFOV));
+	if (captureDepth <= 0.001 || any(abs(captureNDC) > 1.0))
+	{
+		return false;
+	}
+
+	float2 uv = float2(0.5 + 0.5 * captureNDC.x, 0.5 - 0.5 * captureNDC.y);
+	float historyDepth = ProxyHistorySurfaceDepthTexture.SampleLevel(
+		ProxySurfaceDepthSampler, uv, 0).r;
+	if (historyDepth <= 0.01 || historyDepth >= 60000.0)
+	{
+		return false;
+	}
+	float depthTolerance = GetProxyDepthTolerance(max(historyDepth, captureDepth));
+	if (abs(historyDepth - captureDepth) > depthTolerance * 3.0)
+	{
+		return false;
+	}
+
+	float3 historyShadowed = max(
+		ProxyHistoryShadowedCapture.SampleLevel(ProxyCaptureSampler, uv, 0).rgb,
+		0.0);
+	float3 historyUnshadowed = max(
+		ProxyHistoryUnshadowedCapture.SampleLevel(ProxyCaptureSampler, uv, 0).rgb,
+		0.0);
+	const float3 LumaWeights = float3(0.2126, 0.7152, 0.0722);
+	historyVisibility = ComputeProxyCastVisibility(
+		dot(historyShadowed, LumaWeights),
+		dot(historyUnshadowed, LumaWeights));
+	// The history may reduce temporal variance, but it may not invent a cast value
+	// outside the current spatial neighbourhood. This preserves the authored edge.
+	historyVisibility = clamp(
+		historyVisibility,
+		min(currentMinVisibility, currentMaxVisibility),
+		max(currentMinVisibility, currentMaxVisibility));
+	return true;
+}
+
+bool CalculateNeutralProxyReceiver(
+	float2 uv,
+	float2 texel,
+	float centerDepth,
+	out float neutralReceiver)
+{
+	neutralReceiver = 0.0;
+	float3 centerWorld = ReconstructProxySurfaceWorld(uv, centerDepth);
+	float neighborTolerance = GetProxyDepthTolerance(centerDepth) * 4.0;
+
+	float depthL = 0.0, depthR = 0.0, depthU = 0.0, depthD = 0.0;
+	bool validL = SampleValidProxySurfaceDepth(uv - float2(texel.x, 0.0), depthL)
+		&& abs(depthL - centerDepth) <= neighborTolerance;
+	bool validR = SampleValidProxySurfaceDepth(uv + float2(texel.x, 0.0), depthR)
+		&& abs(depthR - centerDepth) <= neighborTolerance;
+	bool validU = SampleValidProxySurfaceDepth(uv - float2(0.0, texel.y), depthU)
+		&& abs(depthU - centerDepth) <= neighborTolerance;
+	bool validD = SampleValidProxySurfaceDepth(uv + float2(0.0, texel.y), depthD)
+		&& abs(depthD - centerDepth) <= neighborTolerance;
+
+	float3 tangentRight = float3(0.0, 0.0, 0.0);
+	bool validHorizontal = false;
+	if (validL && validR)
+	{
+		float3 worldL = ReconstructProxySurfaceWorld(uv - float2(texel.x, 0.0), depthL);
+		float3 worldR = ReconstructProxySurfaceWorld(uv + float2(texel.x, 0.0), depthR);
+		tangentRight = worldR - worldL;
+		validHorizontal = true;
+	}
+	else if (validR)
+	{
+		float3 worldR = ReconstructProxySurfaceWorld(uv + float2(texel.x, 0.0), depthR);
+		tangentRight = worldR - centerWorld;
+		validHorizontal = true;
+	}
+	else if (validL)
+	{
+		float3 worldL = ReconstructProxySurfaceWorld(uv - float2(texel.x, 0.0), depthL);
+		tangentRight = centerWorld - worldL;
+		validHorizontal = true;
+	}
+
+	float3 tangentUp = float3(0.0, 0.0, 0.0);
+	bool validVertical = false;
+	if (validU && validD)
+	{
+		float3 worldU = ReconstructProxySurfaceWorld(uv - float2(0.0, texel.y), depthU);
+		float3 worldD = ReconstructProxySurfaceWorld(uv + float2(0.0, texel.y), depthD);
+		tangentUp = worldU - worldD;
+		validVertical = true;
+	}
+	else if (validU)
+	{
+		float3 worldU = ReconstructProxySurfaceWorld(uv - float2(0.0, texel.y), depthU);
+		tangentUp = worldU - centerWorld;
+		validVertical = true;
+	}
+	else if (validD)
+	{
+		float3 worldD = ReconstructProxySurfaceWorld(uv + float2(0.0, texel.y), depthD);
+		tangentUp = centerWorld - worldD;
+		validVertical = true;
+	}
+
+	if (!(validHorizontal && validVertical))
+	{
+		return false;
+	}
+
+	float3 normalCross = cross(tangentRight, tangentUp);
+	float tangentArea = length(normalCross);
+	if (tangentArea <= 1.0e-5)
+	{
+		return false;
+	}
+
+	float3 normal = normalCross / tangentArea;
+	float3 cameraRay = normalize(centerWorld - ProxyCaptureOriginTanFOV.xyz);
+	if (dot(normal, cameraRay) > 0.0)
+	{
+		normal = -normal;
+	}
+
+	float3 surfaceToLight = -normalize(ProxyLightDepthForwardEnabled.xyz);
+	neutralReceiver = saturate(dot(normal, surfaceToLight)) * saturate(ProxyLightingIntensityScale);
+	return true;
+}
+
+
+
+float ComputeStableProxyReceiverVisibility(float receiverSignal)
+{
+	float directWhitePoint = max(ProxyShadowShapingSettings.x, 0.01);
+	float directReceiver = max(receiverSignal, 0.0) /
+		(max(receiverSignal, 0.0) + directWhitePoint);
+	directReceiver = pow(
+		saturate(directReceiver),
+		max(ProxyShadowShapingSettings.y, 0.25));
+
+	float baseClosureReleaseEnd = clamp(ProxyShadowShapingSettings.w, 0.05, 1.0);
+	float closureAreaScale = clamp(ProxyShadowEvidenceSettings.z, 0.0, 2.5);
+	// Keep the artist control perceptually continuous. From 0..1 it linearly
+	// blends the established closure profile instead of moving a receiver
+	// threshold through clustered normal values (which caused the 0.4 cliff).
+	// Values above one retain the authored meaning of expanding closure into
+	// progressively brighter receiver surfaces.
+	float closureAreaActivation = saturate(closureAreaScale);
+	float closureDomainScale = max(closureAreaScale, 1.0);
+	float closureReceiver = saturate(directReceiver / closureDomainScale);
+	float closureFullEnd = min(
+		clamp(ProxyShadowEvidenceSettings.x, 0.0, 0.95),
+		max(baseClosureReleaseEnd - 0.01, 0.0));
+	float baseClosureWidth = max(baseClosureReleaseEnd - closureFullEnd, 0.01);
+	float closureEdgeSoftness = clamp(ProxyShadowEvidenceSettings.w, 0.25, 3.0);
+	float closureReleaseEnd = min(
+		closureFullEnd + baseClosureWidth * closureEdgeSoftness, 1.0);
+	float closureOpen = smoothstep(
+		closureFullEnd, closureReleaseEnd, closureReceiver);
+	float closureGradientGamma = clamp(ProxyShadowOcclusionBoost, 0.25, 4.0);
+	closureOpen = pow(saturate(closureOpen), closureGradientGamma);
+	float closureMask = (1.0 - closureOpen) * closureAreaActivation;
+	float closureAmount = closureMask
+		* saturate(ProxyShadowEvidenceSettings.y)
+		* saturate(ProxyShadowShapingSettings.z);
+	return saturate(1.0 - closureAmount);
+}
+
+void SampleCapturedShadowVisibility(
+	float2 pixelPosition,
+	float3 translatedWorldPosition,
+	float stableReceiverSignal,
+	out float rawVisibility,
+	out float finalVisibility,
+	out float receiverVisibilityOut)
+{
+	// Ratio validation path (Launcher-engine/plugin-only): derive visibility from
+	// the matched shadowed/unshadowed capture pair. Do not use the shadowed RGB
+	// brightness directly, because proxy albedo and exposure are not a shadow mask.
+	//
+	// Source 2 is deliberately evaluated before any world-position work. The
+	// shadowed/unshadowed proxy pair is rendered from the same camera, so every
+	// overlapping Gaussian fragment at a screen pixel must receive the same AOV
+	// value. This removes splat-center depth switching from the shadow shape.
+	if (ProxyScreenCaptureSettings.x > 0.5 && ProxyCaptureRightEnabled.w > 0.5)
+	{
+		float2 viewSize = max(ProxyCaptureViewRect.zw, float2(1.0, 1.0));
+		float2 viewUV = (pixelPosition - ProxyCaptureViewRect.xy) / viewSize;
+		float2 captureUV = 0.5 + (viewUV - 0.5) * ProxyScreenCaptureSettings.yz;
+		if (any(captureUV < 0.0) || any(captureUV > 1.0))
+		{
+			rawVisibility = 1.0;
+			finalVisibility = 1.0;
+			receiverVisibilityOut = 1.0;
+			return;
+		}
+
+		uint captureWidth = 1;
+		uint captureHeight = 1;
+		ProxyShadowedCapture.GetDimensions(captureWidth, captureHeight);
+		float2 texel = 1.0 / max(float2(captureWidth, captureHeight), float2(1.0, 1.0));
+		float filterRadius = min(max(ProxyCaptureSettings.x, 0.0), 2.5);
+		float2 offsets[5] =
+		{
+			float2(0.0, 0.0),
+			float2(-1.0, 0.0), float2(1.0, 0.0),
+			float2(0.0, -1.0), float2(0.0, 1.0)
+		};
+		float filteredShadowLuma = 0.0;
+		float filteredBaseLuma = 0.0;
+		float weightSum = 0.0;
+		[unroll]
+		for (int sampleIndex = 0; sampleIndex < 5; ++sampleIndex)
+		{
+			float sampleWeight = (sampleIndex == 0) ? 1.0 : 0.55;
+			float2 sampleUV = captureUV + offsets[sampleIndex] * texel * filterRadius;
+			float3 shadowed = max(
+				ProxyShadowedCapture.SampleLevel(ProxyCaptureSampler, sampleUV, 0).rgb,
+				0.0);
+			float3 unshadowed = max(
+				ProxyUnshadowedCapture.SampleLevel(ProxyCaptureSampler, sampleUV, 0).rgb,
+				0.0);
+			filteredShadowLuma += dot(shadowed, float3(0.2126, 0.7152, 0.0722)) * sampleWeight;
+			filteredBaseLuma += dot(unshadowed, float3(0.2126, 0.7152, 0.0722)) * sampleWeight;
+			weightSum += sampleWeight;
+		}
+		float averageShadowLuma = filteredShadowLuma / max(weightSum, 1.0e-5);
+		float averageBaseLuma = filteredBaseLuma / max(weightSum, 1.0e-5);
+		float castVisibility = ComputeProxyCastVisibility(averageShadowLuma, averageBaseLuma);
+		// Use the camera AOV only for the cast-shadow location. Feeding its low-poly
+		// receiver lighting into closure stamped individual proxy triangles onto the
+		// Gaussian image as hard black islands. Keep the established GS receiver
+		// response for the shadow tone/closure so the look matches the pre-AOV path,
+		// while the camera AOV still removes the moving cast-shadow stripes.
+		float receiverVisibility = ComputeStableProxyReceiverVisibility(
+			stableReceiverSignal);
+		float horizonGate = GetProxySunHorizonGate();
+		rawVisibility = castVisibility;
+		finalVisibility = castVisibility * receiverVisibility * horizonGate;
+		receiverVisibilityOut = receiverVisibility;
+		return;
+	}
+
+	float3 worldPosition = translatedWorldPosition - PreViewTranslation;
+	if (ProxyShadowTemporalSettings.z >= 0.5 &&
+		ProxyLightDepthForwardEnabled.w >= 0.0)
+	{
+		// The stable path contains no camera-projected shadow input and therefore
+		// needs no temporal history. The per-splat proxy-normal light response was
+		// evaluated in world space by CalcViewData and is supplied as the receiver.
+		float stableCastVisibility = SampleStableProxyCastVisibility(worldPosition);
+		float stableReceiverVisibility = ComputeStableProxyReceiverVisibility(
+			stableReceiverSignal);
+		float horizonGate = GetProxySunHorizonGate();
+		rawVisibility = stableCastVisibility;
+		finalVisibility = stableCastVisibility * stableReceiverVisibility * horizonGate;
+		receiverVisibilityOut = stableReceiverVisibility;
+		return;
+	}
+
+	float3 captureRelative = worldPosition - ProxyCaptureOriginTanFOV.xyz;
+	float captureDepth = max(dot(captureRelative, ProxyCaptureForwardAspect.xyz), 0.001);
+	float tanHalfFOV = max(ProxyCaptureOriginTanFOV.w, 0.001);
+	float2 captureNDC = float2(
+		dot(captureRelative, ProxyCaptureRightEnabled.xyz) / (captureDepth * tanHalfFOV),
+		dot(captureRelative, ProxyCaptureUp.xyz) * ProxyCaptureForwardAspect.w / (captureDepth * tanHalfFOV));
+	if (ProxyCaptureRightEnabled.w <= 0.0 || captureDepth <= 0.001 || any(abs(captureNDC) > 1.0))
+	{
+		rawVisibility = 1.0;
+		finalVisibility = 1.0;
+		receiverVisibilityOut = 1.0;
+		return;
+	}
+
+	float2 uv = float2(0.5 + 0.5 * captureNDC.x, 0.5 - 0.5 * captureNDC.y);
+	float2 texel = 1.0 / max(ProxyCaptureViewRect.zw, float2(1.0, 1.0));
+	// Old assets may contain very large softness values. The depth-aware 9-tap
+	// kernel intentionally caps the effective radius so detail is never averaged
+	// across several proxy triangles or thin foliage silhouettes.
+	float filterRadius = min(max(ProxyCaptureSettings.x, 0.0), 2.5);
+	float2 offsets[9] =
+	{
+		float2( 0.00,  0.00),
+		float2(-0.65,  0.00), float2( 0.65,  0.00),
+		float2( 0.00, -0.65), float2( 0.00,  0.65),
+		float2(-0.50, -0.50), float2( 0.50, -0.50),
+		float2(-0.50,  0.50), float2( 0.50,  0.50)
+	};
+
+	float centerProxyDepth = 0.0;
+	bool centerDepthValid = SampleValidProxySurfaceDepth(uv, centerProxyDepth);
+	// Compare depths in the same capture-forward coordinate. The previous radial
+	// length comparison rejected most off-axis pixels and locally disabled shadow.
+	float gsForwardDepth = max(dot(captureRelative, ProxyCaptureForwardAspect.xyz), 0.0);
+	float surfaceMatch = 0.0;
+	if (centerDepthValid)
+	{
+		float matchTolerance = GetProxyDepthTolerance(max(centerProxyDepth, gsForwardDepth));
+		surfaceMatch = 1.0 - smoothstep(
+			matchTolerance,
+			matchTolerance * 3.0,
+			abs(centerProxyDepth - gsForwardDepth));
+	}
+
+	float3 centerShadowed = max(
+		ProxyShadowedCapture.SampleLevel(ProxyCaptureSampler, uv, 0).rgb,
+		0.0);
+	float3 centerUnshadowed = max(
+		ProxyUnshadowedCapture.SampleLevel(ProxyCaptureSampler, uv, 0).rgb,
+		0.0);
+	float centerShadowLuma = dot(centerShadowed, float3(0.2126, 0.7152, 0.0722));
+	float centerBaseLuma = dot(centerUnshadowed, float3(0.2126, 0.7152, 0.0722));
+	float currentMinCastVisibility = ComputeProxyCastVisibility(centerShadowLuma, centerBaseLuma);
+	float currentMaxCastVisibility = currentMinCastVisibility;
+
+	// The center capture/depth were already sampled above. Seed the filter with
+	// that exact unit-weight tap and start at the first neighbour; re-sampling
+	// offsets[0] performed three redundant texture reads per GS fragment.
+	float filteredShadowLuma = centerShadowLuma;
+	float filteredBaseLuma = centerBaseLuma;
+	float weightSum = 1.0;
+	float depthEdgeProtection = saturate(ProxyShadowDetailSettings.w);
+	[unroll]
+	for (int sampleIndex = 1; sampleIndex < 9; ++sampleIndex)
+	{
+		float2 sampleUV = uv + offsets[sampleIndex] * texel * filterRadius;
+		if (any(sampleUV < 0.0) || any(sampleUV > 1.0))
+		{
+			continue;
+		}
+
+		float sampleWeight = 1.0 - 0.42 * saturate(length(offsets[sampleIndex]));
+		if (centerDepthValid && depthEdgeProtection > 0.0001)
+		{
+			float sampleDepth = 0.0;
+			bool sampleDepthValid = SampleValidProxySurfaceDepth(sampleUV, sampleDepth);
+			float depthWeight = 0.0;
+			if (sampleDepthValid)
+			{
+				float depthTolerance = GetProxyDepthTolerance(centerProxyDepth);
+				depthWeight = 1.0 - smoothstep(
+					depthTolerance,
+					depthTolerance * 2.5,
+					abs(sampleDepth - centerProxyDepth));
+			}
+			sampleWeight *= lerp(1.0, depthWeight, depthEdgeProtection);
+		}
+		if (sampleWeight <= 1.0e-5)
+		{
+			continue;
+		}
+
+		float3 shadowed = max(
+			ProxyShadowedCapture.SampleLevel(ProxyCaptureSampler, sampleUV, 0).rgb,
+			0.0);
+		float3 unshadowed = max(
+			ProxyUnshadowedCapture.SampleLevel(ProxyCaptureSampler, sampleUV, 0).rgb,
+			0.0);
+		float shadowLuma = dot(shadowed, float3(0.2126, 0.7152, 0.0722));
+		float baseLuma = dot(unshadowed, float3(0.2126, 0.7152, 0.0722));
+		float sampleCastVisibility = ComputeProxyCastVisibility(shadowLuma, baseLuma);
+		currentMinCastVisibility = min(currentMinCastVisibility, sampleCastVisibility);
+		currentMaxCastVisibility = max(currentMaxCastVisibility, sampleCastVisibility);
+		filteredShadowLuma += shadowLuma * sampleWeight;
+		filteredBaseLuma += baseLuma * sampleWeight;
+		weightSum += sampleWeight;
+	}
+
+	// Depth protection is a filter rule, never a final shadow on/off gate. If the
+	// neighborhood is unavailable, or the GS/proxy depth match is uncertain, fall
+	// back to the authoritative center capture instead of restoring full light.
+	float filteredAverageShadow = (weightSum > 1.0e-5)
+		? max(filteredShadowLuma / weightSum, 0.0)
+		: centerShadowLuma;
+	float filteredAverageBase = (weightSum > 1.0e-5)
+		? max(filteredBaseLuma / weightSum, 0.0)
+		: centerBaseLuma;
+	float filteredTrust = centerDepthValid ? saturate(surfaceMatch) : 0.0;
+	float averageShadowLuma = lerp(centerShadowLuma, filteredAverageShadow, filteredTrust);
+	float averageBaseLuma = lerp(centerBaseLuma, filteredAverageBase, filteredTrust);
+
+	// Split the result into two physically distinct terms:
+	//   1) castVisibility: shadowed / unshadowed, so proxy albedo and exposure cancel
+	//   2) receiverVisibility: how much direct sun the unshadowed proxy actually receives
+	// The old Final path saturated the shadowed HDR luma directly, producing an almost
+	// binary 0/1 mask. Reinhard-style HDR compression preserves a smooth receiver
+	// gradient before the closed-shadow response is evaluated.
+	float castVisibility = ComputeProxyCastVisibility(averageShadowLuma, averageBaseLuma);
+	currentMinCastVisibility = min(currentMinCastVisibility, castVisibility);
+	currentMaxCastVisibility = max(currentMaxCastVisibility, castVisibility);
+
+	// Stabilize only the scalar external-caster ratio. Receiver closure, reflected
+	// light, source RGB and the final HDR grade remain current-frame calculations.
+	float historyCastVisibility = 1.0;
+	if (SampleProxyCastHistory(
+		worldPosition,
+		currentMinCastVisibility,
+		currentMaxCastVisibility,
+		historyCastVisibility))
+	{
+		castVisibility = lerp(
+			historyCastVisibility,
+			castVisibility,
+			saturate(ProxyShadowTemporalSettings.y));
+	}
+
+	float directWhitePoint = max(ProxyShadowShapingSettings.x, 0.01);
+	// Neutral receiver lighting comes from the continuous proxy depth surface,
+	// not from proxy RGB. This removes dark-material/albedo contamination from
+	// closure while retaining the proxy mesh's real geometric light response.
+	float receiverSignal = averageBaseLuma;
+	float neutralReceiver = 0.0;
+	if (centerDepthValid && CalculateNeutralProxyReceiver(uv, texel, centerProxyDepth, neutralReceiver))
+	{
+		receiverSignal = neutralReceiver;
+	}
+	float directReceiver = receiverSignal / (receiverSignal + directWhitePoint);
+	directReceiver = pow(saturate(directReceiver), max(ProxyShadowShapingSettings.y, 0.25));
+
+	// Closed shadow is angle/receiver darkness, not another cast-shadow threshold.
+	// It rises continuously as the unshadowed proxy loses direct sun. At zero direct
+	// receiver light it reaches the authored maximum exactly; with max darkness=1
+	// and strength=1 the result is fully black, matching the real proxy mesh.
+	float baseClosureReleaseEnd = clamp(ProxyShadowShapingSettings.w, 0.05, 1.0);
+	// Zero is an authored hard-off state. From zero to one, linearly blend the
+	// established receiver-closure profile. Values above one expand closure into
+	// progressively brighter receiver surfaces. This prevents nearby sub-one
+	// slider values from crossing a full-black receiver threshold abruptly.
+	float closureAreaScale = clamp(ProxyShadowEvidenceSettings.z, 0.0, 2.5);
+	float closureAreaActivation = saturate(closureAreaScale);
+	float closureDomainScale = max(closureAreaScale, 1.0);
+	float closureReceiver = saturate(directReceiver / closureDomainScale);
+
+	// User-authored full-black core. Edge softness changes only the release width,
+	// preserving a stable black core while allowing a broad cinematic gradient.
+	float closureFullEnd = min(
+		clamp(ProxyShadowEvidenceSettings.x, 0.0, 0.95),
+		max(baseClosureReleaseEnd - 0.01, 0.0));
+	float baseClosureWidth = max(baseClosureReleaseEnd - closureFullEnd, 0.01);
+	float closureEdgeSoftness = clamp(ProxyShadowEvidenceSettings.w, 0.25, 3.0);
+	float closureReleaseEnd = min(closureFullEnd + baseClosureWidth * closureEdgeSoftness, 1.0);
+	float closureOpen = smoothstep(closureFullEnd, closureReleaseEnd, closureReceiver);
+	// Values above one hold the dark core longer before releasing; values below one
+	// open it earlier. Endpoints stay exact: zero receiver is closed, release end is open.
+	float closureGradientGamma = clamp(ProxyShadowOcclusionBoost, 0.25, 4.0);
+	closureOpen = pow(saturate(closureOpen), closureGradientGamma);
+	float closureMask = (1.0 - closureOpen) * closureAreaActivation;
+	float closureAmount = closureMask
+		* saturate(ProxyShadowEvidenceSettings.y)
+		* saturate(ProxyShadowShapingSettings.z);
+	float receiverVisibility = saturate(1.0 - closureAmount);
+
+	// Do not use surfaceMatch as a final visibility gate. It only controls whether
+	// the depth-aware neighborhood filter is trusted. The center capture remains
+	// authoritative so shadow still covers the complete projected proxy surface.
+
+	float horizonGate = GetProxySunHorizonGate();
+	rawVisibility = castVisibility;
+	finalVisibility = castVisibility * receiverVisibility * horizonGate;
+	receiverVisibilityOut = receiverVisibility;
+
+}
+
+// UE directional lights continue emitting even when rotated below the world
+// horizon. For the weather/sun workflow, that state must mean no sunlight. Use
+// the same main-light travel vector already supplied by the proxy light-depth
+// bridge, but apply only one uniform horizon gate. This avoids reintroducing the
+// noisy per-splat normal gate that damaged the floor in v2.
+
+
+float3 VisualizeProxyShadowDiagnostic(uint previewMode, float3 translatedWorldPosition)
+{
+	// 35: Show the actual filtered/shaped ratio visibility used by Final.
+	if (previewMode == 35u)
+	{
+		float rawVisibility;
+		float finalVisibility;
+		float receiverVisibility;
+		SampleCapturedShadowVisibility(
+			float2(0.0, 0.0), translatedWorldPosition, 1.0,
+			rawVisibility, finalVisibility, receiverVisibility);
+		return finalVisibility.xxx;
+	}
+
+	// 34: Visualize the directional-light depth capture.
+	if (previewMode == 34u)
+	{
+		if (ProxyLightDepthForwardEnabled.w < 0.0)
+		{
+			return float3(1.0, 0.0, 1.0);
+		}
+
+		float3 worldPosition = translatedWorldPosition - PreViewTranslation;
+		float3 lightRelative = worldPosition - ProxyLightDepthOriginWidth.xyz;
+		float lightWidth = max(ProxyLightDepthOriginWidth.w, 1.0);
+		float2 lightUV = float2(
+			0.5 + dot(lightRelative, ProxyLightDepthRightRange.xyz) / lightWidth,
+			0.5 - dot(lightRelative, ProxyLightDepthUpSettings.xyz) / lightWidth);
+		if (any(lightUV < 0.0) || any(lightUV > 1.0))
+		{
+			return float3(0.25, 0.0, 0.25);
+		}
+
+		float blockerDepth = max(
+			ProxyLightDepthCapture.SampleLevel(ProxyLightDepthSampler, lightUV, 0).r,
+			0.0);
+		float normalizedDepth = saturate(
+			log2(1.0 + blockerDepth) /
+			log2(1.0 + max(lightWidth * 4.0, 1.0)));
+		return normalizedDepth.xxx;
+	}
+
+	// 40-43 are isolated stable-base diagnostics. They read the already-existing
+	// fixed directional LightDepth capture and never alter splat sorting or proxy state.
+	if (previewMode >= 40u && previewMode <= 43u)
+	{
+		// 42: the future fixed per-splat cache has deliberately not been built yet.
+		// Red/orange is an explicit unavailable state, not fabricated cache data.
+		if (previewMode == 42u)
+		{
+			return float3(1.0, 0.12, 0.0);
+		}
+
+		if (ProxyLightDepthForwardEnabled.w < 0.0)
+		{
+			return float3(1.0, 0.0, 1.0);
+		}
+
+		float3 worldPositionLS = translatedWorldPosition - PreViewTranslation;
+		float3 lightRelative = worldPositionLS - ProxyLightDepthOriginWidth.xyz;
+		float lightWidth = max(ProxyLightDepthOriginWidth.w, 1.0);
+		float2 lightUV = float2(
+			0.5 + dot(lightRelative, ProxyLightDepthRightRange.xyz) / lightWidth,
+			0.5 - dot(lightRelative, ProxyLightDepthUpSettings.xyz) / lightWidth);
+		if (any(lightUV < 0.0) || any(lightUV > 1.0))
+		{
+			return float3(0.08, 0.0, 0.12);
+		}
+
+		float blockerDepth = max(
+			ProxyLightDepthCapture.SampleLevel(ProxyLightDepthSampler, lightUV, 0).r,
+			0.0);
+		bool depthValid = blockerDepth < 60000.0;
+
+		// 40: background/validity mask. White = captured proxy/caster depth.
+		if (previewMode == 40u)
+		{
+			return depthValid ? float3(1.0, 1.0, 1.0) : float3(0.0, 0.0, 0.0);
+		}
+
+		if (!depthValid)
+		{
+			return float3(0.0, 0.0, 0.0);
+		}
+
+		float normalizedDepth = saturate(
+			log2(1.0 + blockerDepth) /
+			log2(1.0 + max(lightWidth * 4.0, 1.0)));
+
+		// 41: literal depth heatmap; near=blue, middle=green, far=red.
+		if (previewMode == 41u)
+		{
+			return saturate(float3(
+				1.5 * normalizedDepth,
+				1.5 - abs(normalizedDepth * 3.0 - 1.5),
+				1.5 * (1.0 - normalizedDepth)));
+		}
+
+		// 43: signed receiver/blocker compare. Green = same surface / lit,
+		// red = receiver behind blocker (occluded), blue = receiver in front.
+		float receiverDepth = dot(lightRelative, ProxyLightDepthForwardEnabled.xyz);
+		float deltaCm = receiverDepth - blockerDepth;
+		float toleranceCm = max(ProxyShadowDetailSettings.x, 1.0);
+		float deltaStrength = saturate(abs(deltaCm) / max(toleranceCm * 4.0, 1.0));
+		if (deltaCm > toleranceCm)
+		{
+			return lerp(float3(0.25, 0.0, 0.0), float3(1.0, 0.0, 0.0), deltaStrength);
+		}
+		if (deltaCm < -toleranceCm)
+		{
+			return lerp(float3(0.0, 0.0, 0.25), float3(0.0, 0.3, 1.0), deltaStrength);
+		}
+		return float3(0.0, 1.0, 0.0);
+	}
+
+	// 46/47 are handled per-splat in MainPS from the fixed binding buffer.
+
+	// 45 reuses the actual UE-lit/shadowed proxy capture as a reference image.
+	if (previewMode == 45u)
+	{
+		previewMode = 31u;
+	}
+
+	// 31-33: Reproject the splat into the camera-space capture pair.
+	float3 worldPosition = translatedWorldPosition - PreViewTranslation;
+	float3 captureRelative = worldPosition - ProxyCaptureOriginTanFOV.xyz;
+	float captureDepth = max(dot(captureRelative, ProxyCaptureForwardAspect.xyz), 0.001);
+	float tanHalfFOV = max(ProxyCaptureOriginTanFOV.w, 0.001);
+	float2 captureNDC = float2(
+		dot(captureRelative, ProxyCaptureRightEnabled.xyz) / (captureDepth * tanHalfFOV),
+		dot(captureRelative, ProxyCaptureUp.xyz) * ProxyCaptureForwardAspect.w /
+			(captureDepth * tanHalfFOV));
+	if (ProxyCaptureRightEnabled.w <= 0.0 ||
+		captureDepth <= 0.001 ||
+		any(abs(captureNDC) > 1.0))
+	{
+		return float3(1.0, 0.0, 1.0);
+	}
+
+	float2 uv = float2(
+		0.5 + 0.5 * captureNDC.x,
+		0.5 - 0.5 * captureNDC.y);
+	float3 shadowed = max(
+		ProxyShadowedCapture.SampleLevel(ProxyCaptureSampler, uv, 0).rgb,
+		0.0);
+	float3 unshadowed = max(
+		ProxyUnshadowedCapture.SampleLevel(ProxyCaptureSampler, uv, 0).rgb,
+		0.0);
+
+	// Global sun-state gate only. Mesh N.L and cast shadows still come from the
+	// proxy capture itself; no per-splat/cached-normal multiplication is used.
+	float horizonGate = GetProxySunHorizonGate();
+	shadowed *= horizonGate;
+	unshadowed *= horizonGate;
+
+	if (previewMode == 31u)
+	{
+		return shadowed;
+	}
+	if (previewMode == 32u)
+	{
+		return unshadowed;
+	}
+
+	float shadowLuma = max(
+		dot(shadowed, float3(0.2126, 0.7152, 0.0722)),
+		0.0);
+	float baseLuma = max(
+		dot(unshadowed, float3(0.2126, 0.7152, 0.0722)),
+		0.0);
+	float confidence = smoothstep(0.0005, 0.006, baseLuma);
+	float rawRatio = saturate(shadowLuma / max(baseLuma, 0.002)) * confidence;
+	return rawRatio.xxx;
+}
+
+float SampleCapturedShadowAttenuation(
+	float2 pixelPosition,
+	float3 translatedWorldPosition,
+	float stableReceiverSignal)
+{
+	float rawVisibility;
+	float finalVisibility;
+	float receiverVisibility;
+	SampleCapturedShadowVisibility(
+		pixelPosition, translatedWorldPosition, stableReceiverSignal,
+		rawVisibility, finalVisibility, receiverVisibility);
+	return finalVisibility;
+}
+
+float3 ApplyBaseShadowTransfer(
+	float3 baseColor,
+	float rawVisibility,
+	float angularLightVisibility)
+{
+	// The visible Shadow controls are the only authority for final darkness.
+	// In particular, do not use the hidden legacy base-transfer strength/minimum
+	// (ProxyShadowBaseSettings.x/y): those values silently prevented black.
+	float shadowStrength = saturate(ProxyCaptureSettings.w);
+	if (shadowStrength <= 0.0001)
+	{
+		return baseColor;
+	}
+
+	// Gamma/Depth shapes the captured mask, but it does not impose a floor.
+	// With Strength=1, a fully shadowed capture texel therefore reaches RGB 0.
+	float authoredVisibility = pow(
+		saturate(rawVisibility),
+		max(ProxyCaptureSettings.y, 0.01));
+
+	// The capture describes where the proxy is shadowed; PostLightMask describes
+	// whether the current sun angle can actually reach that splat. Contact Shadow
+	// Boost is the explicit artist control for this closed-shadow response:
+	//   0  = capture only
+	//   >0 = progressively stronger angle-dependent closure
+	// A zero angular visibility always reaches zero, matching a mesh surface that
+	// receives no direct light. There is no hidden minimum-light floor here.
+	float closureExponent = max(ProxyShadowOcclusionBoost, 0.0);
+	float angularClosure = (closureExponent > 0.0)
+		? pow(saturate(angularLightVisibility), closureExponent)
+		: 1.0;
+	authoredVisibility *= angularClosure;
+	float finalVisibility = lerp(1.0, authoredVisibility, shadowStrength);
+	float rawShadow = saturate(1.0 - finalVisibility);
+
+	float saturation = saturate(ProxyShadowBaseSettings.z);
+	float3 darkened = max(baseColor, 0.0) * finalVisibility;
+	float darkenedLuma = max(dot(darkened, float3(0.2126, 0.7152, 0.0722)), 0.0);
+	float3 shadowColor = lerp(darkenedLuma.xxx, darkened, saturation);
+
+	// Treat the user tint as chroma, not as another exposure multiplier. The old
+	// direct RGB multiply made blue shadow tints lose luminance and look dirty.
+	// Normalize it to unit luminance and keep the influence deliberately subtle.
+	float3 requestedTint = max(ProxyShadowBaseTint, 0.001);
+	float requestedTintLuma = max(dot(requestedTint, float3(0.2126, 0.7152, 0.0722)), 0.001);
+	float3 chromaOnlyTint = requestedTint / requestedTintLuma;
+	float tintWeight = rawShadow;
+	float3 tintedShadow = shadowColor * lerp(float3(1.0, 1.0, 1.0), chromaOnlyTint, tintWeight);
+
+	// Reflected light belongs to the penumbra, not the fully lit region or the
+	// sealed umbra. This smooth bell-shaped envelope grows toward the shadow
+	// boundary and returns to exactly zero in complete darkness. Shadow Bounce
+	// remains the sole authored strength control and is no longer disabled when
+	// Shadow Strength is 1.
+	float bounceStrength = max(ProxyShadowColorSettings.x, 0.0) * step(0.5, ProxyShadowColorSettings.y);
+	float shadowEntry = smoothstep(0.015, 0.24, rawShadow);
+	float umbraRejection = 1.0 - smoothstep(0.46, 1.0, rawShadow);
+	float bounceEnvelope = shadowEntry * umbraRejection;
+	float sourceLuma = max(dot(max(baseColor, 0.0), float3(0.2126, 0.7152, 0.0722)), 0.0);
+	float3 sourceHue = sourceLuma > 0.0001 ? max(baseColor, 0.0) / sourceLuma : float3(1.0, 1.0, 1.0);
+	float3 reflectedHue = lerp(sourceHue, chromaOnlyTint, 0.58);
+	float reflectedEnergy = min(sourceLuma, 1.5) * bounceStrength * bounceEnvelope;
+	return max(tintedShadow + reflectedHue * reflectedEnergy, 0.0);
+}
+
+
+
+
+
+float3 ComputeProxyLitMicroGlow(float3 baseColor, float3 directColor, float finalVisibility)
+{
+	// This is intentionally not a second lighting model. It is a small HDR
+	// shoulder fed by the existing direct-light payload and gated by the final
+	// proxy visibility, so it can only appear on genuinely unshadowed surfaces.
+	float litGate = smoothstep(0.72, 0.96, saturate(finalVisibility));
+	float baseLuma = max(dot(max(baseColor, 0.0), float3(0.2126, 0.7152, 0.0722)), 0.0);
+	float directLuma = max(dot(max(directColor, 0.0), float3(0.2126, 0.7152, 0.0722)), 0.0);
+	float highlightGate = smoothstep(0.34, 0.82, baseLuma);
+
+	// Some scans have almost no newly synthesized direct payload because their
+	// photographed color already contains the sun. Use that captured luminance
+	// as the primary energy source and let live direct light reinforce it.
+	float capturedEnergy = 1.0 - exp(-baseLuma);
+	float liveEnergy = 1.0 - exp(-directLuma * 0.70);
+	float glowDrive = litGate * highlightGate * max(capturedEnergy, liveEnergy);
+
+	// Preserve captured hue and bias it very slightly toward warm sunlight.
+	// Do not hard-cap HDR energy here; the explicit bloom threshold/scatter
+	// controls own the visible result in the plugin composite.
+	float3 capturedHue = baseLuma > 0.0001 ? max(baseColor, 0.0) / baseLuma : float3(1.0, 1.0, 1.0);
+	float3 warmHue = lerp(capturedHue, float3(1.08, 0.96, 0.78), 0.16);
+	return warmHue * glowDrive;
+}
+
+
+
+
+float3 FootprintHeatmap(float value01)
+{
+	value01 = saturate(value01);
+	return saturate(float3(
+		1.5 * value01,
+		1.5 - abs(value01 * 3.0 - 1.5),
+		1.5 * (1.0 - value01)));
+}
+
+// v2766: render-path AOV diagnostics. These values are tapped only after the exact
+// production SampleCapturedShadowVisibility call has executed. Modes 80-83 therefore
+// diagnose the real source/visibility branch used by MRQ/Sequencer. Modes 84-87 inspect
+// the same fixed directional LightDepth packet without changing its update policy.
+float3 VisualizeRenderCastPipelineDebug(
+    uint debugMode,
+    float3 translatedWorldPosition,
+    float rawCastVisibility,
+    float authoredVisibility,
+    float receiverVisibility)
+{
+    if (debugMode == 80u)
+    {
+        // Yellow = screen-aligned shadowed/unshadowed capture pair.
+        if (ProxyScreenCaptureSettings.x > 0.5 && ProxyCaptureRightEnabled.w > 0.5)
+        {
+            return float3(1.0, 0.8, 0.0);
+        }
+        // Green = fixed directional LightDepth production path.
+        if (ProxyShadowTemporalSettings.z >= 0.5 && ProxyLightDepthForwardEnabled.w >= 0.0)
+        {
+            return float3(0.0, 1.0, 0.0);
+        }
+        // Blue = legacy camera-projected capture path.
+        return float3(0.0, 0.35, 1.0);
+    }
+
+    if (debugMode == 81u)
+    {
+        return saturate(rawCastVisibility).xxx;
+    }
+    if (debugMode == 82u)
+    {
+        return saturate(receiverVisibility).xxx;
+    }
+    if (debugMode == 83u)
+    {
+        return saturate(authoredVisibility).xxx;
+    }
+
+    // 84-87 are LightDepth-specific. Magenta means the render is not currently using
+    // a valid directional LightDepth packet, so these views are intentionally invalid.
+    if (ProxyLightDepthForwardEnabled.w < 0.0)
+    {
+        return float3(1.0, 0.0, 1.0);
+    }
+
+    float3 worldPosition = translatedWorldPosition - PreViewTranslation;
+    float3 lightRelative = worldPosition - ProxyLightDepthOriginWidth.xyz;
+    float lightWidth = max(ProxyLightDepthOriginWidth.w, 1.0);
+    float2 lightUV = float2(
+        0.5 + dot(lightRelative, ProxyLightDepthRightRange.xyz) / lightWidth,
+        0.5 - dot(lightRelative, ProxyLightDepthUpSettings.xyz) / lightWidth);
+    float receiverDepth = dot(lightRelative, ProxyLightDepthForwardEnabled.xyz);
+    if (receiverDepth <= 0.0 || any(lightUV < 0.0) || any(lightUV > 1.0))
+    {
+        return float3(0.25, 0.0, 0.25);
+    }
+
+    uint depthWidth = 1u;
+    uint depthHeight = 1u;
+    ProxyLightDepthCapture.GetDimensions(depthWidth, depthHeight);
+    float2 depthSize = max(float2(depthWidth, depthHeight), float2(1.0, 1.0));
+    float2 depthTexel = 1.0 / depthSize;
+    float centerBlockerDepth = ProxyLightDepthCapture.SampleLevel(
+        ProxyLightDepthSampler, lightUV, 0).r;
+    bool centerDepthValid = centerBlockerDepth > 0.01 && centerBlockerDepth < 60000.0;
+
+    if (debugMode == 84u)
+    {
+        if (!centerDepthValid)
+        {
+            return float3(0.0, 0.0, 0.0);
+        }
+        float normalizedDepth = saturate(
+            log2(1.0 + max(centerBlockerDepth, 0.0)) /
+            log2(1.0 + max(lightWidth * 4.0, 1.0)));
+        return normalizedDepth.xxx;
+    }
+
+    float worldUnitsPerTexel = lightWidth / max(float(depthWidth), 1.0);
+    float depthBias = clamp(ProxyShadowDetailSettings.x, 2.0, 40.0)
+        + worldUnitsPerTexel * 0.20;
+    float depthTransition = max(1.0, abs(ProxyLightDepthForwardEnabled.w) * 3.0);
+
+    if (debugMode == 85u)
+    {
+        if (!centerDepthValid)
+        {
+            return float3(0.0, 0.0, 0.0);
+        }
+        float deltaCm = receiverDepth - centerBlockerDepth;
+        float scaleCm = max((depthBias + depthTransition) * 4.0, 1.0);
+        float magnitude = saturate(abs(deltaCm) / scaleCm);
+        // Red = receiver behind blocker, blue = receiver in front, green = near compare threshold.
+        if (deltaCm > depthBias)
+        {
+            return lerp(float3(0.15, 0.0, 0.0), float3(1.0, 0.0, 0.0), magnitude);
+        }
+        if (deltaCm < -depthBias)
+        {
+            return lerp(float3(0.0, 0.0, 0.15), float3(0.0, 0.25, 1.0), magnitude);
+        }
+        return float3(0.0, 1.0, 0.0);
+    }
+
+    if (debugMode == 86u)
+    {
+        float filterRadius = min(max(ProxyCaptureSettings.x, 0.0), 2.5);
+        float2 offsets[9] =
+        {
+            float2( 0.00,  0.00),
+            float2(-0.70,  0.00), float2( 0.70,  0.00),
+            float2( 0.00, -0.70), float2( 0.00,  0.70),
+            float2(-0.52, -0.52), float2( 0.52, -0.52),
+            float2(-0.52,  0.52), float2( 0.52,  0.52)
+        };
+        float minVisibility = 1.0;
+        float maxVisibility = 0.0;
+        float validTapCount = 0.0;
+        [unroll]
+        for (int sampleIndex = 0; sampleIndex < 9; ++sampleIndex)
+        {
+            float2 sampleUV = lightUV + offsets[sampleIndex] * depthTexel * filterRadius;
+            if (any(sampleUV < 0.0) || any(sampleUV > 1.0))
+            {
+                continue;
+            }
+            float blockerDepth = ProxyLightDepthCapture.SampleLevel(
+                ProxyLightDepthSampler, sampleUV, 0).r;
+            float sampleVisibility = 1.0;
+            if (blockerDepth > 0.01 && blockerDepth < 60000.0)
+            {
+                float blockerSeparation = receiverDepth - blockerDepth;
+                sampleVisibility = 1.0 - smoothstep(
+                    depthBias, depthBias + depthTransition, blockerSeparation);
+            }
+            minVisibility = min(minVisibility, sampleVisibility);
+            maxVisibility = max(maxVisibility, sampleVisibility);
+            validTapCount += 1.0;
+        }
+        float disagreement = (validTapCount > 0.5)
+            ? saturate(maxVisibility - minVisibility)
+            : 0.0;
+        // Black = all taps agree, white = taps strongly disagree at a shadow/raster boundary.
+        return disagreement.xxx;
+    }
+
+    // 87: sub-texel phase of the receiver inside the LightDepth grid. During a camera-only
+    // render this should remain fixed for a fixed world-space splat. R/G motion means the
+    // light-space packet or world-position input is changing between rendered frames.
+    float2 texelPosition = lightUV * depthSize - 0.5;
+    float2 phase = frac(texelPosition);
+    return float3(phase.x, phase.y, 0.0);
+}
+
+// v2782: preserve original 3DGS hue/chroma only inside the authoritative Stable
+// shadow region while keeping the already-computed shadow luminance. This replaces
+// the old final-composite luminance-darkness heuristic, so naturally dark materials
+// outside Stable cast/closure are no longer mistaken for shadows.
+
+
+#if PIXELSHADER
+// P11: reuse the older wet-surface ripple language on the dedicated water-GS layer.
+// All ripple centers/phases remain WORLD-space only; the camera changes projection, never placement.
+float PuddleDropHash(float2 Cell)
+{
+    return frac(sin(dot(Cell, float2(127.1, 311.7))) * 43758.5453);
+}
+float2 PuddleRippleBands(float2 SurfaceXY)
+{
+    const float CellSize = max(PuddleWaterParams.z, 10.0);
+    const float RippleSizeCm = max(PuddleWaterRippleSizeCm, 5.0);
+    const float RippleSpeed = max(PuddleWaterParams.w, 0.0);
+    const float2 LocalGrid = SurfaceXY / CellSize;
+    const float2 Base = floor(LocalGrid - 0.5);
+    float2 Bands = 0.0.xx;
+    [unroll] for (int DY = 0; DY <= 1; ++DY)
+    {
+        [unroll] for (int DX = 0; DX <= 1; ++DX)
+        {
+            float2 C = Base + float2(DX, DY);
+            float Seed = PuddleDropHash(C);
+            float2 Jitter = float2(PuddleDropHash(C + 23.4), PuddleDropHash(C - 17.8)) - 0.5;
+            float2 Center = (C + 0.5 + Jitter * 0.56) * CellSize;
+            float2 Delta = (SurfaceXY - Center) / CellSize;
+            float Radius = length(Delta);
+            float Phase = frac(PuddleWaterTimeSeconds * RippleSpeed + Seed);
+            float MaxRadius = saturate(RippleSizeCm / CellSize) * 0.48;
+            float RingRadius = Phase * MaxRadius;
+            float RingWidth = max(0.018, MaxRadius * 0.10);
+            float Life = 1.0 - Phase;
+            float RadiusFade = 1.0 - smoothstep(0.52, 0.74, Radius);
+            float D0 = Radius - RingRadius;
+            float Bright = exp(-(D0 * D0) / max(RingWidth * RingWidth * 0.55, 1.0e-5)) * Life;
+            float D1 = Radius - (RingRadius + RingWidth * 1.55);
+            float Dark = exp(-(D1 * D1) / max(RingWidth * RingWidth * 1.35, 1.0e-5)) * Life;
+            float D2 = Radius - (RingRadius + RingWidth * 3.10);
+            float Secondary = exp(-(D2 * D2) / max(RingWidth * RingWidth * 2.20, 1.0e-5)) * Life * 0.45;
+            Bands = max(Bands, float2(Bright + Secondary * 0.35, Dark + Secondary) * RadiusFade);
+        }
+    }
+    return saturate(Bands);
+}
+
+float2 PuddleRoofFlowBands(float3 SurfaceWorld, float3 SurfaceNormal)
+{
+    float2 DownSlope = -SurfaceNormal.xy;
+    float DownLen = length(DownSlope);
+    if (DownLen < 1.0e-4)
+    {
+        DownSlope = float2(0.0, -1.0);
+        DownLen = 1.0;
+    }
+    DownSlope /= DownLen;
+    float2 Across = float2(-DownSlope.y, DownSlope.x);
+    const float Spacing = max(PuddleWaterParams.z * 0.42, 8.0);
+    const float FlowSpeed = max(PuddleRoofFXParams.w, 0.0);
+    const float FlowStrength = max(PuddleRoofFXParams.z, 0.0);
+    const float TrailLen = max(PuddleWaterRippleSizeCm * 0.045, 0.22);
+    float Along = dot(SurfaceWorld.xy, DownSlope) / max(PuddleWaterRippleSizeCm, 10.0);
+    float AcrossCoord = dot(SurfaceWorld.xy, Across) / Spacing;
+    float StripeIndex = floor(AcrossCoord);
+    float StripeSeed = PuddleDropHash(float2(StripeIndex, StripeIndex * 0.37));
+    float StripeMask = exp(-pow((frac(AcrossCoord) - 0.5) / 0.18, 2.0));
+    float FlowPhase = frac(-Along + PuddleWaterTimeSeconds * FlowSpeed + StripeSeed);
+    float Head = exp(-pow((FlowPhase - 0.16) / 0.09, 2.0));
+    float Trail = exp(-max(FlowPhase - 0.16, 0.0) / max(TrailLen, 0.08)) * step(0.16, FlowPhase);
+    float Secondary = exp(-pow((FlowPhase - 0.58) / 0.16, 2.0)) * 0.35;
+    float Bright = StripeMask * (Head + 0.55 * Trail + Secondary) * FlowStrength;
+    float Dark = StripeMask * (0.45 * Trail + 0.20 * Secondary) * FlowStrength;
+    return saturate(float2(Bright, Dark));
+}
+// Intersect the screen ray with the baked Gaussian TANGENT PLANE. Camera data
+// does not decide membership; it only projects an already-baked surface point.
+float3 PuddlePixelWorldPosition(float4 ScreenPosition, float3 WorldCenter, float3 SurfaceN, out bool bValid)
+{
+    bValid = false;
+    float2 NDC = float2(
+        (ScreenPosition.x - PuddleViewport.x) / PuddleViewport.z * 2.0 - 1.0,
+        1.0 - (ScreenPosition.y - PuddleViewport.y) / PuddleViewport.w * 2.0);
+    float4 NearH = mul(float4(NDC, 1.0, 1.0), PuddleClipToWorld);
+    float4 MidH = mul(float4(NDC, 0.5, 1.0), PuddleClipToWorld);
+    if (abs(NearH.w) < 1.e-7 || abs(MidH.w) < 1.e-7) return WorldCenter;
+    float3 Near = NearH.xyz / NearH.w;
+    float3 Mid = MidH.xyz / MidH.w;
+    float3 Ray = Mid - Near;
+    float Den = dot(Ray, SurfaceN);
+    if (abs(Den) < 1.e-5) return WorldCenter;
+    float T = dot(WorldCenter - Near, SurfaceN) / Den;
+    bValid = (T > 0.0 && T < 20000.0);
+    return bValid ? Near + T * Ray : WorldCenter;
+}
+
+#endif // PIXELSHADER P10 ring helpers
+
+// Pixel shader: Gaussian falloff with alpha blending + velocity output (Nanite-style)
+#if GS_VR_DIAGNOSTIC_MODE > 0
+FMainPixelOutput MainPS(FVertexOutput Input)
+{
+    // Same removal, support, quality falloff and alpha cutoff as production.
+    // ViewData/SH/projection/opacity and LOD are deliberately not replaced.
+    if (IsInsideAnyGSRemovalBox(Input.Position, Input.TranslatedWorldPos.xyz)) discard;
+    float distSq = dot(Input.LocalPos, Input.LocalPos);
+    if (distSq > 1.0) discard;
+    float k = RenderQualityMode == 3u ? 5.15 : 4.0;
+    float edge = exp(-k);
+    float weight = (exp(-k * distSq) - edge) / max(1.0 - edge, 0.0001);
+    float4 color = Input.Color;
+    color.a = saturate(weight * color.a);
+    color.rgb *= color.a;
+    if (color.a < 1.0 / 255.0) discard;
+    FMainPixelOutput Output;
+    Output.Color = color;
+    #if GS_VR_DIAGNOSTIC_MODE != 3
+    Output.Depth = (PCVRReuseRadialDepth != 0u ? Input.TranslatedWorldPos.w : length(Input.TranslatedWorldPos.xyz));
+    #endif
+    #if GS_VR_DIAGNOSTIC_MODE == 1
+    // Match production's base-GS auxiliary writes to isolate pixel ALU first.
+    Output.Normal = float4(normalize(Input.SurfaceNormal) * 0.5 + 0.5,
+                          saturate(Input.SurfaceWorldSizeCm));
+    Output.SnowOcclusionDepth = color.a >= 0.32 ? Output.Depth : 1.0e30;
+    Output.FogDepthAccum = float4((Output.Depth * 0.01) * color.a, 0, 0, color.a);
+    #endif
+    return Output;
+}
+#else
+FMainPixelOutput MainPS(FVertexOutput Input)
+{
+    if (IsInsideAnyGSRemovalBox(Input.Position, Input.TranslatedWorldPos.xyz)) discard;
+    // V15-A: reject only provably invisible ordinary source pixels BEFORE
+    // the expensive stable-shadow / per-pixel lighting equations. Diagnostic
+    // alpha previews and PuddleGaussian (which can replace alpha) keep the
+    // original order and result. The same exact falloff is reused below.
+    const bool bEarlyAlphaSafe = PCVREarlyAlphaEnabled != 0u &&
+        Input.DebugFlag == 0u && LightingPreviewMode == 0u &&
+        StableShadowDebugMode == 0u && Input.SurfacePuddleMembership <= 1.5;
+    float EarlyGaussianWeight = 0.0;
+    const float EarlyDistSq = dot(Input.LocalPos, Input.LocalPos);
+    if (bEarlyAlphaSafe)
+    {
+        if (EarlyDistSq > 1.0) discard;
+        const float EarlyK = RenderQualityMode == 3u ? 5.15 : 4.0;
+        const float EarlyEdge = exp(-EarlyK);
+        EarlyGaussianWeight = (exp(-EarlyK * EarlyDistSq) - EarlyEdge) / max(1.0 - EarlyEdge, 0.0001);
+        if (saturate(EarlyGaussianWeight * Input.Color.a) < 1.0 / 255.0) discard;
+    }
+	FMainPixelOutput Output;
+	Output.Depth = (PCVRReuseRadialDepth != 0u ? Input.TranslatedWorldPos.w : length(Input.TranslatedWorldPos.xyz));
+	Output.FogDepthAccum = 0.0.xxxx;
+	// Weak Gaussian tails must not behave as fully opaque snow cutters.  Keep the
+	// normal GS depth untouched and publish a separate snow-only occlusion depth.
+	Output.SnowOcclusionDepth = 1.0e30;
+	// v36 Rain auxiliary payload.
+	// RGB keeps the existing stable surface normal (replacement blend). Alpha is an
+	// order-independent accumulation of intrinsic-size quality * Gaussian coverage.
+	// It is NOT the water receiver mask; the dedicated Wet pass derives receiver
+	// geometry from the continuous collider/proxy surface depth.
+	Output.Normal = float4(
+		normalize(Input.SurfaceNormal) * 0.5 + 0.5,
+		0.0);
+	float4 color = Input.Color;
+	bool originalUnlit = RenderQualityMode == 4u;
+	bool proxyLightingMain = UseProxyLightingMaskAsMain != 0u;
+	if (!originalUnlit && LightingPreviewMode == 38u)
+	{
+		color.rgb = max(Input.DirectColor, 0.0);
+		color.a = 1.0;
+	}
+	else if (!originalUnlit && LightingPreviewMode == 39u)
+	{
+		color.rgb = max(Input.PlantTransmissionColor, 0.0);
+		color.a = 1.0;
+	}
+	else if (!originalUnlit &&
+		(LightingPreviewMode >= 31u && LightingPreviewMode <= 47u))
+	{
+		if (LightingPreviewMode == 35u)
+		{
+			float rawVisibility;
+			float finalVisibility;
+			float receiverVisibility;
+			SampleCapturedShadowVisibility(
+				Input.Position.xy, Input.TranslatedWorldPos.xyz, Input.ProxyShadowMask,
+				rawVisibility, finalVisibility, receiverVisibility);
+			color.rgb = finalVisibility.xxx;
+		}
+		else if (LightingPreviewMode == 36u || LightingPreviewMode == 37u)
+		{
+			float rawVisibility;
+			float finalVisibility;
+			float receiverVisibility;
+			SampleCapturedShadowVisibility(
+				Input.Position.xy, Input.TranslatedWorldPos.xyz, Input.ProxyShadowMask,
+				rawVisibility, finalVisibility, receiverVisibility);
+			float sunlitGradeMask = smoothstep(0.08, 0.78, finalVisibility);
+			float shadowGradeMask = 1.0 - sunlitGradeMask;
+			float3 graded = ApplyRegionalColorGrade(max(color.rgb, 0.0), sunlitGradeMask, RegionalColorGradeParams0);
+			graded = ApplyRegionalColorGrade(graded, shadowGradeMask, RegionalColorGradeParams1);
+			graded = ApplyAuthoredShadowTintLift(graded, shadowGradeMask);
+			float3 reflected = ComputeProxyReflectedFill(graded, finalVisibility, receiverVisibility);
+			float3 directCarrier = ApplyDetailPreservingShadow(graded, finalVisibility);
+			color.rgb = (LightingPreviewMode == 36u) ? reflected : (directCarrier + reflected);
+		}
+		else
+		{
+			float3 diagnostic;
+			// v2743 public stable set: energy-preserving proxy lighting plus an
+			// indirect/closure-only diagnostic. Legacy direct/micro proof views are hidden.
+			if (StableShadowDebugMode == 72u || StableShadowDebugMode == 75u || StableShadowDebugMode == 79u ||
+				StableShadowDebugMode == 80u || StableShadowDebugMode == 81u || StableShadowDebugMode == 82u ||
+				StableShadowDebugMode == 102u || StableShadowDebugMode == 103u || StableShadowDebugMode == 104u ||
+				(StableShadowDebugMode >= 92u && StableShadowDebugMode <= 101u))
+			{
+				if (Input.StableBindingDebug < -1.5)
+				{
+					diagnostic = float3(0.0, 0.2, 1.0);
+				}
+				else if (Input.StableBindingDebug < -0.5)
+				{
+					diagnostic = float3(1.0, 0.0, 1.0);
+				}
+				else
+				{
+					// DirectColor already contains the camera-independent energy split built
+					// in CalcViewData. Do not multiply it by closure or cast visibility again.
+					diagnostic = saturate(max(Input.DirectColor, 0.0));
+				}
+			}
+
+			else if (LightingPreviewMode == 44u)
+			{
+				// Core C: left half = UE-lit shadowed proxy capture, right half = the
+				// exact final visibility currently applied by the stable renderer.
+				float3 proxyReference = VisualizeProxyShadowDiagnostic(31u, Input.TranslatedWorldPos.xyz);
+				float proxyLuma = saturate(dot(max(proxyReference, 0.0), float3(0.2126, 0.7152, 0.0722)));
+				float rawVisibilitySplit;
+				float finalVisibilitySplit;
+				float receiverVisibilitySplit;
+				SampleCapturedShadowVisibility(
+					Input.Position.xy, Input.TranslatedWorldPos.xyz, Input.ProxyShadowMask,
+					rawVisibilitySplit, finalVisibilitySplit, receiverVisibilitySplit);
+				float centerNDCX = Input.CenterClipPos.x / max(abs(Input.CenterClipPos.w), 1.0e-5);
+				diagnostic = centerNDCX < 0.0 ? proxyLuma.xxx : finalVisibilitySplit.xxx;
+			}
+			else
+			{
+				diagnostic = VisualizeProxyShadowDiagnostic(
+					LightingPreviewMode, Input.TranslatedWorldPos.xyz);
+			}
+			if (LightingPreviewMode == 31u || LightingPreviewMode == 32u || LightingPreviewMode == 45u)
+			{
+				// These are true direct-directional proxy-capture diagnostics. Previously the
+				// capture was multiplied by Input.PostLightMask, a separately computed
+				// per-splat normal term. That extra gate produced noisy ground patches
+				// and hid what the proxy mesh actually received.
+				float captureLuma = dot(
+					max(diagnostic, 0.0),
+					float3(0.2126, 0.7152, 0.0722));
+				diagnostic = saturate(captureLuma).xxx;
+			}
+			color.rgb = diagnostic;
+		}
+		// Show the diagnostic value independent of the source splat alpha.
+		// Gaussian support/coverage is still applied by the normal raster path.
+		color.a = 1.0;
+	}
+	else if (!originalUnlit && LightingPreviewMode > 0u && LightingPreviewMode <= 5u)
+	{
+		if (LightingPreviewMode == 2u)
+		{
+			float attenuation = SampleCapturedShadowAttenuation(
+				Input.Position.xy, Input.TranslatedWorldPos.xyz, Input.ProxyShadowMask);
+			color.rgb = attenuation.xxx;
+		}
+		else if (LightingPreviewMode == 5u)
+		{
+			// Pure diagnostic output: no gamma, minimum-light floor, mask strength,
+			// or screen-space filtering. Black is zero separation and white is the
+			// configured Distance Range (cm).
+			float blockerDistance = CalculateBlockerDistanceFactor(Input.TranslatedWorldPos.xyz);
+			color.rgb = blockerDistance.xxx;
+		}
+		else
+		{
+			float previewMask = (LightingPreviewMode == 4u) ? Input.ProxyShadowMask : Input.PostLightMask;
+			color.rgb = VisualizeLightingMask(previewMask, LightingPreviewMode);
+		}
+		color.a = max(color.a, 0.22);
+	}
+	else if (!originalUnlit && StableShadowDebugMode >= 74u && StableShadowDebugMode <= 78u)
+	{
+		// Cast-depth data is emitted directly from CalcViewData. Bypass all Final
+		// grading so the encoded receiver/blocker/comparison values stay measurable.
+		color.rgb = saturate(Input.DirectColor);
+		color.a = 1.0;
+	}
+	else if (!originalUnlit && PerSplatLightingEnabled == 0u)
+	{
+		color.rgb = EvaluateFinalSplatLighting(Input);
+	}
+
+    if (!originalUnlit && LightingPreviewMode == 0u && StableShadowDebugMode == 0u)
+        color.rgb = ApplyPCVRShadowBlueOverlay(color.rgb, Input);
+
+	// Debug mode: solid opaque colors without Gaussian falloff (Nanite-style)
+	if (Input.DebugFlag != 0)
+	{
+		// Simple circle cutoff for cleaner debug visualization
+		float distSq = EarlyDistSq;
+		if (distSq > 1.0)
+		{
+			discard;
+		}
+		// Output solid color (no premultiplied alpha, no Gaussian)
+		Output.Color = color;
+		return Output;
+	}
+
+	// Normalized Gaussian falloff (matches SuperSplat)
+	// Shifts and rescales exp(-4*A) so it reaches exactly 0.0 at the quad edge,
+	// eliminating the visible discontinuity from a nonzero cutoff
+	float distSq = EarlyDistSq;
+	float qualitySharp = RenderQualityMode == 3u ? 1.0 : 0.0;
+	float supportRadiusSq = 1.0;
+
+	// Discard pixels outside the unit circle for efficiency
+	if (distSq > supportRadiusSq)
+	{
+		discard;
+	}
+
+	float normalizedDistSq = distSq / max(supportRadiusSq, 0.0001);
+	float falloffK = lerp(4.0, 5.15, qualitySharp);
+	float edgeValue = exp(-falloffK);
+    float gaussianWeight = EarlyGaussianWeight;
+    if (!bEarlyAlphaSafe)
+        gaussianWeight = (exp(-falloffK * normalizedDistSq) - edgeValue) / max(1.0 - edgeValue, 0.0001);
+
+	// Apply Gaussian to alpha
+	color.a = saturate(gaussianWeight * color.a);
+
+	// P10 world-fixed transparent water film + animated expanding rain rings.
+	// Applied ONLY to the dedicated PuddleGaussianComponent, never base 3DGS.
+	if (Input.SurfacePuddleMembership > 1.5)
+	{
+        float3 WorldCenter = Input.TranslatedWorldPos.xyz - PreViewTranslation;
+        float3 N = normalize(Input.SurfaceNormal);
+        // Water layer's baked flat/roof covariance gives us a deterministic tangent normal.
+        if (N.z < 0.0) N = -N;
+        bool bValidWaterPlane = false;
+        float3 WaterWorld = PuddlePixelWorldPosition(Input.Position, WorldCenter, N, bValidWaterPlane);
+        // P13: roof-only world-space subcell coverage clip. The two 8-bit
+        // values were baked from original proxy triangles, NOT camera depth.
+        // A roof Gaussian may be much wider than its parent roof tile; its
+        // pixels MUST NOT write alpha outside the actual tile's roof coverage.
+        const bool bRoofPuddleMarker = Input.PlantTransmissionColor.x > 0.85;
+        const bool bLeafPuddleMarker = Input.PlantTransmissionColor.x > 0.5 && Input.PlantTransmissionColor.x < 0.80;
+        const uint RoofBlueDebugMode = (uint)round(clamp(PuddleRoofFXParams.y, 0.0, 3.0));
+        // P16: both BLUE modes stay within each tiny roof tile. Previously P15 raw
+        // mode bypassed the boundary completely and painted enormous sky blobs.
+        // Mode 1: tile-bounded raw micro splats. Mode 2: tile plus 4x4 proxy mask.
+        if (RoofBlueDebugMode > 0u &&
+            (RoofBlueDebugMode == 3u ? !bLeafPuddleMarker : !bRoofPuddleMarker)) discard;
+        float RoofCoverage = 1.0;
+        if (bRoofPuddleMarker)
+        {
+            if (!bValidWaterPlane) discard;
+            const float CellCm = max(PuddleRoofRasterCellCm, 1.0);
+            const float2 CellUV = (WaterWorld.xy - WorldCenter.xy) / CellCm + 0.5;
+            // A Gaussian is NEVER allowed to draw outside its assigned WORLD roof tile.
+            if (any(CellUV < 0.0.xx) || any(CellUV >= 1.0.xx)) discard;
+        }
+        if (bRoofPuddleMarker && RoofBlueDebugMode != 1u)
+        {
+            const float CellCm = max(PuddleRoofRasterCellCm, 1.0);
+            const float2 CellUV = (WaterWorld.xy - WorldCenter.xy) / CellCm + 0.5;
+            const uint LowByte = (uint)round(saturate(Input.PlantTransmissionColor.y) * 255.0);
+            const uint HighByte = (uint)round(saturate(Input.PlantTransmissionColor.z) * 255.0);
+            const uint Coverage = LowByte | (HighByte << 8);
+            const float2 P = CellUV * 4.0 - 0.5;
+            const int2 I0 = int2(floor(P));
+            const float2 Blend = frac(P);
+            // Four nearest 4x4 bits smoothly feather partial eaves/roof edges;
+            // full-coverage cells stay unchanged across internal tile borders.
+            const int2 A = clamp(I0, int2(0,0), int2(3,3));
+            const int2 B = clamp(I0 + int2(1,0), int2(0,0), int2(3,3));
+            const int2 C = clamp(I0 + int2(0,1), int2(0,0), int2(3,3));
+            const int2 D = clamp(I0 + int2(1,1), int2(0,0), int2(3,3));
+            const float C00 = float((Coverage >> (A.y * 4 + A.x)) & 1u);
+            const float C10 = float((Coverage >> (B.y * 4 + B.x)) & 1u);
+            const float C01 = float((Coverage >> (C.y * 4 + C.x)) & 1u);
+            const float C11 = float((Coverage >> (D.y * 4 + D.x)) & 1u);
+            RoofCoverage = lerp(lerp(C00, C10, Blend.x), lerp(C01, C11, Blend.x), Blend.y);
+            if (RoofCoverage < 0.01) discard;
+        }
+        const bool bRoofLayer = bRoofPuddleMarker;
+        if (RoofBlueDebugMode != 0u)
+        {
+            // Strong premultiplied BLUE, not P14 low-opacity film tint. Ignore
+            // normal source opacity, wetness, Fresnel and ripple attenuation.
+            // Gaussian support and optional mask still define actual coverage.
+            const float DebugAlpha = saturate(gaussianWeight * 1.8) * RoofCoverage;
+            if (DebugAlpha < 1.0 / 255.0) discard;
+            const float3 DebugColor = bLeafPuddleMarker ? float3(0.02, 0.93, 0.92) : float3(0.012, 0.14, 1.0);
+            Output.Color = float4(DebugColor * DebugAlpha, DebugAlpha);
+            Output.Normal.a = 0.0;
+            return Output;
+        }
+        float2 EffectBands = (bRoofLayer && PuddleRoofFXParams.x > 0.5)
+            ? PuddleRoofFlowBands(WaterWorld, N)
+            : PuddleRippleBands(WaterWorld.xy);
+        EffectBands *= saturate(PuddleWaterParams.y);
+		float RippleBrightBand = EffectBands.x;
+		float RippleDarkBand = EffectBands.y;
+		// More transparent neutral film; roofs can switch to down-slope droplets while floor keeps ring ripples.
+        // P12: cheap directional/Fresnel reflection preview. A ray-traced
+        // 3DGS scene reflection would require a separate scene/depth hit pass;
+        // this uses the existing light vector/sky response without faking that claim.
+        float2 NDC = float2(
+            (Input.Position.x - PuddleViewport.x) / PuddleViewport.z * 2.0 - 1.0,
+            1.0 - (Input.Position.y - PuddleViewport.y) / PuddleViewport.w * 2.0);
+        float4 NearH = mul(float4(NDC, 1.0, 1.0), PuddleClipToWorld);
+        float3 NearWorld = abs(NearH.w) > 1.e-7 ? NearH.xyz / NearH.w : WorldCenter + float3(0,0,50);
+        float3 V = normalize(NearWorld - WaterWorld);
+        if (dot(N, V) < 0.0) N = -N;
+        float NdotV = saturate(dot(N, V));
+        float Fresnel = 0.03 + 0.97 * pow(1.0 - NdotV, 5.0);
+        float3 Reflected = reflect(-V, N);
+        float SkyFactor = smoothstep(-0.08, 0.82, Reflected.z);
+        float3 SkyReflection = lerp(float3(0.055, 0.071, 0.091), float3(0.28, 0.34, 0.40), SkyFactor);
+        float3 LightToSurface = -normalize(ProxyLightDepthForwardEnabled.xyz);
+        float LightReady = step(0.001, dot(ProxyLightDepthForwardEnabled.xyz, ProxyLightDepthForwardEnabled.xyz));
+        float Glint = pow(saturate(dot(Reflected, LightToSurface)), 96.0) * LightReady;
+        float ReflectionWeight = saturate(PuddleWaterReflectionStrength * (0.10 + 0.90 * Fresnel));
+        {
+            float3 BaseFilmTint = bRoofLayer ? float3(0.050, 0.062, 0.072) : float3(0.062, 0.075, 0.085);
+            float3 CrestTint = bRoofLayer ? float3(0.34, 0.38, 0.40) : float3(0.29, 0.33, 0.35);
+            color.rgb = max(BaseFilmTint * (1.0 - 0.20 * RippleDarkBand)
+                + CrestTint * (0.48 * RippleBrightBand)
+                + SkyReflection * ReflectionWeight
+                + (0.16 + 0.14 * RippleBrightBand) * Glint * PuddleWaterReflectionStrength, 0.0);
+            color.a *= saturate(PuddleWaterParams.x) * saturate(
+                (bRoofLayer ? 0.46 : 0.38) + 0.17 * Fresnel * PuddleWaterReflectionStrength
+                + 0.30 * RippleBrightBand - 0.06 * RippleDarkBand) * RoofCoverage;
+        }
+        if (bLeafPuddleMarker)
+        {
+            // Canopy is volumetric, not a planar puddle/roof. Tiny glistening
+            // droplets follow ORIGINAL source covariance normal and position.
+            float3 SeedP = floor(WorldCenter * 0.067);
+            float Seed = PuddleDropHash(SeedP.xy + SeedP.z * 19.3);
+            float Flicker = pow(saturate(0.5 + 0.5 * sin(PuddleWaterTimeSeconds * 4.0 + Seed * 9.0)), 4.0);
+            float Glaze = saturate(0.15 + 0.55 * Fresnel + Flicker * 0.55);
+            color.rgb = lerp(float3(0.055,0.071,0.067), float3(0.38,0.43,0.40), Glaze);
+            color.a = saturate(gaussianWeight * 0.24 * Glaze);
+        }
+	}
+
+	// Premultiplied alpha
+	color.rgb *= color.a;
+
+	// Discard nearly transparent pixels for efficiency
+	// Match Unity's threshold: 1/255 ??0.00392
+	if (color.a < 1.0/255.0)
+	{
+		discard;
+	}
+
+	// v36 intrinsic-size quality accumulation. The upper 12 packed payload bits hold
+	// only the fixed world-space size quality. Separate-alpha over blending produces
+	// a stable coverage field that can downweight huge Gaussians in reflections while
+	// leaving receiver geometry to the collider/proxy surface.
+	float WetSplatSizeQuality = saturate(Input.SurfaceWorldSizeCm);
+	// Replacement blending must write zero for rejected foreground splats.
+	Output.Normal.a = WetSplatSizeQuality;
+
+	Output.Color = color;
+	Output.Depth = (PCVRReuseRadialDepth != 0u ? Input.TranslatedWorldPos.w : length(Input.TranslatedWorldPos.xyz));
+	// Snow-only coverage-aware occlusion: transparent Gaussian fringes continue to
+	// contribute to normal GS color, but only materially covered foreground pixels
+	// are allowed to cut snow on a deeper surface.  This target is never used by
+	// Rain/Wet, Stable Self-Cast, normal GS compositing or UE scene depth.
+	const float SnowOcclusionAlphaThreshold = 0.32;
+	Output.SnowOcclusionDepth =
+		(color.a >= SnowOcclusionAlphaThreshold) ? Output.Depth : 1.0e30;
+	// Match RT0's visibility equation exactly. Because the render is sorted,
+	// this converges to the depth of the actually visible Gaussian mixture rather
+	// than the nearest Gaussian centre/tail.
+	Output.FogDepthAccum = float4((Output.Depth * 0.01) * color.a, 0.0, 0.0, color.a);
+	return Output;
+}
+
+#endif // GS_VR_DIAGNOSTIC_MODE
+#if GS_PCVR_LEAN_OUTPUTS
+#undef MainPS
+#undef FMainPixelOutput
+FMainPixelOutput MainPS(FVertexOutput Input)
+{
+#if GS_PCVR_FINAL_ONLY
+    // CPU requires Final/debug=0, one non-water, non-snow proxy. All active
+    // lighting equations remain in the shared production function. This variant
+    // removes unreachable preview and water-film code, not any enabled effect.
+#if !GS_PCVR_NO_REMOVAL
+    if (IsInsideAnyGSRemovalBox(Input.Position,Input.TranslatedWorldPos.xyz)) discard;
+#endif
+    float4 color=Input.Color;
+    const float distSq=dot(Input.LocalPos,Input.LocalPos);
+    // V15-A final-only permutation: the alpha test is safe for ordinary
+    // splats only. It does not suppress any active stable shadow or light.
+    const bool bEarlyAlphaSafe=PCVREarlyAlphaEnabled!=0u && Input.SurfacePuddleMembership<=1.5;
+    if (bEarlyAlphaSafe && distSq>1.0) discard;
+    const float k=RenderQualityMode==3u?5.15:4.0;
+    const float edge=exp(-k);
+    const float weight=(exp(-k*distSq)-edge)/max(1.0-edge,0.0001);
+    if (bEarlyAlphaSafe && saturate(weight*color.a)<1.0/255.0) discard;
+#if !GS_PCVR_COLOR_CACHE
+    if (RenderQualityMode!=4u && PerSplatLightingEnabled==0u)
+        color.rgb=EvaluateFinalSplatLighting(Input);
+#endif
+    color.rgb=ApplyPCVRShadowBlueOverlay(color.rgb,Input);
+    if (distSq>1.0) discard;
+    color.a=saturate(weight*color.a);
+    color.rgb*=color.a;
+    if (color.a<1.0/255.0) discard;
+    FMainPixelOutput Output;
+    Output.Color=color;
+    Output.Depth=(PCVRReuseRadialDepth != 0u ? Input.TranslatedWorldPos.w : length(Input.TranslatedWorldPos.xyz));
+    // Source alpha remains W for the existing over blend. RG targets store
+    // depth sum in R and coverage in G; RGBA reference still reads coverage A.
+#if !GS_PCVR_NO_FOG_OUTPUT
+    Output.FogDepthAccum=float4(Output.Depth*0.01*color.a,color.a,0,color.a);
+#endif
+    return Output;
+#else
+    FPCVRPixelPayload Payload=MainPSPayload(Input);
+    FMainPixelOutput Output;
+    Output.Color=Payload.Color;
+    Output.Depth=Payload.Depth;
+#if !GS_PCVR_NO_FOG_OUTPUT
+    Output.FogDepthAccum=float4(Payload.FogDepthAccum.r,Payload.FogDepthAccum.a,0,Payload.FogDepthAccum.a);
+#endif
+    return Output;
+#endif
+}
+#endif

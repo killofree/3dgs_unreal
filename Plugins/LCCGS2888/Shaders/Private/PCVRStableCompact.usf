@@ -1,0 +1,126 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/LCCCinematicGS/Private/GaussianDataTypes.ush"
+StructuredBuffer<FGaussianSplatViewData> ViewData;
+RWStructuredBuffer<uint> ScratchDepth;
+RWStructuredBuffer<uint> ScratchRank;
+RWStructuredBuffer<uint> Blocks;
+RWStructuredBuffer<uint> OutDepth;
+RWStructuredBuffer<uint> OutIndex;
+RWStructuredBuffer<uint> SortParamsOut;
+RWStructuredBuffer<uint> SortDispatch;
+RWStructuredBuffer<uint> DrawArgsOut;
+uint SourceCount;
+uint BlockCount;
+StructuredBuffer<uint> SourceCluster;
+StructuredBuffer<uint> LeafVisibility;
+StructuredBuffer<uint> ParentVisibility;
+StructuredBuffer<uint> SelectedSourceCluster;
+uint UseSourceClusters;
+uint UseSourceLOD;
+uint OriginalSourceCount;
+RWStructuredBuffer<uint> VisibleCountOut;
+
+#if !PCVR_SOURCE_COMPACT
+#include "/Plugin/LCCCinematicGS/Private/PCVRConservativeCull.ush"
+uint PreCullBoxCount;
+float3 PreCullTranslation;
+float4x4 PreCullClipToWorld;
+float4 PreCullCenters[8];
+float4 PreCullX[8];
+float4 PreCullY[8];
+float4 PreCullZ[8];
+bool EntireSplatRemoved(FGaussianSplatViewData v)
+{
+ [loop] for(uint box=0;box<PreCullBoxCount;++box)
+  if(GSProjectedQuadInsideBox(v.ClipPosition.xy/v.ClipPosition.w,v.Axis1,v.Axis2,v.TranslatedWorldPos,PreCullTranslation,PreCullClipToWorld,PreCullCenters[box],PreCullX[box],PreCullY[box],PreCullZ[box]))return true;
+ return false;
+}
+#endif
+groupshared uint Scan[256];
+[numthreads(256,1,1)]
+void CountCS(uint3 G:SV_GroupID,uint3 T:SV_GroupThreadID)
+{
+    uint first=G.x*1024+T.x*4;
+    uint4 depth=0xFFFFFFFFu;
+    uint count=0;
+    [unroll] for(uint i=0;i<4;++i)
+    {
+        if(first+i<SourceCount)
+        {
+#if PCVR_SOURCE_COMPACT
+            bool valid=true;
+            if(UseSourceClusters!=0)
+            {
+                uint c=SourceCluster[first+i];
+                if(first+i>=OriginalSourceCount)
+                    valid=UseSourceLOD!=0 && (ParentVisibility[c/32] & (1u<<(c%32)))!=0;
+                else
+                    valid=(LeafVisibility[c/32] & (1u<<(c%32)))!=0 &&
+                          (UseSourceLOD==0 || (SelectedSourceCluster[c]&0x00FFFFFFu)==c);
+            }
+            if(valid)
+#else
+            float4 clip=ViewData[first+i].ClipPosition;
+            if(clip.w>0 && (PreCullBoxCount==0 || !EntireSplatRemoved(ViewData[first+i])))
+#endif
+            {
+#if PCVR_SOURCE_COMPACT
+                uint bits=0;
+#else
+                uint bits=asuint(clip.z/clip.w);
+                bits ^= (-(int)(bits>>31)) | 0x80000000u;
+#endif
+                depth[i]=bits;
+                ++count;
+            }
+        }
+    }
+    Scan[T.x]=count;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for(uint shift=1;shift<256;shift<<=1)
+    {
+        uint add=0; if(T.x>=shift) add=Scan[T.x-shift];
+        GroupMemoryBarrierWithGroupSync();
+        Scan[T.x]+=add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    uint rank=Scan[T.x]-count;
+    [unroll] for(uint j=0;j<4;++j) if(first+j<SourceCount)
+    {
+        ScratchDepth[first+j]=depth[j];
+        ScratchRank[first+j]=rank;
+        rank += depth[j]!=0xFFFFFFFFu ? 1 : 0;
+    }
+    if(T.x==255) Blocks[G.x]=Scan[255];
+}
+[numthreads(1,1,1)]
+void PrefixCS(uint3 T:SV_DispatchThreadID)
+{
+    uint total=0;
+    for(uint i=0;i<BlockCount;++i)
+    { uint n=Blocks[i]; Blocks[BlockCount+i]=total; total+=n; }
+#if PCVR_SOURCE_COMPACT
+    VisibleCountOut[0]=total;
+#else
+    SortParamsOut[0]=total; SortParamsOut[1]=(total+1023)/1024;
+    SortDispatch[0]=(total+1023)/1024; SortDispatch[1]=1;SortDispatch[2]=1;
+    DrawArgsOut[0]=6;DrawArgsOut[1]=total;DrawArgsOut[2]=0;DrawArgsOut[3]=0;DrawArgsOut[4]=0;
+#endif
+}
+[numthreads(256,1,1)]
+void ScatterCS(uint3 G:SV_GroupID,uint3 T:SV_GroupThreadID)
+{
+    uint first=G.x*1024+T.x*4;
+    [unroll] for(uint j=0;j<4;++j) if(first+j<SourceCount)
+    {
+        uint d=ScratchDepth[first+j];
+        if(d!=0xFFFFFFFFu)
+        {
+            uint dst=Blocks[BlockCount+G.x]+ScratchRank[first+j];
+#if !PCVR_SOURCE_COMPACT
+            OutDepth[dst]=d;
+#endif
+            OutIndex[dst]=first+j;
+        }
+    }
+}

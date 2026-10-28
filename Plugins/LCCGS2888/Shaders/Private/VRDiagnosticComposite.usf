@@ -1,0 +1,15 @@
+#include "/Engine/Public/Platform.ush"
+Texture2D VRDiagnosticSource;
+float4 VRDiagnosticSourceRect;
+float4 VRDiagnosticOutputRect;
+float VRDiagnosticExposure;
+float4 MainPS(float4 Position : SV_POSITION) : SV_Target0
+{
+    float2 uv = (Position.xy - VRDiagnosticOutputRect.xy) / VRDiagnosticOutputRect.zw;
+    int2 p = int2(VRDiagnosticSourceRect.xy + uv * VRDiagnosticSourceRect.zw);
+    p = clamp(p, int2(VRDiagnosticSourceRect.xy),
+                 int2(VRDiagnosticSourceRect.xy + VRDiagnosticSourceRect.zw) - 1);
+    float4 color = VRDiagnosticSource.Load(int3(p, 0));
+    color.rgb *= VRDiagnosticExposure;
+    return color;
+}

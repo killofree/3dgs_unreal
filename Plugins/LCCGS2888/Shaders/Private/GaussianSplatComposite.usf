@@ -1,0 +1,1294 @@
+#include "/Engine/Public/Platform.ush"
+
+
+#ifndef GS_PCVR_BLOOM_CACHE
+#define GS_PCVR_BLOOM_CACHE 0
+#endif
+Texture2D PCVRBloomExtractTexture;
+RWTexture2D<float4> PCVRBloomExtractOut;
+int2 PCVRBloomExtractExtent;
+Texture2D IntermediateTexture;
+Texture2D IntermediateDepthTexture;
+Texture2D IntermediateFogDepthTexture;
+// Raw accumulation alpha has the identical blend, order, FP16 precision and clear
+// as fog coverage. Do not use graded alpha: viewport remapping can resample it.
+Texture2D PCVRFogCoverageTexture;
+// Snow-only coverage/depth seed accumulation. These remain separate from the
+// untouched base GS and are resolved into a continuous surface in this shader.
+Texture2D SnowIntermediateTexture;
+Texture2D SnowIntermediateDepthTexture;
+// Snow-only coverage-aware occlusion depth from the base GS pass. Unlike the
+// normal MIN-depth target, transparent Gaussian fringes do not write here.
+Texture2D SnowOcclusionDepthTexture;
+// x enabled, y depth tolerance cm, z occlusion-depth clear sentinel, w reserved.
+float4 SnowCompositeParams;
+float4 SnowTuningParams; // x ground fill, y structure removal, z structure slope threshold
+Texture2D ProxyCompositeLightDepthTexture;
+SamplerState ProxyCompositeLightDepthSampler;
+// Params0: x pre-exposure, y look strength, z selective green saturation, w global gamma exponent.
+// v2886 diagnostics, default 0. Mask probe never changes ordinary rendering.
+uint PanoramaShadowMaskProbe;
+// v2887 opt-in GS composite routing. Only used by MainBloomCompositePS.
+uint PanoramaGSCompositeMode;
+float4 GaussianCompositeParams0;
+// Params1: x global saturation, y highlight compression, z bright-green compression, w fine local contrast.
+float4 GaussianCompositeParams1;
+// Params2: x pre-gamma exposure EV, y bloom colour-highlight sensitivity,
+// z shadow saturation retention, w green saturation recovery.
+float4 GaussianCompositeParams2;
+// Params3: x highlight start, y green luminance reduction, z log-detail clamp, w coarse local contrast.
+float4 GaussianCompositeParams3;
+// Params4: x final sharpen, y highlight protection, z coverage-edge protection, w diagnostic view.
+float4 GaussianCompositeParams4;
+float GaussianCompositeSourceBrightness;
+// x spread radius in pixels, y scatter energy, z source threshold,
+// w directional-light colour influence.
+float4 GaussianCompositeBloomParams;
+// x independent colour-bloom strength, y peak-channel threshold,
+// z minimum saturation, w saturation feather width.
+float4 GaussianCompositeColorBloomParams;
+float4 GaussianCompositeBloomTint;
+// Fraction of the threshold used as a soft transition around the bloom cutoff.
+float GaussianCompositeBloomSoftKnee;
+// xy = rectangle minimum, zw = rectangle size. The GS accumulation and the
+// post-process output can differ under editor Screen Percentage / DPI scaling.
+float4 GaussianCompositeSourceRect;
+float4 GaussianCompositeOutputRect;
+// Isolated stable-shadow debug selector. 66-68 are composite-only LightDepth insets.
+uint StableShadowDebugMode;
+uint StableShadowDebugLightDepthValid;
+float4x4 ProxyCompositeInvViewProjection;
+// xyz camera world position, w Light Depth validity.
+float4 ProxyCompositeCameraOriginValid;
+// xyz light capture origin, w orthographic width.
+float4 ProxyCompositeLightOriginWidth;
+// xyz light travel direction, w depth transition softness.
+float4 ProxyCompositeLightForwardSoftness;
+// xyz light right, w blocker distance range.
+float4 ProxyCompositeLightRightRange;
+// xyz light up.
+float4 ProxyCompositeLightUp;
+// x strength, y density, z max distance, w forward-scattering concentration.
+float4 ProxyCompositeShaftSettings;
+float3 ProxyCompositeShaftTint;
+// P46: native ExponentialHeightFog component is the single authority for GS and meshes.
+// Settings: x enabled, y FogDensity, z FogMaxOpacity, w FogHeightFalloff.
+float4 NativeFogCompositeSettings;
+float4 NativeFogCompositeColor;
+// Profile0: x StartDistance (cm), y native fog component world Z (cm), zw unused.
+float4 NativeFogCompositeProfile0;
+// Compatibility with existing shader parameter layout. Not used by P46.
+float4 NativeFogCompositeProfile1;
+
+struct FScreenVertexOutput { float4 Position : SV_POSITION; };
+FScreenVertexOutput MainVS(uint VertexId : SV_VertexID)
+{
+    FScreenVertexOutput Output;
+    float2 Position = float2((VertexId << 1) & 2, VertexId & 2);
+    Output.Position = float4(Position * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return Output;
+}
+
+float CompositeLuminance(float3 Color)
+{
+    return max(dot(max(Color, 0.0), float3(0.2126, 0.7152, 0.0722)), 0.0);
+}
+
+float4 LoadAccumulated(int2 PixelPos, int2 MaxPixel)
+{
+    return IntermediateTexture.Load(int3(clamp(PixelPos, int2(0, 0), MaxPixel), 0));
+}
+
+
+// SnowContinuousSurface v5 ----------------------------------------------------
+// Resolve the snow seed accumulation into a continuous, base-surface-attached
+// coverage layer.  SnowIntermediateTexture/Depth are now used as the requested
+// snow Coverage/Depth buffers.  A depth-aware 3x3 close/blur connects adjacent
+// snow seeds while preventing coverage from leaking across unrelated surfaces.
+void ResolveContinuousSnowSurface(
+	int2 PixelPos,
+	int2 MaxPixel,
+	float4 BaseAccum,
+	float BaseDepth,
+	out float4 ResolvedSnow)
+{
+	ResolvedSnow = 0.0.xxxx;
+	if (SnowCompositeParams.x < 0.5 ||
+		BaseAccum.a <= (1.0 / 255.0) ||
+		BaseDepth <= 0.0)
+	{
+		return;
+	}
+
+	const int2 Offsets[9] =
+	{
+		int2(-1,-1), int2(0,-1), int2(1,-1),
+		int2(-1, 0), int2(0, 0), int2(1, 0),
+		int2(-1, 1), int2(0, 1), int2(1, 1)
+	};
+	const float Kernel[9] =
+	{
+		1.0, 2.0, 1.0,
+		2.0, 4.0, 2.0,
+		1.0, 2.0, 1.0
+	};
+
+	float depthTolerance = max(SnowCompositeParams.y, 4.0);
+	float groundFillStrength = saturate(SnowTuningParams.x);
+	float snowOcclusionDepth = SnowOcclusionDepthTexture.Load(int3(PixelPos, 0)).r;
+	float occlusionClearDepth = max(SnowCompositeParams.z, 1.0);
+	bool hasMaterialSnowOccluder =
+		snowOcclusionDepth > 0.0 &&
+		snowOcclusionDepth < (occlusionClearDepth * 0.99);
+	float weightedAlpha = 0.0;
+	float coherentKernelWeight = 0.0;
+	float activeSupportWeight = 0.0;
+	float maxSeedAlpha = 0.0;
+	float2 coverageGradient = 0.0.xx;
+	float3 straightColorSum = 0.0.xxx;
+	float colorWeight = 0.0;
+
+	[unroll]
+	for (int i = 0; i < 9; ++i)
+	{
+		int2 Q = clamp(PixelPos + Offsets[i], int2(0, 0), MaxPixel);
+		float4 Seed = SnowIntermediateTexture.Load(int3(Q, 0));
+		float seedAlpha = saturate(Seed.a);
+		float seedDepth = SnowIntermediateDepthTexture.Load(int3(Q, 0)).r;
+
+		// Compare snow against the dedicated coverage-aware GS occlusion depth.
+		// Faint foreground Gaussian tails no longer behave as absolute MIN-depth
+		// cutters. If no materially covered occluder exists, keep snow continuity.
+		float depthGate = 1.0;
+		if (hasMaterialSnowOccluder)
+		{
+			float depthDelta = abs(seedDepth - snowOcclusionDepth);
+			depthGate = 1.0 - smoothstep(
+				depthTolerance * 0.75,
+				depthTolerance * 2.25,
+				depthDelta);
+		}
+		float W = Kernel[i] * depthGate;
+		coherentKernelWeight += W;
+
+		if (seedAlpha > (1.0 / 255.0) && W > 1.0e-5)
+		{
+			weightedAlpha += seedAlpha * W;
+			activeSupportWeight += W;
+			maxSeedAlpha = max(maxSeedAlpha, seedAlpha * depthGate);
+			float localCoverageSignal = seedAlpha * depthGate;
+			coverageGradient += float2(Offsets[i]) * (localCoverageSignal * Kernel[i]);
+			float3 straightSeed = max(Seed.rgb, 0.0) / max(seedAlpha, 1.0e-4);
+			float CW = seedAlpha * W;
+			straightColorSum += straightSeed * CW;
+			colorWeight += CW;
+		}
+	}
+
+	// SnowHoleRingFill7x7 v2803 -------------------------------------------------
+	// Keep the native 3x3 resolve unchanged. Only weak/empty pixels inspect the
+	// OUTER ring of a 7x7 footprint. Ring samples must agree with the CURRENT base
+	// surface depth as well as the Snow-only occlusion depth, so this can close a
+	// wider missing-floor patch without blurring across object boundaries.
+	float innerMeanCoverage =
+		(coherentKernelWeight > 1.0e-5) ? (weightedAlpha / coherentKernelWeight) : 0.0;
+	float innerSupport =
+		(coherentKernelWeight > 1.0e-5) ? saturate(activeSupportWeight / coherentKernelWeight) : 0.0;
+	float holeMeanThreshold = lerp(0.055, 0.18, groundFillStrength);
+	float holeSupportThreshold = lerp(0.30, 0.72, groundFillStrength);
+	bool needsHoleFill =
+		(colorWeight <= 1.0e-5) ||
+		(innerMeanCoverage < holeMeanThreshold && innerSupport < holeSupportThreshold);
+
+	// SnowGroundOnlyRingFill v2803: a merged proxy/collider contains both ground
+	// and structures. Keep the wide 7x7 recovery only on locally smooth continuous
+	// depth surfaces. Object silhouettes / stone stacks produce a larger local depth
+	// spread and therefore fall back to the native 3x3 resolve.
+	float localDepthSpread = 0.0;
+	const int2 DepthProbeOffsets[4] =
+	{
+		int2(-1,0), int2(1,0), int2(0,-1), int2(0,1)
+	};
+	[unroll]
+	for (int dp = 0; dp < 4; ++dp)
+	{
+		int2 DQ = clamp(PixelPos + DepthProbeOffsets[dp], int2(0, 0), MaxPixel);
+		float neighborBaseDepth = IntermediateDepthTexture.Load(int3(DQ, 0)).r;
+		if (neighborBaseDepth > 0.0)
+		{
+			localDepthSpread = max(localDepthSpread, abs(neighborBaseDepth - BaseDepth));
+		}
+	}
+	float broadGroundFillGate = 1.0 - smoothstep(
+		max(depthTolerance * 0.65, 3.0),
+		max(depthTolerance * 1.25, 7.0),
+		localDepthSpread);
+
+	if (needsHoleFill && groundFillStrength > 0.01 && broadGroundFillGate > 0.08)
+	{
+		const int2 RingOffsets[24] =
+		{
+			int2(-3,-3), int2(-2,-3), int2(-1,-3), int2(0,-3), int2(1,-3), int2(2,-3), int2(3,-3),
+			int2(-3,-2), int2(3,-2),
+			int2(-3,-1), int2(3,-1),
+			int2(-3, 0), int2(3, 0),
+			int2(-3, 1), int2(3, 1),
+			int2(-3, 2), int2(3, 2),
+			int2(-3, 3), int2(-2, 3), int2(-1, 3), int2(0, 3), int2(1, 3), int2(2, 3), int2(3, 3)
+		};
+
+		float ringWeightedAlpha = 0.0;
+		float ringWeight = 0.0;
+		float ringColorWeight = 0.0;
+		float3 ringStraightColorSum = 0.0.xxx;
+		float ringMaxAlpha = 0.0;
+		uint ringSeedCount = 0u;
+		const float ringDepthTolerance = max(depthTolerance * 1.55, 8.0);
+
+		[unroll]
+		for (int r = 0; r < 24; ++r)
+		{
+			int2 Q = clamp(PixelPos + RingOffsets[r], int2(0, 0), MaxPixel);
+			float4 Seed = SnowIntermediateTexture.Load(int3(Q, 0));
+			float seedAlpha = saturate(Seed.a);
+			if (seedAlpha <= (1.0 / 255.0))
+			{
+				continue;
+			}
+
+			float seedDepth = SnowIntermediateDepthTexture.Load(int3(Q, 0)).r;
+			if (seedDepth <= 0.0)
+			{
+				continue;
+			}
+
+			// The ring is allowed to fill only the same visible GS surface as this
+			// pixel. This is stricter and more stable than choosing the first ring
+			// sample as an arbitrary reference depth.
+			float baseDelta = abs(seedDepth - BaseDepth);
+			float depthGate = 1.0 - smoothstep(
+				ringDepthTolerance * 0.72,
+				ringDepthTolerance,
+				baseDelta);
+
+			if (hasMaterialSnowOccluder)
+			{
+				float occlusionDelta = abs(seedDepth - snowOcclusionDepth);
+				depthGate *= 1.0 - smoothstep(
+					depthTolerance * 0.90,
+					depthTolerance * 2.10,
+					occlusionDelta);
+			}
+
+			if (depthGate <= 1.0e-4)
+			{
+				continue;
+			}
+
+			float ringW = depthGate;
+			ringWeightedAlpha += seedAlpha * ringW;
+			ringWeight += ringW;
+			ringMaxAlpha = max(ringMaxAlpha, seedAlpha * depthGate);
+			float3 straightSeed = max(Seed.rgb, 0.0) / max(seedAlpha, 1.0e-4);
+			float colorW = seedAlpha * ringW;
+			ringStraightColorSum += straightSeed * colorW;
+			ringColorWeight += colorW;
+			ringSeedCount++;
+		}
+
+		// A 7x7 ring spans farther, so require a coherent surround rather than one
+		// isolated seed. Once confirmed, inject enough support to close the center
+		// instead of merely tinting it.
+		uint minRingSeeds = (uint)round(lerp(8.0, 3.0, groundFillStrength));
+		if (ringSeedCount >= minRingSeeds && ringWeight > 1.0e-5 && ringColorWeight > 1.0e-5)
+		{
+			float ringMeanCoverage = ringWeightedAlpha / ringWeight;
+			float ringConfidence = saturate((float(ringSeedCount) - float(minRingSeeds) + 1.0) / lerp(9.0, 5.0, groundFillStrength));
+			float holeFillSignal = ringMeanCoverage * ringConfidence;
+			float holeFillLow = lerp(0.055, 0.016, groundFillStrength);
+			float holeFillHigh = lerp(0.24, 0.14, groundFillStrength);
+			float holeFillCoverage = smoothstep(holeFillLow, holeFillHigh, holeFillSignal);
+
+			// Do not let the wide ring become a structure/edge whitening pass.
+			holeFillCoverage *= broadGroundFillGate * groundFillStrength;
+			float injectWeight = holeFillCoverage * lerp(0.35, 0.95, groundFillStrength);
+			if (injectWeight > 1.0e-4)
+			{
+				float3 ringStraight = ringStraightColorSum / ringColorWeight;
+				weightedAlpha += holeFillCoverage * injectWeight;
+				coherentKernelWeight += injectWeight;
+				activeSupportWeight += injectWeight;
+				maxSeedAlpha = max(maxSeedAlpha, ringMaxAlpha * 0.52);
+				straightColorSum += ringStraight * injectWeight;
+				colorWeight += injectWeight;
+			}
+		}
+	}
+
+	if (colorWeight <= 1.0e-5 || coherentKernelWeight <= 1.0e-5)
+	{
+		return;
+	}
+
+	float meanCoverage = weightedAlpha / coherentKernelWeight;
+	float support = saturate(activeSupportWeight / coherentKernelWeight);
+
+	// Dense neighboring seeds become one continuous sheet.  Isolated source
+	// Gaussians are deliberately weakened, which removes the large white pancake
+	// signature without deleting legitimate sparse snow completely.
+	float continuousSignal =
+		meanCoverage * lerp(1.05, 1.42, support) +
+		maxSeedAlpha * lerp(0.18, 0.36, support);
+	float coverage = smoothstep(0.045, 0.62, saturate(continuousSignal));
+
+	// Never invent snow outside actual GS coverage.  This is what makes the final
+	// layer follow the scanned surface rather than the geometry of the seed quad.
+	float baseAttachLow = lerp(0.012, 0.0025, groundFillStrength);
+	float baseAttachHigh = lerp(0.14, 0.050, groundFillStrength);
+	float baseAttachment = smoothstep(baseAttachLow, baseAttachHigh, saturate(BaseAccum.a));
+	coverage *= baseAttachment;
+	if (coverage <= (1.0 / 255.0))
+	{
+		return;
+	}
+
+	float3 snowStraight = straightColorSum / colorWeight;
+
+	// SnowCoverageRelief v2803: add shallow apparent snow volume from the
+	// already-resolved coverage field without moving geometry or changing the
+	// existing light/cast authority. Dense centers stay softly lifted while
+	// coverage transitions receive a small cool contact/edge shade.
+	float gradientMagnitude = length(coverageGradient) / max(weightedAlpha * 2.0, 1.0e-4);
+	float edgeRelief = saturate(gradientMagnitude * 0.90);
+	float centerRelief = smoothstep(0.16, 0.78, coverage);
+	float reliefLuma = lerp(0.94, 1.035, centerRelief) * lerp(1.0, 0.93, edgeRelief);
+	snowStraight *= reliefLuma;
+	float edgeCoolAmount = edgeRelief * (1.0 - centerRelief) * 0.28;
+	snowStraight = lerp(
+		snowStraight,
+		snowStraight * float3(0.88, 0.93, 1.0),
+		edgeCoolAmount);
+
+	ResolvedSnow = float4(max(snowStraight, 0.0) * coverage, coverage);
+}
+
+float4 LoadWeatherAccumulated(int2 PixelPos, int2 MaxPixel)
+{
+	int2 P = clamp(PixelPos, int2(0, 0), MaxPixel);
+	float4 baseAccum = IntermediateTexture.Load(int3(P, 0));
+	if (SnowCompositeParams.x < 0.5)
+	{
+		return baseAccum;
+	}
+
+	float baseDepth = IntermediateDepthTexture.Load(int3(P, 0)).r;
+	float4 snowAccum;
+	ResolveContinuousSnowSurface(P, MaxPixel, baseAccum, baseDepth, snowAccum);
+	float snowAlpha = saturate(snowAccum.a);
+	return snowAccum + baseAccum * (1.0 - snowAlpha);
+}
+
+float LoadWeatherDepth(int2 PixelPos, int2 MaxPixel)
+{
+	int2 P = clamp(PixelPos, int2(0, 0), MaxPixel);
+	// V5 final snow is a coating resolved ON the base GS surface.  Keeping base
+	// depth here is intentional: cloned snow quad depth is no longer visible.
+	return IntermediateDepthTexture.Load(int3(P, 0)).r;
+}
+
+float3 AccumToStraight(float4 Accum)
+{
+    return max(Accum.rgb, 0.0) / max(saturate(Accum.a), 1.0e-4);
+}
+
+// Dense GS surfaces can remain partially transparent even after accumulation.
+// The validated production path seals the accumulated alpha using a fixed 16x exponent.
+// Depends only on accumulated alpha; no depth/silhouette/8-neighbor mask,
+// so the Gaussian coverage transitions continuously at sky boundaries.
+float ComputeProductionAccumulatedAlphaSeal(float AccumulatedAlpha)
+{
+    const float A = saturate(AccumulatedAlpha);
+    if (A <= (1.0 / 255.0))
+    {
+        return A;
+    }
+    return saturate(1.0 - pow(max(1.0 - A, 0.0), 16.0));
+}
+
+float SampleCompositeProxyLightVisibility(float3 WorldPosition);
+
+float3 ReconstructCompositeWorldPosition(int2 SamplePixel, int2 MaxPixel, float SampleDepth)
+{
+    const float2 SourceSize = max(GaussianCompositeSourceRect.zw, 1.0.xx);
+    const float2 SampleUV = saturate(
+        (float2(clamp(SamplePixel, int2(0, 0), MaxPixel)) -
+         GaussianCompositeSourceRect.xy + 0.5) / SourceSize);
+    const float2 NDC = float2(SampleUV.x * 2.0 - 1.0, 1.0 - SampleUV.y * 2.0);
+    const float4 WorldFarH = mul(float4(NDC, 0.0, 1.0), ProxyCompositeInvViewProjection);
+    const float3 WorldFar = WorldFarH.xyz / max(abs(WorldFarH.w), 1.0e-5);
+    const float3 CameraOrigin = ProxyCompositeCameraOriginValid.xyz;
+    return CameraOrigin + normalize(WorldFar - CameraOrigin) * SampleDepth;
+}
+
+float SampleBloomProxyLitVisibility(float3 WorldPosition)
+{
+    float3 LightRelative = WorldPosition - ProxyCompositeLightOriginWidth.xyz;
+    float LightWidth = max(ProxyCompositeLightOriginWidth.w, 1.0);
+    float2 LightUV = float2(
+        0.5 + dot(LightRelative, ProxyCompositeLightRightRange.xyz) / LightWidth,
+        0.5 - dot(LightRelative, ProxyCompositeLightUp.xyz) / LightWidth);
+    // Outside the proxy capture there is no shadow evidence, so do not
+    // accidentally suppress an otherwise valid highlight.
+    if (any(LightUV < 0.0) || any(LightUV > 1.0))
+    {
+        return 1.0;
+    }
+    return SampleCompositeProxyLightVisibility(WorldPosition);
+}
+
+float ComputeBloomExcess(float Metric, float Threshold, float SoftKneeFraction)
+{
+    const float Knee = max(abs(Threshold) * saturate(SoftKneeFraction), 0.0);
+    float SoftExcess = Metric - Threshold + Knee;
+    SoftExcess = clamp(SoftExcess, 0.0, 2.0 * Knee);
+    SoftExcess = Knee > 1.0e-5
+        ? (SoftExcess * SoftExcess) / (4.0 * Knee)
+        : 0.0;
+    return max(Metric - Threshold, SoftExcess);
+}
+
+float3 ExtractPluginBloomUncached(int2 SamplePixel, int2 MaxPixel, float Threshold)
+{
+    const int2 ClampedPixel = clamp(SamplePixel, int2(0, 0), MaxPixel);
+    const float4 SampleAccum = LoadAccumulated(ClampedPixel, MaxPixel);
+    const float SampleAlpha = saturate(SampleAccum.a);
+    // The bloom pass reads the already graded scene-linear HDR texture. Do not
+    // apply source brightness or the nonlinear look a second time here.
+    const float3 SampleStraight = AccumToStraight(SampleAccum);
+    const float SampleLuma = CompositeLuminance(SampleStraight);
+    const float SamplePeak = max(SampleStraight.r, max(SampleStraight.g, SampleStraight.b));
+    const float SampleMin = min(SampleStraight.r, min(SampleStraight.g, SampleStraight.b));
+    const float SampleSaturation =
+        SamplePeak > 1.0e-5 ? saturate((SamplePeak - SampleMin) / SamplePeak) : 0.0;
+
+    // Neutral highlights retain the authored luminance threshold. Saturated
+    // highlights use an independent peak-channel threshold, so a coloured
+    // reflection can bloom even when its Rec.709 luminance is below the white
+    // threshold. The saturation gate prevents neutral midtones from leaking
+    // into the colour path.
+    const float WhiteExcess = ComputeBloomExcess(
+        SampleLuma, Threshold, GaussianCompositeBloomSoftKnee);
+    const float ColorStrength = max(GaussianCompositeColorBloomParams.x, 0.0);
+    const float ColorThreshold = max(GaussianCompositeColorBloomParams.y, 0.0);
+    const float MinimumSaturation = saturate(GaussianCompositeColorBloomParams.z);
+    const float SaturationFeather = max(GaussianCompositeColorBloomParams.w, 1.0e-4);
+    float SaturationGate = saturate(
+        (SampleSaturation - MinimumSaturation) / SaturationFeather);
+    SaturationGate = SaturationGate * SaturationGate * (3.0 - 2.0 * SaturationGate);
+    const float ColorExcess = ComputeBloomExcess(
+        SamplePeak, ColorThreshold, GaussianCompositeBloomSoftKnee);
+
+    const float WhiteWeight = WhiteExcess / max(SampleLuma, 1.0e-5);
+    const float ColorWeight = ColorStrength * SaturationGate *
+        (ColorExcess / max(SamplePeak, 1.0e-5));
+    // Max avoids doubling energy where a bright saturated pixel qualifies for
+    // both channels while preserving the original source hue.
+    const float ExtractWeight = max(WhiteWeight, ColorWeight);
+    return SampleStraight * ExtractWeight * SampleAlpha;
+}
+
+float3 ExtractPluginBloom(int2 SamplePixel,int2 MaxPixel,float Threshold){
+#if GS_PCVR_BLOOM_CACHE
+ return PCVRBloomExtractTexture.Load(int3(clamp(SamplePixel,int2(0,0),MaxPixel),0)).rgb;
+#else
+ return ExtractPluginBloomUncached(SamplePixel,MaxPixel,Threshold);
+#endif
+}
+[numthreads(8,8,1)]
+void MainBloomExtractCS(uint3 id:SV_DispatchThreadID){
+ if(any(id.xy>=uint2(PCVRBloomExtractExtent)))return;
+ float3 extracted=ExtractPluginBloomUncached(int2(id.xy),PCVRBloomExtractExtent-1,GaussianCompositeBloomParams.z);
+ PCVRBloomExtractOut[id.xy]=float4(extracted,0);
+}
+
+float3 ComputePluginSpatialBloom(int2 PixelPos, int2 MaxPixel)
+{
+    const float Spread = max(GaussianCompositeBloomParams.x, 0.0);
+    const float Scatter = max(GaussianCompositeBloomParams.y, 0.0);
+    const float Threshold = GaussianCompositeBloomParams.z;
+    // Rain-only 20-tap switch is encoded by CPU as +2 in W. Normal UI range
+    // for Bloom Sun Color Influence is 0..1, so this cannot collide with legacy data.
+    const bool bRainHalfDirections = GaussianCompositeBloomParams.w > 1.5;
+    if (Spread <= 0.001 || Scatter <= 0.0001)
+    {
+        return 0.0.xxx;
+    }
+
+    const float2 Directions[8] =
+    {
+        float2(1,0), float2(-1,0), float2(0,1), float2(0,-1),
+        float2(0.7071,0.7071), float2(-0.7071,0.7071),
+        float2(0.7071,-0.7071), float2(-0.7071,-0.7071)
+    };
+    // Four nested lobes: tight optical glow, near halo, broad bloom and
+    // atmospheric scatter. This preserves a bright shaped core instead of
+    // turning the complete lit surface into one white patch.
+    const float RadiusScale[5] = { 0.04, 0.11, 0.25, 0.52, 1.0 };
+    const float RadiusWeight[5] = { 0.30, 0.27, 0.21, 0.14, 0.08 };
+    float3 Bloom = 0.0.xxx;
+    float Weight = 0.0;
+    [unroll]
+    for (int Ring = 0; Ring < 5; ++Ring)
+    {
+        const float Radius = max(Spread * RadiusScale[Ring], 1.0);
+        const float RingAngle = float(Ring) * 0.3926991;
+        const float RingCos = cos(RingAngle);
+        const float RingSin = sin(RingAngle);
+        if (bRainHalfDirections)
+        {
+            [unroll]
+            for (int DirectionIndex = 0; DirectionIndex < 4; ++DirectionIndex)
+            {
+                const float2 D = Directions[((Ring & 1) != 0 ? 4 : 0) + DirectionIndex];
+                const float2 RotatedDirection = float2(
+                    D.x * RingCos - D.y * RingSin,
+                    D.x * RingSin + D.y * RingCos);
+                const int2 Offset = int2(round(RotatedDirection * Radius));
+                Bloom += ExtractPluginBloom(PixelPos + Offset, MaxPixel, Threshold) * RadiusWeight[Ring];
+                Weight += RadiusWeight[Ring];
+            }
+        }
+        else
+        {
+            [unroll]
+            for (int DirectionIndex = 0; DirectionIndex < 8; ++DirectionIndex)
+            {
+                const float2 D = Directions[DirectionIndex];
+                const float2 RotatedDirection = float2(
+                    D.x * RingCos - D.y * RingSin,
+                    D.x * RingSin + D.y * RingCos);
+                const int2 Offset = int2(round(RotatedDirection * Radius));
+                Bloom += ExtractPluginBloom(PixelPos + Offset, MaxPixel, Threshold) * RadiusWeight[Ring];
+                Weight += RadiusWeight[Ring];
+            }
+        }
+    }
+
+    Bloom /= max(Weight, 1.0e-5);
+    const float3 Core = ExtractPluginBloom(PixelPos, MaxPixel, Threshold);
+    const float3 SunTintRaw = max(GaussianCompositeBloomTint.rgb, 0.0);
+    const float SunTintLuma = max(CompositeLuminance(SunTintRaw), 1.0e-4);
+    const float3 SunTint = SunTintRaw / SunTintLuma;
+    const float OriginalTintInfluence = GaussianCompositeBloomParams.w - (bRainHalfDirections ? 2.0 : 0.0);
+    const float TintInfluence = saturate(OriginalTintInfluence);
+    const float BloomLuma = CompositeLuminance(Bloom);
+    const float3 SourceHue = BloomLuma > 1.0e-5 ? Bloom / BloomLuma : 1.0.xxx;
+    const float3 Halo = BloomLuma * lerp(SourceHue, SunTint, TintInfluence) * Scatter;
+    const float CoreLuma = CompositeLuminance(Core);
+    const float3 CoreHue = CoreLuma > 1.0e-5 ? Core / CoreLuma : 1.0.xxx;
+    const float CoreIntensity = max(GaussianCompositeBloomTint.w, 0.0);
+    const float3 ShapedCore = CoreLuma *
+        lerp(CoreHue, SunTint, TintInfluence) * CoreIntensity;
+    return Halo + ShapedCore;
+}
+
+float SampleCompositeProxyLightVisibility(float3 WorldPosition)
+{
+    float3 LightRelative = WorldPosition - ProxyCompositeLightOriginWidth.xyz;
+    float LightWidth = max(ProxyCompositeLightOriginWidth.w, 1.0);
+    float2 LightUV = float2(
+        0.5 + dot(LightRelative, ProxyCompositeLightRightRange.xyz) / LightWidth,
+        0.5 - dot(LightRelative, ProxyCompositeLightUp.xyz) / LightWidth);
+    if (any(LightUV < 0.0) || any(LightUV > 1.0))
+    {
+        return 0.0;
+    }
+
+    float BlockerDepth = ProxyCompositeLightDepthTexture.SampleLevel(
+        ProxyCompositeLightDepthSampler, LightUV, 0).r;
+    float SampleDepth = dot(LightRelative, ProxyCompositeLightForwardSoftness.xyz);
+    float DepthSoftness = max(2.0, ProxyCompositeLightForwardSoftness.w * 3.0);
+    return 1.0 - smoothstep(
+        BlockerDepth + 2.0,
+        BlockerDepth + 2.0 + DepthSoftness,
+        SampleDepth);
+}
+
+float3 ComputeFullscreenProxyShaft(float2 ViewUV)
+{
+    float Strength = clamp(ProxyCompositeShaftSettings.x, 0.0, 2.0);
+    float Density = clamp(ProxyCompositeShaftSettings.y, 0.0, 2.0);
+    if (Strength <= 0.0001 || Density <= 0.0001 || ProxyCompositeCameraOriginValid.w < 0.5)
+    {
+        return 0.0.xxx;
+    }
+
+    // Unreal uses reversed Z: clip Z=0 reconstructs a far-plane world point.
+    float2 NDC = float2(ViewUV.x * 2.0 - 1.0, 1.0 - ViewUV.y * 2.0);
+    float4 WorldFarH = mul(float4(NDC, 0.0, 1.0), ProxyCompositeInvViewProjection);
+    float3 WorldFar = WorldFarH.xyz / max(abs(WorldFarH.w), 1.0e-5);
+    float3 CameraOrigin = ProxyCompositeCameraOriginValid.xyz;
+    float3 RayDirection = normalize(WorldFar - CameraOrigin);
+    float MaxDistance = clamp(ProxyCompositeShaftSettings.z, 100.0, 50000.0);
+
+    static const int ShaftSampleCount = 6;
+    float WeightedVisibilitySum = 0.0;
+    float WeightedVisibilitySquaredSum = 0.0;
+    float WeightSum = 0.0;
+    float TransitionSum = 0.0;
+    float PreviousVisibility = 0.0;
+    [unroll]
+    for (int SampleIndex = 0; SampleIndex < ShaftSampleCount; ++SampleIndex)
+    {
+        float SampleT = (float(SampleIndex) + 0.5) / float(ShaftSampleCount);
+        float3 SampleWorld = CameraOrigin + RayDirection * (SampleT * MaxDistance);
+        float Visibility = SampleCompositeProxyLightVisibility(SampleWorld);
+        float SampleWeight = exp2(-SampleT * lerp(0.8, 2.2, saturate(Density * 0.5)));
+        WeightedVisibilitySum += Visibility * SampleWeight;
+        WeightedVisibilitySquaredSum += Visibility * Visibility * SampleWeight;
+        WeightSum += SampleWeight;
+        if (SampleIndex > 0)
+        {
+            TransitionSum += abs(Visibility - PreviousVisibility);
+        }
+        PreviousVisibility = Visibility;
+    }
+
+    float MeanVisibility = WeightedVisibilitySum / max(WeightSum, 0.0001);
+    float VisibilityVariance = max(
+        WeightedVisibilitySquaredSum / max(WeightSum, 0.0001)
+        - MeanVisibility * MeanVisibility, 0.0);
+    float TransitionDensity = TransitionSum / float(ShaftSampleCount - 1);
+    float MixedVisibilityGate = 4.0 * MeanVisibility * (1.0 - MeanVisibility);
+
+    // Fully open air must not become a uniform glow. Energy exists only when
+    // this camera ray crosses alternating proxy-lit and proxy-shadowed regions.
+    float StructuredLight = saturate(
+        sqrt(VisibilityVariance) * 1.90
+        + TransitionDensity * 1.65
+        + MixedVisibilityGate * 0.28);
+
+    float ForwardAlignment = saturate(dot(
+        -RayDirection, normalize(ProxyCompositeLightForwardSoftness.xyz)));
+    float Concentration = saturate(ProxyCompositeShaftSettings.w);
+    float FocusedScattering = pow(
+        ForwardAlignment, lerp(1.5, 5.0, Concentration));
+    float Scattering = lerp(
+        0.14, 0.035 + 0.965 * FocusedScattering, Concentration);
+    float OpticalDepth = 1.0 - exp(-Density * 1.15);
+
+    float3 Tint = max(ProxyCompositeShaftTint, 0.0);
+    float TintLuma = max(dot(Tint, float3(0.2126, 0.7152, 0.0722)), 0.001);
+    Tint /= TintLuma;
+    float ShaftEnergy = StructuredLight * Scattering * OpticalDepth * Strength * 0.24;
+    return min(Tint * ShaftEnergy, float3(0.28, 0.24, 0.18));
+}
+
+float GreenDominanceFromColor(float3 Color, float Luma)
+{
+    return saturate((Color.g - max(Color.r, Color.b)) / max(Luma, 0.025) * 1.30);
+}
+
+float ApplyDirectToneLuma(
+    float SourceLuma,
+    float ExposureEV,
+    float GammaExponent,
+    float HighlightStart,
+    float HighlightCompression,
+    out float ShadowMask,
+    out float MidtoneMask,
+    out float HighlightMask,
+    out float ToneRatio)
+{
+    const float Exposed = max(SourceLuma * exp2(ExposureEV), 1.0e-6);
+    // Match the public 0.25..4.0 range exactly.  A second hidden clamp here made
+    // the outer portions of the Details slider stop responding.
+    const float GammaLuma = pow(Exposed, clamp(GammaExponent, 0.25, 4.0));
+    MidtoneMask = smoothstep(0.035, 0.20, Exposed) * (1.0 - smoothstep(0.62, 1.10, Exposed));
+    ShadowMask = 1.0 - smoothstep(0.025, 0.16, GammaLuma);
+
+    const float Start = max(HighlightStart, 0.08);
+    const float Over = max(GammaLuma - Start, 0.0);
+    // Artist contract: zero is a mathematically neutral shoulder and one is the
+    // full compression range.  The old 0.75 floor compressed highlights even
+    // when the Details value was zero.
+    const float CompressionRate = 4.25 * saturate(HighlightCompression);
+    const float CompressedOver = Over / (1.0 + Over * CompressionRate);
+    const float CompressedLuma = GammaLuma > Start ? Start + CompressedOver : GammaLuma;
+    HighlightMask = smoothstep(Start * 0.90, Start + 0.38, GammaLuma);
+    const float TargetLuma = lerp(GammaLuma, CompressedLuma, HighlightMask);
+    ToneRatio = TargetLuma / max(SourceLuma, 1.0e-5);
+    return max(TargetLuma, 0.0);
+}
+
+float ApplyGreenLuminanceBeforeTone(
+    float SourceLuma,
+    float3 SourceColor,
+    float BrightGreenCompression,
+    float GreenLuminanceReduction,
+    out float GreenMask)
+{
+    const float GreenDominance = GreenDominanceFromColor(SourceColor, SourceLuma);
+    const float BrightGate = smoothstep(0.08, 0.48, SourceLuma);
+    GreenMask = GreenDominance * BrightGate;
+
+    // "Green luminance reduction" is the broad green control.  "Bright green
+    // compression" owns a separate shoulder above scene-linear 0.30 instead of
+    // being an undocumented 0.35 addend to the first control.
+    float ReducedLuma = SourceLuma * max(1.0 - saturate(GreenLuminanceReduction) * GreenMask, 0.35);
+    const float BrightGreenMask = GreenDominance * smoothstep(0.30, 0.85, SourceLuma);
+    const float BrightStart = 0.30;
+    const float BrightOver = max(ReducedLuma - BrightStart, 0.0);
+    const float BrightRate = 5.0 * saturate(BrightGreenCompression) * BrightGreenMask;
+    const float CompressedOver = BrightOver / (1.0 + BrightOver * BrightRate);
+    return ReducedLuma > BrightStart ? BrightStart + CompressedOver : ReducedLuma;
+}
+
+float3 ApplyDirectGammaSaturationColor(
+    float3 Source,
+    float LookStrength,
+    float ExposureEV,
+    float GammaExponent,
+    float GlobalSaturation,
+    float ShadowSaturationRetention,
+    float HighlightStart,
+    float HighlightCompression,
+    float BrightGreenCompression,
+    float GreenLuminanceReduction,
+    float GreenBoost,
+    float GreenSaturationRecovery,
+    out float ShadowMask,
+    out float MidtoneMask,
+    out float HighlightMask,
+    out float GreenLuminanceMask,
+    out float SaturationScale,
+    out float ToneRatio)
+{
+    Source = max(Source, 0.0);
+    const float SourceLuma = max(CompositeLuminance(Source), 1.0e-5);
+    const float GreenAdjustedLuma = ApplyGreenLuminanceBeforeTone(
+        SourceLuma, Source, BrightGreenCompression, GreenLuminanceReduction, GreenLuminanceMask);
+
+    float ToneShadowMask, ToneMidtoneMask, ToneHighlightMask, ToneRatioLocal;
+    float TargetLuma = ApplyDirectToneLuma(
+        GreenAdjustedLuma, ExposureEV, GammaExponent, HighlightStart, HighlightCompression,
+        ToneShadowMask, ToneMidtoneMask, ToneHighlightMask, ToneRatioLocal);
+
+    ShadowMask = ToneShadowMask;
+    MidtoneMask = ToneMidtoneMask;
+    HighlightMask = ToneHighlightMask;
+    ToneRatio = TargetLuma / max(SourceLuma, 1.0e-5);
+
+    // Move the source hue/chroma onto the new luminance, then apply a direct
+    // saturation multiplier. This is intentionally stronger and simpler than
+    // the earlier chroma-recovery curve so the result is visible in the viewport.
+    const float3 SourceAtTargetLuma = Source * (TargetLuma / SourceLuma);
+    const float3 ChromaVector = SourceAtTargetLuma - TargetLuma.xxx;
+    SaturationScale = clamp(GlobalSaturation, 0.0, 2.50);
+    SaturationScale *= lerp(saturate(ShadowSaturationRetention), 1.0, 1.0 - ShadowMask);
+    // Do not bleach illuminated splats. The previous 0.88 multiplier removed
+    // chroma exactly where the direct light was strongest, so foliage and warm
+    // surfaces converged toward white before UE's tonemapper.
+    SaturationScale *= lerp(1.0, 1.02, HighlightMask);
+
+    float3 Color = TargetLuma.xxx + ChromaVector * SaturationScale;
+    Color = max(Color, 0.0);
+    Color *= TargetLuma / max(CompositeLuminance(Color), 1.0e-5);
+
+    // Green receives only a modest extra saturation after its luminance has
+    // already been reduced. This avoids returning to fluorescent foliage.
+    float CurrentLuma = max(CompositeLuminance(Color), 1.0e-5);
+    const float GreenDominance = GreenDominanceFromColor(Color, CurrentLuma);
+    const float GreenSatMask = GreenDominance * (1.0 - HighlightMask * 0.55);
+    // Both public 0..1-style controls now use their complete authored range.
+    // Recovery remains gentler than the direct boost, but is no longer nearly
+    // invisible after the green/highlight masks are applied.
+    const float GreenSatScale = 1.0 + (saturate(GreenSaturationRecovery) * 0.75 + saturate(GreenBoost)) * GreenSatMask;
+    Color = CurrentLuma.xxx + (Color - CurrentLuma.xxx) * GreenSatScale;
+    Color = max(Color, 0.0);
+    Color *= CurrentLuma / max(CompositeLuminance(Color), 1.0e-5);
+
+    return max(lerp(Source, Color, saturate(LookStrength)), 0.0);
+}
+
+float TonalLogForNeighbor(
+    float3 NeighborColor,
+    float ExposureEV,
+    float GammaExponent,
+    float HighlightStart,
+    float HighlightCompression,
+    float BrightGreenCompression,
+    float GreenLuminanceReduction)
+{
+    const float SourceLuma = max(CompositeLuminance(NeighborColor), 1.0e-5);
+    float GreenMask;
+    const float GreenAdjustedLuma = ApplyGreenLuminanceBeforeTone(
+        SourceLuma, NeighborColor, BrightGreenCompression, GreenLuminanceReduction, GreenMask);
+    float S, M, H, R;
+    const float TargetLuma = ApplyDirectToneLuma(
+        GreenAdjustedLuma, ExposureEV, GammaExponent, HighlightStart, HighlightCompression, S, M, H, R);
+    return log2(max(TargetLuma, 1.0e-6));
+}
+
+// Panorama-safe fog depth comes from the same premultiplied GS visibility
+// accumulation as the rendered colour. No auxiliary camera or SceneCapture is used.
+float ResolvePanoramaSafeFogDepth(int2 PixelPos, float FallbackDepth)
+{
+    const float4 FogDepthAccum = IntermediateFogDepthTexture.Load(int3(PixelPos, 0));
+    // Bloom-only Params0.z identifies RG16F. Grade uses its own params and
+    // never calls this function. Nearest depth and fallback rules are unchanged.
+    const float Coverage = saturate(GaussianCompositeParams0.z > 1.5
+        ? PCVRFogCoverageTexture.Load(int3(PixelPos,0)).a
+        : (GaussianCompositeParams0.z > 0.5 ? FogDepthAccum.g : FogDepthAccum.a));
+    if (Coverage <= 1.0e-4 || FogDepthAccum.r <= 0.0)
+    {
+        return FallbackDepth;
+    }
+
+    const float ExpectedDepth = (FogDepthAccum.r / max(Coverage, 1.0e-4)) * 100.0;
+    // The weighted depth should never pull fog in front of the nearest visible GS.
+    // Allow it only to move the optical termination deeper, suppressing large
+    // low-alpha Gaussian tails without reshaping the visible splat geometry.
+    return max(FallbackDepth, ExpectedDepth);
+}
+
+// Fog depth is resolved from a small neighbourhood instead of trusting the raw
+// MIN-depth splat at one pixel.  A single large/near Gaussian can otherwise punch
+// a sharp clear disc through dense fog.  The correction is strongest on sparse
+// coverage and almost disappears on fully covered surfaces.
+float ResolveNativeFogSurfaceDepth(
+    int2 PixelPos,
+    int2 MaxPixel,
+    float CenterDepth,
+    float CenterAlpha,
+    out float RepairAmount)
+{
+    RepairAmount = 0.0;
+    if (CenterDepth <= 0.0)
+    {
+        return CenterDepth;
+    }
+
+    // FogDeSplat: the MIN-depth buffer stores the nearest Gaussian, not the
+    // visually resolved surface.  Large sparse Gaussians can therefore behave
+    // like clear circular cards in fog.  Inspect a wider multi-radius ring and
+    // only replace the centre when the surrounding samples strongly agree that
+    // the centre is an isolated near-depth outlier.  This path is fog-only.
+    const int2 Offsets[16] =
+    {
+        int2(-2, 0), int2(2, 0), int2(0, -2), int2(0, 2),
+        int2(-5,-5), int2(5,-5), int2(-5,5), int2(5,5),
+        int2(-8, 0), int2(8, 0), int2(0, -8), int2(0, 8),
+        int2(-14,0), int2(14,0), int2(0,-14), int2(0,14)
+    };
+
+    float FarDepthSum = 0.0;
+    float FarWeight = 0.0;
+    float ValidWeight = 0.0;
+    float SameNearWeight = 0.0;
+    [unroll]
+    for (int i = 0; i < 16; ++i)
+    {
+        const int2 Q = clamp(PixelPos + Offsets[i], int2(0, 0), MaxPixel);
+        const float4 NeighborAccum = IntermediateTexture.Load(int3(Q, 0));
+        const float NeighborAlpha = saturate(NeighborAccum.a);
+        const float NeighborDepth = IntermediateDepthTexture.Load(int3(Q, 0)).r;
+        if (NeighborDepth <= 0.0 || NeighborAlpha <= 0.035)
+        {
+            continue;
+        }
+
+        const float W = lerp(0.25, 1.0, NeighborAlpha);
+        ValidWeight += W;
+        const float FarGate = smoothstep(
+            max(60.0, CenterDepth * 0.035),
+            max(180.0, CenterDepth * 0.12),
+            NeighborDepth - CenterDepth);
+        FarDepthSum += NeighborDepth * W * FarGate;
+        FarWeight += W * FarGate;
+        const float SameNear = 1.0 - smoothstep(
+            max(35.0, CenterDepth * 0.02),
+            max(120.0, CenterDepth * 0.07),
+            abs(NeighborDepth - CenterDepth));
+        SameNearWeight += W * SameNear;
+    }
+
+    if (ValidWeight <= 0.001 || FarWeight <= 0.001)
+    {
+        return CenterDepth;
+    }
+
+    const float FarDepth = FarDepthSum / FarWeight;
+    const float FarAgreement = saturate(FarWeight / max(ValidWeight * 0.58, 0.001));
+    const float NearAgreement = saturate(SameNearWeight / max(ValidWeight * 0.42, 0.001));
+    const float DepthOutlier = smoothstep(
+        max(100.0, CenterDepth * 0.08),
+        max(450.0, CenterDepth * 0.28),
+        FarDepth - CenterDepth);
+    const float CoveragePermission = 1.0 - smoothstep(0.94, 0.995, CenterAlpha);
+    RepairAmount = saturate(FarAgreement * (1.0 - NearAgreement) * DepthOutlier);
+    RepairAmount *= lerp(0.72, 1.0, CoveragePermission);
+    RepairAmount = RepairAmount * RepairAmount * (3.0 - 2.0 * RepairAmount);
+
+    return lerp(CenterDepth, max(CenterDepth, FarDepth), RepairAmount * 0.96);
+}
+
+// P46 — analytic height-fog bridge for late-composited Gaussian splats.
+// This uses the same physical inputs as UExponentialHeightFogComponent and
+// the UE height-fog line-integral shape: exponential density versus world Z,
+// ray-direction height integration, StartDistance, and FogMaxOpacity.
+// The old GS-only 5-step noisy/proxy density, near-air, and "pocket" terms
+// are intentionally NOT used. Native volumetric lighting / aerial-perspective
+// scattering can still differ because this GS pass runs after scene fog.
+float3 ApplyNativeFogBridgeToGS(
+    float3 SceneLinearColor,
+    float3 CameraOrigin,
+    float3 ViewDirection,
+    float SurfaceDepthCm,
+    out float FogAmountOut)
+{
+    FogAmountOut = 0.0;
+    const float Enabled = NativeFogCompositeSettings.x;
+    const float FogDensity = NativeFogCompositeSettings.y;
+    if (Enabled < 0.5 || FogDensity <= 1.0e-6 || SurfaceDepthCm <= 0.0)
+    {
+        return SceneLinearColor;
+    }
+
+    const float FogMaxOpacity = saturate(NativeFogCompositeSettings.z);
+    const float FogHeightFalloff = max(NativeFogCompositeSettings.w, 0.001);
+    const float FogStartCm = max(NativeFogCompositeProfile0.x, 0.0);
+    const float FogHeightCm = NativeFogCompositeProfile0.y;
+    const float RayLength = max(SurfaceDepthCm, 0.0);
+    const float FogRayLength = max(RayLength - FogStartCm, 0.0);
+    if (FogRayLength <= 0.0 || FogMaxOpacity <= 0.0)
+    {
+        return SceneLinearColor;
+    }
+
+    // UE fog units use a per-kilounit density/falloff scale for cm world space.
+    // The height-fog shader uses exp2 and integrates from camera to the surface;
+    // its start distance reduces path length without introducing a visible ring.
+    const float WorldToFogUnits = 0.001;
+    const float DensityPerCm = FogDensity * WorldToFogUnits;
+    const float FalloffPerCm = FogHeightFalloff * WorldToFogUnits;
+    const float OriginHeightExponent = clamp(
+        -FalloffPerCm * (CameraOrigin.z - FogHeightCm), -60.0, 60.0);
+    const float OriginDensity = DensityPerCm * exp2(OriginHeightExponent);
+    const float RayHeightDelta = ViewDirection.z * RayLength;
+    const float HeightExponent = clamp(FalloffPerCm * RayHeightDelta, -60.0, 60.0);
+
+    // UE HeightFogCommon integral: (1 - exp2(-x))/x, approaching ln(2) for x=0.
+    const float HeightIntegral = abs(HeightExponent) > 1.0e-3
+        ? (1.0 - exp2(-HeightExponent)) / HeightExponent
+        : 0.69314718;
+    const float OpticalDepthLog2 = max(OriginDensity * HeightIntegral * FogRayLength, 0.0);
+    const float Transmission = max(saturate(exp2(-OpticalDepthLog2)), 1.0 - FogMaxOpacity);
+    FogAmountOut = 1.0 - Transmission;
+    return max(
+        SceneLinearColor * Transmission + max(NativeFogCompositeColor.rgb, 0.0) * FogAmountOut,
+        0.0);
+}
+
+float4 MainGradePS(FScreenVertexOutput Input) : SV_Target0
+{
+    const float2 OutputSize = max(GaussianCompositeOutputRect.zw, 1.0.xx);
+    const float2 ViewUV = saturate(
+        (Input.Position.xy - GaussianCompositeOutputRect.xy + 0.5) / OutputSize);
+    const int2 PixelPos = int2(
+        GaussianCompositeSourceRect.xy +
+        ViewUV * max(GaussianCompositeSourceRect.zw - 1.0.xx, 0.0.xx));
+    uint TextureWidth, TextureHeight;
+    IntermediateTexture.GetDimensions(TextureWidth, TextureHeight);
+    const int2 MaxPixel = int2(max(int(TextureWidth) - 1, 0), max(int(TextureHeight) - 1, 0));
+
+    const float4 Accum = LoadWeatherAccumulated(PixelPos, MaxPixel);
+    const float Alpha = saturate(Accum.a);
+    // v2888: explicitly initialize uncovered output pixels. In full-extent
+    // views this replaces the redundant RGBA16F clear; in cropped views the
+    // clear is kept for all pixels OUTSIDE the viewport. Alpha/colour matches
+    // the former transparent-clear-plus-discard semantics exactly.
+    if (Alpha <= (1.0 / 255.0)) return 0.0.xxxx;
+    // v2886: shader-visible source-linear, ungraded monochrome GS debug signal.
+    // Source from CalcViewData (102/103/104), not a late tone-mapped approximation.
+    // Only the plugin's grade/bloom/fog are bypassed, not UE tonemapping.
+    if (PanoramaShadowMaskProbe != 0u)
+    {
+        float3 LinearMask = saturate(AccumToStraight(Accum));
+        return float4(LinearMask * Alpha, Alpha);
+    }
+    const float GSDepth = LoadWeatherDepth(PixelPos, MaxPixel);
+    float2 CurrentNDC = float2(ViewUV.x * 2.0 - 1.0, 1.0 - ViewUV.y * 2.0);
+    float4 CurrentWorldFarH = mul(float4(CurrentNDC, 0.0, 1.0), ProxyCompositeInvViewProjection);
+    float3 CurrentWorldFar = CurrentWorldFarH.xyz / max(abs(CurrentWorldFarH.w), 1.0e-5);
+    float3 CurrentCameraOrigin = ProxyCompositeCameraOriginValid.xyz;
+    float3 CurrentRayDirection = normalize(CurrentWorldFar - CurrentCameraOrigin);
+    float3 CurrentWorldPosition = CurrentCameraOrigin + CurrentRayDirection * GSDepth;
+
+    const float SourceBrightness = max(GaussianCompositeSourceBrightness, 0.0);
+    const float3 OriginalStraight = AccumToStraight(Accum) * SourceBrightness;
+    const float OriginalLuma = CompositeLuminance(OriginalStraight);
+    const float LookStrength = saturate(GaussianCompositeParams0.y);
+    const float GreenBoost = saturate(GaussianCompositeParams0.z);
+    const float GammaExponent = clamp(GaussianCompositeParams0.w, 0.25, 4.0);
+    // The exposed control is authoritative; do not silently cap it below its
+    // public 0..2.5 range.
+    const float GlobalSaturation = clamp(GaussianCompositeParams1.x, 0.0, 2.50);
+    const float HighlightCompression = saturate(GaussianCompositeParams1.y);
+    const float BrightGreenCompression = saturate(GaussianCompositeParams1.z);
+    const float FineContrastStrength = saturate(GaussianCompositeParams1.w);
+    const float ExposureEV = clamp(GaussianCompositeParams2.x, -1.0, 1.0);
+    const float ShadowSaturationRetention = saturate(GaussianCompositeParams2.z);
+    const float GreenSaturationRecovery = saturate(GaussianCompositeParams2.w);
+    // Compress the HDR shoulder before individual RGB channels run into the
+    // display/tonemapper ceiling. Limiting an accidentally high UI value keeps
+    // the source hue ratios intact instead of clipping the brightest channel.
+    const float HighlightStart = clamp(GaussianCompositeParams3.x, 0.08, 1.50);
+    const float GreenLuminanceReduction = saturate(GaussianCompositeParams3.y);
+    const float DetailClamp = max(GaussianCompositeParams3.z, 0.03);
+    const float CoarseContrastStrength = saturate(GaussianCompositeParams3.w);
+    const float FinalSharpenStrength = saturate(GaussianCompositeParams4.x);
+    const float HighlightSharpenProtection = saturate(GaussianCompositeParams4.y);
+    const float CoverageEdgeProtection = saturate(GaussianCompositeParams4.z);
+
+    float ShadowMask, MidtoneMask, HighlightMask, GreenLuminanceMask, SaturationScale, ToneRatio;
+    float3 GradedStraight = ApplyDirectGammaSaturationColor(
+        OriginalStraight, LookStrength, ExposureEV, GammaExponent, GlobalSaturation,
+        ShadowSaturationRetention, HighlightStart, HighlightCompression,
+        BrightGreenCompression, GreenLuminanceReduction, GreenBoost,
+        GreenSaturationRecovery, ShadowMask, MidtoneMask, HighlightMask,
+        GreenLuminanceMask, SaturationScale, ToneRatio);
+
+    const int2 FineOffsets[4] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };
+    const int2 CoarseOffsets[4] = { int2(-3,0), int2(3,0), int2(0,-3), int2(0,3) };
+    const float CenterLog = log2(max(CompositeLuminance(GradedStraight), 1.0e-6));
+
+    float FineSum = 0.0, FineWeight = 0.0;
+    float CoarseSum = 0.0, CoarseWeight = 0.0;
+    float CoverageConfidenceSum = 0.0;
+
+    [unroll]
+    for (int i = 0; i < 4; ++i)
+    {
+        float4 NAccum = LoadWeatherAccumulated(PixelPos + FineOffsets[i], MaxPixel);
+        float NAlpha = saturate(NAccum.a);
+        float3 NColor = AccumToStraight(NAccum) * SourceBrightness;
+        float NLog = TonalLogForNeighbor(
+            NColor, ExposureEV, GammaExponent, HighlightStart, HighlightCompression,
+            BrightGreenCompression, GreenLuminanceReduction);
+        float CoverageSimilarity = 1.0 - saturate(abs(NAlpha - Alpha) * 3.8);
+        float EdgeWeight = exp2(-abs(NLog - CenterLog) * 2.6);
+        float W = smoothstep(0.12, 0.72, NAlpha) * CoverageSimilarity * EdgeWeight;
+        FineSum += NLog * W;
+        FineWeight += W;
+        CoverageConfidenceSum += CoverageSimilarity;
+    }
+
+    [unroll]
+    for (int j = 0; j < 4; ++j)
+    {
+        float4 NAccum = LoadWeatherAccumulated(PixelPos + CoarseOffsets[j], MaxPixel);
+        float NAlpha = saturate(NAccum.a);
+        float3 NColor = AccumToStraight(NAccum) * SourceBrightness;
+        float NLog = TonalLogForNeighbor(
+            NColor, ExposureEV, GammaExponent, HighlightStart, HighlightCompression,
+            BrightGreenCompression, GreenLuminanceReduction);
+        float CoverageSimilarity = 1.0 - saturate(abs(NAlpha - Alpha) * 2.8);
+        float EdgeWeight = exp2(-abs(NLog - CenterLog) * 1.7);
+        float W = smoothstep(0.12, 0.72, NAlpha) * CoverageSimilarity * EdgeWeight;
+        CoarseSum += NLog * W;
+        CoarseWeight += W;
+        CoverageConfidenceSum += CoverageSimilarity;
+    }
+
+    const float FineAverage = FineWeight > 0.001 ? FineSum / FineWeight : CenterLog;
+    const float CoarseAverage = CoarseWeight > 0.001 ? CoarseSum / CoarseWeight : CenterLog;
+    const float FineDetail = clamp(CenterLog - FineAverage, -DetailClamp, DetailClamp);
+    const float CoarseDetail = clamp(CenterLog - CoarseAverage, -DetailClamp * 1.45, DetailClamp * 1.45);
+
+    const float CoverageConfidence = saturate(CoverageConfidenceSum / 8.0) * smoothstep(0.52, 0.94, Alpha);
+    const float CoverageGate = lerp(1.0, max(CoverageConfidence, 0.22), CoverageEdgeProtection);
+    const float HighlightGate = 1.0 - HighlightMask * HighlightSharpenProtection * 0.82;
+    const float TonalBand = smoothstep(log2(0.012), log2(0.070), CenterLog) * (1.0 - smoothstep(log2(0.72), log2(1.30), CenterLog));
+    const float TonalGate = lerp(0.18, 1.0, TonalBand);
+
+    const float FineContribution = FineDetail * FineContrastStrength * 1.18 * CoverageGate * HighlightGate * TonalGate;
+    const float CoarseContribution = CoarseDetail * CoarseContrastStrength * 0.78 * CoverageGate * HighlightGate * TonalGate;
+    const float SharpenContribution = FineDetail * FinalSharpenStrength * 0.62 * CoverageGate * HighlightGate * TonalGate;
+    const float FinalLog = CenterLog + FineContribution + CoarseContribution + SharpenContribution;
+    const float FinalLuma = exp2(FinalLog);
+    float3 FinalStraight = GradedStraight * (FinalLuma / max(CompositeLuminance(GradedStraight), 1.0e-5));
+
+    const bool RawUnlitDisplay = GaussianCompositeParams4.w > 11.5;
+    uint DiagnosticView = RawUnlitDisplay
+        ? 0u
+        : (uint)round(clamp(GaussianCompositeParams4.w, 0.0, 11.0));
+    float3 OutputStraight = FinalStraight;
+    if (DiagnosticView == 1u) OutputStraight = OriginalStraight;
+    else if (DiagnosticView == 2u) OutputStraight = GradedStraight;
+    else if (DiagnosticView == 3u) OutputStraight = saturate(abs(FinalStraight - OriginalStraight) * 5.0);
+    else if (DiagnosticView == 4u) OutputStraight = CompositeLuminance(FinalStraight).xxx;
+    else if (DiagnosticView == 5u) OutputStraight = MidtoneMask.xxx;
+    else if (DiagnosticView == 6u) OutputStraight = GreenLuminanceMask.xxx;
+    else if (DiagnosticView == 7u) OutputStraight = saturate(abs(FineDetail) / max(DetailClamp, 0.001)).xxx;
+    else if (DiagnosticView == 8u) OutputStraight = saturate(abs(CoarseDetail) / max(DetailClamp * 1.45, 0.001)).xxx;
+    else if (DiagnosticView == 9u) OutputStraight = Alpha.xxx;
+    else if (DiagnosticView == 10u) OutputStraight = saturate((SaturationScale - 0.5) / 2.0).xxx;
+    else if (DiagnosticView == 11u) OutputStraight = saturate(ToneRatio * 0.75).xxx;
+
+    // Fog is deliberately deferred to MainBloomCompositePS.  That pass already
+    // owns the sealed GS coverage, so applying fog there prevents individual raw
+    // Gaussian MIN-depth discs from cutting holes in the atmosphere.
+
+    // Store the exact final scene-linear colour, still un-pre-exposed, for the
+    // second pass. Keeping this texture premultiplied preserves the original
+    // SceneColor blend semantics and allows bloom to extend beyond GS coverage.
+    return float4(max(OutputStraight, 0.0) * Alpha, Alpha);
+}
+
+// Display-referred curve for experimental post-tonemap GS isolation. All
+// original GS grading, light, shadow, wet/snow, and bloom are processed in
+// floating-point HDR *before* this conversion. No UE eye adaptation or color
+// grading is applied to GS after the post-tonemap blend. This produces SDR;
+// do not use mode 2 for scene-linear HDR/EXR export.
+float3 ToneMapIsolatedGS(float3 HDRLinear)
+{
+    const float3 X = max(HDRLinear, 0.0.xxx);
+    return saturate((X * (2.51 * X + 0.03)) / max(X * (2.43 * X + 0.59) + 0.14, 1.0e-5.xxx));
+}
+
+float4 MainBloomCompositePS(FScreenVertexOutput Input) : SV_Target0
+{
+    const float2 OutputSize = max(GaussianCompositeOutputRect.zw, 1.0.xx);
+    const float2 ViewUV = saturate(
+        (Input.Position.xy - GaussianCompositeOutputRect.xy + 0.5) / OutputSize);
+
+    // Phase 0A-C: show the fixed directional LightDepth texture in a separate
+    // upper-right inset. Outside this rectangle the normal Final composite runs
+    // unchanged, so these modes never replace GS draw/sort/LOD behavior.
+    if (StableShadowDebugMode >= 66u && StableShadowDebugMode <= 68u)
+    {
+        const float2 InsetMin = float2(0.70, 0.04);
+        const float2 InsetMax = float2(0.97, 0.34);
+        const float2 Border = 0.004.xx;
+        const bool InsideOuter = all(ViewUV >= InsetMin - Border) && all(ViewUV <= InsetMax + Border);
+        if (InsideOuter)
+        {
+            const bool InsideInner = all(ViewUV >= InsetMin) && all(ViewUV <= InsetMax);
+            const float AppliedPreExposure = max(GaussianCompositeParams0.x, 1.0e-4);
+            if (!InsideInner)
+            {
+                return float4((0.92.xxx) * AppliedPreExposure, 1.0);
+            }
+
+            if (StableShadowDebugLightDepthValid == 0u)
+            {
+                return float4(float3(1.0, 0.0, 1.0) * AppliedPreExposure, 1.0);
+            }
+
+            const float2 LightUV = saturate((ViewUV - InsetMin) / max(InsetMax - InsetMin, 1.0e-5.xx));
+            const float RawDepth = max(
+                ProxyCompositeLightDepthTexture.SampleLevel(ProxyCompositeLightDepthSampler, LightUV, 0).r,
+                0.0);
+            const bool DepthValid = RawDepth < 60000.0;
+            float3 DebugColor = 0.0.xxx;
+
+            if (StableShadowDebugMode == 67u)
+            {
+                DebugColor = DepthValid ? 1.0.xxx : 0.0.xxx;
+            }
+            else if (DepthValid)
+            {
+                const float Depth01 = saturate(log2(1.0 + RawDepth) / log2(60001.0));
+                if (StableShadowDebugMode == 66u)
+                {
+                    DebugColor = Depth01.xxx;
+                }
+                else
+                {
+                    DebugColor = saturate(float3(
+                        1.5 * Depth01,
+                        1.5 - abs(Depth01 * 3.0 - 1.5),
+                        1.5 * (1.0 - Depth01)));
+                }
+            }
+            return float4(DebugColor * AppliedPreExposure, 1.0);
+        }
+    }
+
+    const int2 PixelPos = int2(
+        GaussianCompositeSourceRect.xy +
+        ViewUV * max(GaussianCompositeSourceRect.zw - 1.0.xx, 0.0.xx));
+    uint TextureWidth, TextureHeight;
+    IntermediateTexture.GetDimensions(TextureWidth, TextureHeight);
+    const int2 MaxPixel = int2(max(int(TextureWidth) - 1, 0), max(int(TextureHeight) - 1, 0));
+
+    const float4 GradedAccum = LoadAccumulated(PixelPos, MaxPixel);
+    const float Alpha = saturate(GradedAccum.a);
+    // v2886: direct, linear GS diagnostic before plugin bloom, sealing and fog.
+    // Mode 1 retains the view's pre-exposure; mode 2 removes just the GS factor.
+    // UE's own tonemapper still applies after this pre-tonemap composite.
+    if (PanoramaShadowMaskProbe != 0u)
+    {
+        if (Alpha <= (1.0 / 255.0)) discard;
+        const float ProbeExposure = (PanoramaGSCompositeMode == 2u || PanoramaShadowMaskProbe == 2u)
+            ? 1.0 : max(GaussianCompositeParams0.x, 1.0e-4);
+        return float4(max(GradedAccum.rgb, 0.0) * ProbeExposure, Alpha);
+    }
+    // The raw 102/103/104 visibility mask is a data display, not a film scene:
+    // bypass our private tone curve to preserve the original black/white values.
+    if (PanoramaGSCompositeMode == 2u && StableShadowDebugMode >= 102u && StableShadowDebugMode <= 104u)
+    {
+        if (Alpha <= (1.0 / 255.0)) discard;
+        return float4(saturate(GradedAccum.rgb), Alpha);
+    }
+    const float GSDepth = IntermediateDepthTexture.Load(int3(PixelPos, 0)).r;
+    const float CompositeAlpha = ComputeProductionAccumulatedAlphaSeal(Alpha);
+    const float3 PluginSpatialBloom = ComputePluginSpatialBloom(PixelPos, MaxPixel);
+    if (Alpha <= (1.0 / 255.0) && CompositeLuminance(PluginSpatialBloom) <= 1.0e-6) discard;
+
+    // Pre-exposure is applied exactly once, after both the graded base and its
+    // post-grade bloom have been combined.
+    const float AppliedPreExposure = max(GaussianCompositeParams0.x, 1.0e-4);
+
+    // Resolve fog depth from the same visibility-weighted Gaussian accumulation
+    // used by the rendered colour. This is per-view, not camera-capture based, and
+    // remains valid for MRQ tiles and 360 panoramic faces.
+    float FogSurfaceDepth = ResolvePanoramaSafeFogDepth(PixelPos, GSDepth);
+    float2 FogNDC = float2(ViewUV.x * 2.0 - 1.0, 1.0 - ViewUV.y * 2.0);
+    float4 FogWorldFarH = mul(float4(FogNDC, 0.0, 1.0), ProxyCompositeInvViewProjection);
+    float3 FogWorldFar = FogWorldFarH.xyz / max(abs(FogWorldFarH.w), 1.0e-5);
+    const float3 FogCameraOrigin = ProxyCompositeCameraOriginValid.xyz;
+    const float3 FogViewDirection = normalize(FogWorldFar - FogCameraOrigin);
+
+    float FogAmount = 0.0;
+    const float3 OriginalStraight = AccumToStraight(GradedAccum);
+    const float3 FoggedStraight = ApplyNativeFogBridgeToGS(
+        OriginalStraight, FogCameraOrigin, FogViewDirection, FogSurfaceDepth, FogAmount);
+
+    // Keep the exact pre-fog GS coverage. The previous fog-specific alpha sealing
+    // made large low-opacity Gaussians visible as giant petals/discs. Fog now
+    // changes only radiance/depth; it never grows or reshapes a splat footprint.
+    const float FogCompositeAlpha = CompositeAlpha;
+    // P46: all covered GS pixels receive the same fog transmittance at the
+    // resolved surface depth; no alpha-dependent fog strength or hard silhouettes.
+    const float3 SealedStraight = FoggedStraight;
+    const float3 SealedBase = SealedStraight * FogCompositeAlpha;
+    // P50: surface bloom is extinguished by the same medium as the surface.
+    // Leaving 90% of bloom alive made bright ground/leaf specks cut through fog.
+    const float BloomFogAttenuation = 1.0 - FogAmount;
+
+    const float3 PremultipliedGSLinearHDR = SealedBase + PluginSpatialBloom * BloomFogAttenuation;
+    if (PanoramaGSCompositeMode == 2u)
+    {
+        // Apply display mapping to *straight* base HDR, then premultiply again.
+        // Keep bloom independent: it must remain visible beyond base GS coverage.
+        const float DisplayExposure = exp2(GaussianCompositeParams0.y);
+        const float3 StraightBase = SealedBase / max(FogCompositeAlpha, 1.0e-5);
+        const float3 DisplayBase = ToneMapIsolatedGS(StraightBase * DisplayExposure) * FogCompositeAlpha;
+        const float3 DisplayBloom = ToneMapIsolatedGS(
+            PluginSpatialBloom * BloomFogAttenuation * DisplayExposure);
+        return float4(saturate(DisplayBase + DisplayBloom), FogCompositeAlpha);
+    }
+    return float4(PremultipliedGSLinearHDR * AppliedPreExposure, FogCompositeAlpha);
+}

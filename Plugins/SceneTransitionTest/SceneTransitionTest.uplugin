@@ -1,0 +1,14 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1",
+  "FriendlyName": "Scene Transition Test",
+  "Description": "Reusable Blueprint-callable map transition smoke test. Opt in with -SceneTransitionTest.",
+  "CanContainContent": true,
+  "EnabledByDefault": true,
+  "Plugins": [{ "Name": "XRBase", "Enabled": true }, { "Name": "SceneEnvironment", "Enabled": true }],
+  "Modules": [
+    { "Name": "SceneTransitionTest", "Type": "Runtime", "LoadingPhase": "Default" },
+    { "Name": "SceneTransitionTestEditor", "Type": "Editor", "LoadingPhase": "PostEngineInit" }
+  ]
+}

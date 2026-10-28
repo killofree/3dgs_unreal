@@ -1,0 +1,29 @@
+#include "/Engine/Public/Platform.ush"
+StructuredBuffer<float4> WetMeshVertices;
+float4x4 WetMeshClip;
+float3 WetMeshCamera;
+Texture2D WetMeshGSDepth;
+struct FMeshVarying
+{
+    float4 Position : SV_POSITION;
+    float3 RelativeWorld : TEXCOORD0;
+    nointerpolation float Up : TEXCOORD1;
+};
+FMeshVarying MainVS(uint Id : SV_VertexID)
+{
+    FMeshVarying O;
+    float4 V = WetMeshVertices[Id];
+    O.Position = mul(float4(V.xyz, 1), WetMeshClip);
+    O.RelativeWorld = V.xyz - WetMeshCamera;
+    O.Up = V.w;
+    return O;
+}
+float4 MainPS(FMeshVarying I) : SV_Target0
+{
+    float D = WetMeshGSDepth.Load(int3(int2(I.Position.xy), 0)).r;
+    float MeshDistance = length(I.RelativeWorld);
+    // Only foreground GS occludes water; a modest offset accommodates proxy error.
+    // Receiver selection itself comes exclusively from baked triangles.
+    if (D > 0 && D < 60000 && D + 15.0 < MeshDistance) discard;
+    return float4(I.RelativeWorld, max(I.Up, 0.001));
+}

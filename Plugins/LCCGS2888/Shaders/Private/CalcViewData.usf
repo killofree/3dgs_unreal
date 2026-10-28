@@ -1,0 +1,3709 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+//Purpose: Transform 3D splat data ??2D screen-space data
+
+#include "/Plugin/LCCCinematicGS/Private/GaussianSplatting.ush"
+
+// Shader parameters
+ByteAddressBuffer PackedSplatBuffer;  // 16 bytes/splat packed data
+ByteAddressBuffer Float32PositionBuffer; // tightly packed float3, 12 bytes/splat
+uint UseFloat32Position; // 0 legacy packed FP16, 1 Float32 position buffer
+Texture2D<float4> HighPrecisionColorTexture; // existing PF_FloatRGBA Morton-swizzled color/opacity texture
+uint UseHighPrecisionColorOpacity; // 0 packed RGBA8, 1 Float16 RGBA texture
+uint UseAdaptiveFootprint; // 0 legacy projected covariance, 1 adaptive EWA
+float4 SeasonalColorSelectParams;
+float4 SeasonalColorAdjustParams;
+float4 SeasonalSourceColorFrom;
+float4 SeasonalSourceColorTo;
+float4 SeasonalTargetColorFrom;
+float4 SeasonalTargetColorTo;
+// v2784 direct weather: x mode (1 wet/puddles, 2 snow), y strength,
+// z upward-facing selectivity, w stable world-pattern scale.
+float4 DirectSplatSurfaceEffectParams0;
+// rgb weather/reflection tint, w specular/sparkle amount.
+float4 DirectSplatSurfaceEffectParams1;
+// x snow thickness cm, y snow footprint expansion, z wet darkening, w puddle amount.
+float4 DirectSplatSurfaceEffectParams2;
+float4 DirectSnowTuningParams; // x ground fill, y structure removal, z structure slope threshold
+float4 SnowSourceCoverParams; // v2872 x validated baked-source colour cover boost; other channels reserved
+float4 FootprintParams0; // x strength, y/z/w near/mid/far minimum radius px
+float4 FootprintParams1; // x/y/z near/mid/far maximum radius px, w anisotropy limit
+float4 FootprintParams2; // x adaptive start cm, y full-strength cm, z opacity strength, w max compensation exponent
+float4 FootprintParams3; // x far radius quantization px, y adaptive look safety (composite), zw reserved
+ByteAddressBuffer SHBuffer;           // View-dependent spherical-harmonic color data
+RWStructuredBuffer<FGaussianSplatViewData> ViewDataBuffer; //pass calculated result to ViewDataBuffer
+
+// Cluster visibility integration (UNIFIED APPROACH)
+// SplatClusterIndexBuffer maps ALL splats (original + LOD) to their cluster
+// - Original splats (index < OriginalSplatCount) -> leaf cluster ID
+// - LOD splats (index >= OriginalSplatCount) -> parent cluster ID
+StructuredBuffer<uint> SplatClusterIndexBuffer;
+StructuredBuffer<uint> ClusterVisibilityBitmap;       // Leaf cluster visibility
+StructuredBuffer<uint> LODClusterSelectedBitmap;      // Parent cluster LOD selection
+StructuredBuffer<uint> SelectedClusterBuffer;  // Maps leaf cluster -> selected cluster for debug viz
+StructuredBuffer<uint2> ClusterLightingBuffer; // dense spatial-grid half4: RGB baked-light factor + confidence
+uint ClusterLightingCount;
+float4 SpatialLightingGridMinCellSize; // xyz local-space grid minimum, w cell size
+float4 SpatialLightingGridDimensionsStatus; // xyz dimensions, w cache status (1 = valid)
+StructuredBuffer<uint2> ProxyNormalGridBuffer; // dense component-local half4: encoded normal RGB + confidence
+uint ProxyNormalGridCount;
+float4 ProxyNormalGridMinCellSize;
+float4 ProxyNormalGridDimensionsStatus;
+StructuredBuffer<uint> SnowCoveragePackedBuffer;
+StructuredBuffer<uint> PuddleDampenPackedMask;
+uint PuddleDampenPackedCount;
+float PuddleDampenStrength; // source broad-ground opacity damping
+float2 PuddleSourceWetSettings; // x wet blend, y 0 normal / 1 roof blue / 2 foliage cyan / 3 both
+uint PuddleWaterLayer; // P10 isolated water GS component
+uint PuddleHideMainSource; // P08 independent-layer proof, no component visibility mutation
+uint SnowCoveragePackedCount;
+StructuredBuffer<uint> SnowBakedFieldBuffer2873; // 4 packed UNORM8 values/uint, world-position authored in Bake
+uint SnowBakedFieldCount2873;
+float SnowBakedFieldPatternCm2873;
+uint SnowBakedFieldValid2873;
+StructuredBuffer<uint4> StableSplatBindingBuffer; // x triangleID, y barycentric, z multi-triangle normal, w valid
+uint StableSplatBindingCount;
+StructuredBuffer<uint4> StableProxyTriangleBuffer; // xyz welded vertex IDs, w packed average normal + closure
+uint StableProxyTriangleCount;
+StructuredBuffer<float4> StableProxyTriangleVertexNormalBuffer; // v2804: 3 authored local normals per source triangle
+uint StableProxyTriangleVertexNormalCount;
+StructuredBuffer<float4> StableProxyVertexProofBuffer; // B/current complete field: x center, y continuous bilinear 3x3 PCF
+StructuredBuffer<float4> StableProxyVertexProofPreviousBuffer; // A/previous complete field retained after atomic swap
+StructuredBuffer<uint> StableProxyVertexOwnerBuffer;
+StructuredBuffer<uint> StableProxyVertexOwnerPreviousBuffer;
+uint StableProxyVertexProofCount;
+uint StableProxyFieldPairValid;
+uint StableProxyLiveTargetValid;
+float StableProxyFieldABBlend;
+StructuredBuffer<float4> StableProxyVertexBuffer; // local-space welded positions
+uint StableProxyVertexCount;
+StructuredBuffer<float> StableProxyCastGridBuffer;
+uint StableProxyCastGridWidth;
+uint StableProxyCastGridHeight;
+uint StableProxyCastGridValid;
+float4 StableProxyCastGridOriginWidth;
+float4 StableProxyCastGridForwardEnabled;
+float4 StableProxyCastGridRightRange;
+float4 StableProxyCastGridUpSettings;
+uint StableProxyFieldValid;
+uint StableShadowDebugMode;
+uint UseClusterCulling;  // 1 = check visibility, 0 = process all splats
+uint UseLODRendering;    // 1 = enable LOD rendering (unified approach)
+uint OriginalSplatCount; // Count of original splats (LOD splats start after this)
+
+// Compaction mode: process only visible splats from CompactedSplatIndices
+StructuredBuffer<uint> CompactedSplatIndices;  // Indices of visible splats
+uint UseCompaction;      // 1 = use compacted indices (skip visibility checks)
+uint VisibleSplatCount;  // Number of visible splats (when using compaction)
+
+float4x4 LocalToWorld;
+float4x4 WorldToPLY;   // Transforms world direction to PLY/SH space for SH evaluation
+float4x4 WorldToClip;
+float4x4 WorldToView;
+float3 PreViewTranslation;  // For translating world position (velocity calculation)
+float3 CameraPosition;
+float2 ScreenSize;
+float2 FocalLength;
+uint SplatCount;
+uint SHOrder;
+uint NumSHCoeffs;      // Coefficients to evaluate (based on SHOrder: 4, 9, or 16)
+uint SHBufferCoeffs;   // Coefficients actually stored per splat in SHBuffer (based on asset SHBands)
+uint UseSHRendering;   // 1 = use view-dependent SH evaluation, 0 = use pre-computed DC color
+float OpacityScale;
+float SplatScale;
+
+// Cinematic Unreal light bridge. Filled from active Unreal LightComponents on the game thread.
+uint ReceiveUnrealLighting;
+uint UnrealLightCount;
+float UnrealLightingInfluence;
+float UnrealLightingPadding0;
+float UnrealDirectionalResponse;
+float UnrealLightWrap;
+uint UnrealNormalMode;
+float UnrealLightingPadding1;
+float4 UnrealAmbientColorIntensity;
+float4 UnrealIndirectLightParams; // x indirect strength, y ground bounce, z shadow saturation, w enable shadow lighting
+float4 UnrealIndirectShadowTint;  // rgb shadow tint, w reserved
+float4 StableLightingParams0; // x cast density, y top-layer closure density, z closure spread/area, w closure softness
+float4 StableLightingParams1; // x closure minimum brightness at density=1, y reserved, z cast softness, w cast minimum
+float4 StableLightingParams2; // x shadow/reflected bounce strength, y sky/indirect strength, z ground bounce, w reserved
+float4 StableLightingParams3; // x stable sun scale, y stable light influence, z ambient intensity, w bright-day phase
+float4 StableLightingParams4; // x=night energy phase, y=horizon cast-shadow stability, z/w=Stable lighting normal full/max proxy distance (cm)
+float4 UnrealShadowParams;   // x shadow strength, y contact strength, z contrast, w micro-normal strength
+float4 UnrealShadowParams2;  // x softness, y breakup, z enabled, w reserved
+float4 UnrealShadowBounds;   // xyz component bounds center, w horizontal radius
+float4 UnrealShadowHeight;   // x minZ, y maxZ, z/w reserved
+float4 UnrealRelightParams;   // x enable, y relight blend, z approximate-albedo strength, w baked-shadow lift
+float4 UnrealRelightLookParams; // x baked-highlight reduction, y target-look strength, z selective green boost, w midtone contrast
+float4 UnrealRelightSunTint;  // rgb warm sun tint, w direct energy scale
+float4 UnrealRelightSkyTint;  // rgb sky tint, w final shadow lift
+float4 TimeOfDayGradeTint;   // rgb TOD hue multiplier, w blend; luminance-preserving final GS grade
+float4 UnrealRelightDetailParams; // x baked-sun suppression, y highlight compression, z bright-green compression, w tonal micro-contrast
+float4 UnrealRelightDetailParams2; // x Gaussian sharpness; y bloom soft knee; z master effects; w source brightness
+float4 SpatialDelightingParams0; // x enabled, y strength, z chroma strength, w min lighting
+float4 SpatialDelightingParams1; // x max lighting, y dark protection, z max albedo luma, w diagnostic mode
+float4 SpatialDelightingParams2; // x foliage protection, y max tint scale, z difference gain, w reserved
+float4 SpatialDelightingParams3; // x evidence start EV, y evidence full EV, z max correction weight, w foliage correction scale
+float4 SpatialDelightingParams4; // x max shadow lift, y min highlight retention, z signed difference EV range, w reserved
+float4 ProxyNormalParams; // x enabled, y strength, z confidence threshold, w foliage strength
+float4 GaussianSunAccentParams0;
+float4 GaussianSunAccentParams1;
+float4 GaussianSunAccentTint;
+float4 GaussianPlantTransmissionParams0;
+float4 GaussianPlantTransmissionParams1;
+float4 GaussianPlantTransmissionTint;
+float4 UnrealAtmosphereDistanceParams; // x far light fade, y far saturation fade, z highlight glare scale, w color saturation boost
+float4 UnrealAtmosphereFogShapeParams; // x/y distance start/end, z/w near-air start/end
+float4 UnrealAtmosphereFogAmountParams; // x distance fog weight, y near fog weight, z/w density min/max
+float4 UnrealAtmosphereHighlightShapeParams; // x/y highlight luma gate, z/w sun mask gate
+float4 UnrealAtmosphereBloomParams; // x/y local bloom mask gate, z strength, w glare mix
+float4 UnrealAtmosphereGlareParams; // x/y lit-air near/far weights, z haze glow, w lit-air glow
+float4 UnrealAtmosphereShaftParams; // x shaft base, y shaft highlight, z/w sun lift base/distance
+float4 UnrealLightPositionRadius[8];
+float4 UnrealLightDirectionType[8];
+float4 UnrealLightColorIntensity[8];
+float4 UnrealLightConeAngles[8];
+
+uint GlobalBaseOffset; // Offset into global ViewDataBuffer (for multi-proxy global accumulator, non-compaction path)
+
+// Global compaction path: read per-proxy base offset from GPU prefix-sum buffer
+StructuredBuffer<uint> GlobalBaseOffsetsBuffer; // [MAX_PROXY_COUNT+1] prefix sums
+uint ProxyIndex;             // Index of this proxy in the global array
+uint UseGlobalCompactionPath; // 1 = read offset from GlobalBaseOffsetsBuffer[ProxyIndex]
+uint MaxRenderBudget; // Physical buffer capacity guard: skip writes at indices >= this value (0 = no guard)
+
+// Phase-1B binding debug scalar packed into the otherwise-unused second half of PackedDirectBA.
+// -2 = unprocessed/no committed full binding, -1 = processed-but-invalid, [0,1] = deterministic triangle-ID hash.
+// No camera value, ViewRect, FOV, or sort result participates.
+uint LoadStableBindingTriangleID(uint splatIndex)
+{
+	// Exact 32-bit binding ID transport for Phase-1 diagnostics.
+	// 0xFFFFFFFE = unprocessed/no committed binding, 0xFFFFFFFF = processed-invalid.
+	if (splatIndex >= StableSplatBindingCount)
+	{
+		return 0xFFFFFFFEu;
+	}
+	return StableSplatBindingBuffer[splatIndex].x;
+}
+
+float LoadStableBindingDebugValue(uint splatIndex)
+{
+	uint triangleID = LoadStableBindingTriangleID(splatIndex);
+	if (triangleID == 0xFFFFFFFEu)
+	{
+		return -2.0;
+	}
+	if (triangleID == 0xFFFFFFFFu)
+	{
+		return -1.0;
+	}
+	uint h = triangleID * 2654435761u;
+	h ^= h >> 16;
+	h *= 0x85ebca6bu;
+	h ^= h >> 13;
+	return float(h & 0xFFFFu) / 65535.0;
+}
+
+float3 DecodeStableProxyOctNormal(uint packedNormal)
+{
+	// v2745: bits 0..9 / 10..19 = 10+10 oct normal,
+	// bits 20..25 = local closure openness, bits 26..31 = broad closure openness.
+	float2 f = float2(
+		float(packedNormal & 0x3FFu) / 1023.0,
+		float((packedNormal >> 10) & 0x3FFu) / 1023.0);
+	f = f * 2.0 - 1.0;
+	float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+	if (n.z < 0.0)
+	{
+		float2 oldXY = n.xy;
+		n.x = (1.0 - abs(oldXY.y)) * (oldXY.x >= 0.0 ? 1.0 : -1.0);
+		n.y = (1.0 - abs(oldXY.x)) * (oldXY.y >= 0.0 ? 1.0 : -1.0);
+	}
+	return normalize(n);
+}
+
+
+float3 LoadStableMultiTriangleLocalNormal(uint splatIndex, out bool valid)
+{
+	valid = false;
+	if (splatIndex >= StableSplatBindingCount) return float3(0.0, 0.0, 1.0);
+	uint4 binding = StableSplatBindingBuffer[splatIndex];
+	if (binding.x == 0xFFFFFFFFu || binding.w == 0u || binding.z == 0u) return float3(0.0, 0.0, 1.0);
+	valid = true;
+	return DecodeStableProxyOctNormal(binding.z);
+}
+
+
+uint EncodeWeatherOctNormal10(float3 n)
+{
+	n = normalize(n);
+	float denom = max(abs(n.x) + abs(n.y) + abs(n.z), 1.0e-6);
+	float2 p = n.xy / denom;
+	if (n.z < 0.0)
+	{
+		float2 oldP = p;
+		p.x = (1.0 - abs(oldP.y)) * (oldP.x >= 0.0 ? 1.0 : -1.0);
+		p.y = (1.0 - abs(oldP.x)) * (oldP.y >= 0.0 ? 1.0 : -1.0);
+	}
+	uint qx = (uint)round(saturate(p.x * 0.5 + 0.5) * 1023.0);
+	uint qy = (uint)round(saturate(p.y * 0.5 + 0.5) * 1023.0);
+	return (qx & 0x3FFu) | ((qy & 0x3FFu) << 10);
+}
+
+// v2791H: 20-bit normal + 6-bit accumulation + 6-bit pure directional-light facing.
+// Snow color no longer consumes postLight/closure/base-color derived signals.
+// v2841: must agree with CellHash/SnowAccumulationField in GaussianSnowGaussians.cpp.
+// This field uses only world position and the baked artist pattern scale;
+// it has no view-, capture-, or screen-space dependency (panoramic MRQ safe).
+uint SnowWorldCellHash(int2 Cell)
+{
+	uint N = asuint(Cell.x) * 0x9e3779b9u ^ asuint(Cell.y) * 0x85ebca6bu ^ 0x51ed270bu;
+	N ^= N >> 16u; N *= 0x7feb352du; N ^= N >> 15u;
+	N *= 0x846ca68bu; N ^= N >> 16u;
+	return N;
+}
+float SnowWorldValueNoise(float2 P)
+{
+	float2 F = frac(P);
+	int2 I = int2(floor(P));
+	F = F * F * (3.0 - 2.0 * F);
+	float A = float(SnowWorldCellHash(I) & 0x00ffffffu) / 16777215.0;
+	float B = float(SnowWorldCellHash(I + int2(1, 0)) & 0x00ffffffu) / 16777215.0;
+	float C = float(SnowWorldCellHash(I + int2(0, 1)) & 0x00ffffffu) / 16777215.0;
+	float D = float(SnowWorldCellHash(I + int2(1, 1)) & 0x00ffffffu) / 16777215.0;
+	return lerp(lerp(A, B, F.x), lerp(C, D, F.x), F.y);
+}
+float SnowWorldAccumulationField(float2 WorldXY, float PatternCm)
+{
+	float S = max(50.0, PatternCm);
+	return saturate(
+		0.60 * SnowWorldValueNoise(WorldXY / (S * 2.70)) +
+		0.30 * SnowWorldValueNoise(WorldXY / S + float2(17.13, -9.41)) +
+		0.10 * SnowWorldValueNoise(WorldXY / (S * 0.46) + float2(-31.7, 14.29)));
+}
+
+// 2.8.73: same deterministic WORLD field as the full GPU path. The CPU baker
+// stores one 8-bit value per source GS, including source LOD. 2-bit geometry
+// correspondence remains a separate buffer, preserving roof/ground boundaries.
+// Old levels, changed artist patterns and moving components fall back to the
+// original field. No camera-dependent selection is introduced.
+float SourceSnowWorldField2873(uint splatIndex, float2 worldXY, float patternCm)
+{
+	if (SnowBakedFieldValid2873 != 0u &&
+		(splatIndex >> 2u) < SnowBakedFieldCount2873 &&
+		abs(patternCm - SnowBakedFieldPatternCm2873) <= 0.005)
+	{
+		uint packed = SnowBakedFieldBuffer2873[splatIndex >> 2u];
+		uint sample8 = (packed >> ((splatIndex & 3u) * 8u)) & 255u;
+		return float(sample8) * (1.0 / 255.0);
+	}
+	return SnowWorldAccumulationField(worldXY, patternCm);
+}
+
+uint PackDirectSnowOverlayData(float3 worldNormal, float snowWeight, float snowLightFacing)
+{
+	uint packedNormal = EncodeWeatherOctNormal10(worldNormal) & 0xFFFFFu;
+	uint packedWeight = (uint)round(saturate(snowWeight) * 63.0) & 0x3Fu;
+	uint packedFacing = (uint)round(saturate(snowLightFacing) * 63.0) & 0x3Fu;
+	return packedNormal | (packedWeight << 20) | (packedFacing << 26);
+}
+
+// v29 Rain camera-independent water gate payload.
+// The lower 20 bits keep the stable world-space surface normal. Rain no longer needs
+// the two legacy 6-bit membership fields in the Wet post pass, so the upper 12 bits
+// carry an intrinsic WORLD-SPACE splat-size metric instead. This size comes from the
+// 3D covariance before projection and therefore does not change with camera/FOV/view rect.
+uint PackDirectRainWaterData(float3 worldNormal, float worldSplatSizeCm)
+{
+	uint packedNormal = EncodeWeatherOctNormal10(worldNormal) & 0xFFFFFu;
+
+	// Camera-independent intrinsic-size eligibility in the upper 12 bits.
+	// The Wet pass applies this limit to both proxy and fallback receivers,
+	// as well as reflected scene content.
+	// Inclusive size interval, not a full-strength-to-zero fade.
+	// A reversed interval deliberately admits nothing.
+	float wetMinSizeCm = max(DirectSplatSurfaceEffectParams2.x, 0.0);
+	float wetMaxSizeCm = abs(DirectSplatSurfaceEffectParams2.y);
+	float sizeEligibility = (worldSplatSizeCm >= wetMinSizeCm &&
+		worldSplatSizeCm <= wetMaxSizeCm) ? 1.0 : 0.0;
+
+	uint packedEligibility = (uint)round(saturate(sizeEligibility) * 4095.0) & 0xFFFu;
+	return packedNormal | (packedEligibility << 20);
+}
+
+float2 LoadStableProxyTriangleClosureOpenPair(uint splatIndex, out bool outValid)
+{
+	outValid = false;
+	if (splatIndex >= StableSplatBindingCount)
+	{
+		return float2(1.0, 1.0);
+	}
+	uint triangleID = StableSplatBindingBuffer[splatIndex].x;
+	if (triangleID == 0xFFFFFFFFu || triangleID >= StableProxyTriangleCount)
+	{
+		return float2(1.0, 1.0);
+	}
+	uint packed = StableProxyTriangleBuffer[triangleID].w;
+	if (packed == 0u)
+	{
+		return float2(1.0, 1.0);
+	}
+	outValid = true;
+	return float2(
+		float((packed >> 20) & 0x3Fu) / 63.0,
+		float((packed >> 26) & 0x3Fu) / 63.0);
+}
+
+float3 LoadStableProxyTriangleNormal(uint splatIndex, out bool outValid)
+{
+	outValid = false;
+	if (splatIndex >= StableSplatBindingCount)
+	{
+		return float3(0.0, 0.0, 1.0);
+	}
+	uint4 binding = StableSplatBindingBuffer[splatIndex];
+	uint triangleID = binding.x;
+	if (triangleID == 0xFFFFFFFFu || triangleID >= StableProxyTriangleCount)
+	{
+		return float3(0.0, 0.0, 1.0);
+	}
+
+	// v2804: match UE StaticMesh lighting more closely by interpolating the three
+	// authored vertex normals with the exact nearest-point barycentrics already
+	// stored by the stable binding. The packed triangle-average normal remains a
+	// compatibility fallback for invalid/legacy data.
+	uint normalBase = triangleID * 3u;
+	if (normalBase + 2u < StableProxyTriangleVertexNormalCount)
+	{
+		float4 n0p = StableProxyTriangleVertexNormalBuffer[normalBase + 0u];
+		float4 n1p = StableProxyTriangleVertexNormalBuffer[normalBase + 1u];
+		float4 n2p = StableProxyTriangleVertexNormalBuffer[normalBase + 2u];
+		if (min(n0p.w, min(n1p.w, n2p.w)) > 0.5)
+		{
+			float2 baryUV = UnpackHalf2x16(binding.y);
+			float b = saturate(baryUV.x);
+			float c = saturate(baryUV.y);
+			float a = max(1.0 - b - c, 0.0);
+			float ws = max(a + b + c, 1.0e-6);
+			float3 n = n0p.xyz * (a / ws) + n1p.xyz * (b / ws) + n2p.xyz * (c / ws);
+			if (dot(n, n) > 1.0e-6)
+			{
+				outValid = true;
+				return normalize(n);
+			}
+		}
+	}
+
+	uint packedNormal = StableProxyTriangleBuffer[triangleID].w;
+	if (packedNormal == 0u)
+	{
+		return float3(0.0, 0.0, 1.0);
+	}
+	outValid = true;
+	return DecodeStableProxyOctNormal(packedNormal);
+}
+
+float LoadStableProxyBindingDistanceCm(uint splatIndex, float3 localPos, out bool outValid)
+{
+	outValid = false;
+	if (splatIndex >= StableSplatBindingCount)
+	{
+		return 1.0e9;
+	}
+	uint4 binding = StableSplatBindingBuffer[splatIndex];
+	uint triangleID = binding.x;
+	if (triangleID == 0xFFFFFFFFu || triangleID >= StableProxyTriangleCount)
+	{
+		return 1.0e9;
+	}
+	uint4 tri = StableProxyTriangleBuffer[triangleID];
+	if (tri.w == 0u || tri.x >= StableProxyVertexCount || tri.y >= StableProxyVertexCount || tri.z >= StableProxyVertexCount)
+	{
+		return 1.0e9;
+	}
+	float2 baryUV = UnpackHalf2x16(binding.y);
+	float b = saturate(baryUV.x);
+	float c = saturate(baryUV.y);
+	float a = max(1.0 - b - c, 0.0);
+	float ws = max(a + b + c, 1.0e-6);
+	a /= ws; b /= ws; c /= ws;
+	float3 proxyLocalPos = StableProxyVertexBuffer[tri.x].xyz * a
+		+ StableProxyVertexBuffer[tri.y].xyz * b
+		+ StableProxyVertexBuffer[tri.z].xyz * c;
+	float3 proxyWorldPos = mul(float4(proxyLocalPos, 1.0), LocalToWorld).xyz;
+	float3 splatWorldPos = mul(float4(localPos, 1.0), LocalToWorld).xyz;
+	outValid = true;
+	return length(splatWorldPos - proxyWorldPos);
+}
+
+// v2791H GroundWetFix / WeatherSurfaceWet v4: puddle/ripple receivers must stay
+// attached to their actual Stable Proxy surface, rather than merely inherit an
+// upward normal from a proxy triangle up to 2.5 m away.
+// Reuse the existing stable binding barycentric point to measure true surface
+// attachment without relying on the component global minimum height.
+// This is wet-only data; stable shadow/closure fields are untouched.
+float LoadStableWetGroundMembership(uint splatIndex, float3 localPos)
+{
+	if (splatIndex >= StableSplatBindingCount)
+	{
+		return 0.0;
+	}
+	uint4 binding = StableSplatBindingBuffer[splatIndex];
+	uint triangleID = binding.x;
+	if (triangleID == 0xFFFFFFFFu || triangleID >= StableProxyTriangleCount)
+	{
+		return 0.0;
+	}
+	uint4 tri = StableProxyTriangleBuffer[triangleID];
+	if (tri.w == 0u || tri.x >= StableProxyVertexCount || tri.y >= StableProxyVertexCount || tri.z >= StableProxyVertexCount)
+	{
+		return 0.0;
+	}
+
+	float2 baryUV = UnpackHalf2x16(binding.y);
+	float b = saturate(baryUV.x);
+	float c = saturate(baryUV.y);
+	float a = max(1.0 - b - c, 0.0);
+	float weightSum = max(a + b + c, 1.0e-6);
+	a /= weightSum; b /= weightSum; c /= weightSum;
+
+	float3 v0Local = StableProxyVertexBuffer[tri.x].xyz;
+	float3 v1Local = StableProxyVertexBuffer[tri.y].xyz;
+	float3 v2Local = StableProxyVertexBuffer[tri.z].xyz;
+	float3 proxyLocalPos = v0Local * a + v1Local * b + v2Local * c;
+
+	// GroundWetFix v2: do NOT classify ground from the component's global MinZ.
+	// Gaussian bounds can contain under-floor/outlier splats, which made the real
+	// ground miss the old narrow 45-90 cm lowest-height band and zeroed all puddles.
+	// Instead measure distance perpendicular to the splat's own nearest stable
+	// proxy triangle. This tolerates lateral proxy mismatch while rejecting splats
+	// floating clearly above the receiver plane (foliage, furniture, ledges, etc.).
+	float3 v0World = mul(float4(v0Local, 1.0), LocalToWorld).xyz;
+	float3 v1World = mul(float4(v1Local, 1.0), LocalToWorld).xyz;
+	float3 v2World = mul(float4(v2Local, 1.0), LocalToWorld).xyz;
+	float3 proxyWorldPos = mul(float4(proxyLocalPos, 1.0), LocalToWorld).xyz;
+	float3 splatWorldPos = mul(float4(localPos, 1.0), LocalToWorld).xyz;
+	float3 proxyWorldNormal = normalize(cross(v1World - v0World, v2World - v0World));
+
+	float planeDistanceCm = abs(dot(splatWorldPos - proxyWorldPos, proxyWorldNormal));
+	// GroundWetControl v3 / WeatherSurfaceWet v4: in Wet mode Settings2.x/y remain
+	// the puddle/ripple Stable-Proxy attachment Full/Max distances. They no longer
+	// gate the base wet/reflection effect. abs(y) strips the debug-view flag.
+	float wetGroundFullDistanceCm = max(DirectSplatSurfaceEffectParams2.x, 0.0);
+	float wetGroundMaxDistanceCm = max(abs(DirectSplatSurfaceEffectParams2.y), wetGroundFullDistanceCm + 0.1);
+	float attachedToPlane = 1.0 - smoothstep(
+		wetGroundFullDistanceCm, wetGroundMaxDistanceCm, planeDistanceCm);
+
+	// Keep the original nearest-triangle binding meaningful without reintroducing
+	// the strict 12-32 cm Euclidean cutoff. A very broad fade only rejects splats
+	// whose closest bound point is near the 250 cm stable-binding search limit.
+	float closestDistanceCm = length(splatWorldPos - proxyWorldPos);
+	float withinBindingNeighborhood = 1.0 - smoothstep(180.0, 245.0, closestDistanceCm);
+
+	return saturate(attachedToPlane * withinBindingNeighborhood);
+}
+
+float LoadStableProxyVisibility(uint splatIndex, bool bUsePCF3x3)
+{
+	if (StableProxyFieldValid == 0u)
+	{
+		return -2.0; // field not built yet
+	}
+	if (splatIndex >= StableSplatBindingCount)
+	{
+		return -2.0;
+	}
+	uint4 binding = StableSplatBindingBuffer[splatIndex];
+	uint triangleID = binding.x;
+	if (triangleID == 0xFFFFFFFFu || triangleID >= StableProxyTriangleCount)
+	{
+		return -1.0; // fail-open invalid binding
+	}
+	uint4 tri = StableProxyTriangleBuffer[triangleID];
+	if (tri.w == 0u || tri.x >= StableProxyVertexProofCount || tri.y >= StableProxyVertexProofCount || tri.z >= StableProxyVertexProofCount)
+	{
+		return -1.0;
+	}
+	float2 baryUV = UnpackHalf2x16(binding.y);
+	float u = saturate(baryUV.x);
+	float v = saturate(baryUV.y);
+	float w = max(1.0 - u - v, 0.0);
+	float weightSum = max(w + u + v, 1.0e-6);
+	float3 weights = float3(w, u, v) / weightSum;
+	float3 vertexVisibility = bUsePCF3x3
+		? float3(
+			StableProxyVertexProofBuffer[tri.x].y,
+			StableProxyVertexProofBuffer[tri.y].y,
+			StableProxyVertexProofBuffer[tri.z].y)
+		: float3(
+			StableProxyVertexProofBuffer[tri.x].x,
+			StableProxyVertexProofBuffer[tri.y].x,
+			StableProxyVertexProofBuffer[tri.z].x);
+	return saturate(dot(weights, vertexVisibility));
+}
+
+// RainOcclusion v5: interpolate the static world-up sky visibility encoded in
+// deterministic proof Z. 2..3 is the v5 valid range; older/missing fields fail open
+// so the whole 3DGS remains wet rather than creating an artificial dry boundary.
+float LoadStableRainExposure(uint splatIndex)
+{
+	if (StableProxyFieldValid == 0u || splatIndex >= StableSplatBindingCount)
+	{
+		return 1.0;
+	}
+	uint4 binding = StableSplatBindingBuffer[splatIndex];
+	uint triangleID = binding.x;
+	if (triangleID == 0xFFFFFFFFu || triangleID >= StableProxyTriangleCount)
+	{
+		return 1.0;
+	}
+	uint4 tri = StableProxyTriangleBuffer[triangleID];
+	if (tri.w == 0u || tri.x >= StableProxyVertexProofCount ||
+		tri.y >= StableProxyVertexProofCount || tri.z >= StableProxyVertexProofCount)
+	{
+		return 1.0;
+	}
+	float2 baryUV = UnpackHalf2x16(binding.y);
+	float u = saturate(baryUV.x);
+	float v = saturate(baryUV.y);
+	float w = max(1.0 - u - v, 0.0);
+	float3 weights = float3(w, u, v) / max(w + u + v, 1.0e-6);
+	float3 encoded = float3(
+		StableProxyVertexProofBuffer[tri.x].z,
+		StableProxyVertexProofBuffer[tri.y].z,
+		StableProxyVertexProofBuffer[tri.z].z);
+	if (min(encoded.x, min(encoded.y, encoded.z)) < 1.5)
+	{
+		return 1.0;
+	}
+	return saturate(dot(weights, encoded) - 2.0);
+}
+
+float LoadStableProxyPreviousVisibility(uint splatIndex, bool bUsePCF3x3)
+{
+	if (StableProxyFieldValid == 0u || StableProxyFieldPairValid == 0u)
+	{
+		return -2.0;
+	}
+	if (splatIndex >= StableSplatBindingCount)
+	{
+		return -2.0;
+	}
+	uint4 binding = StableSplatBindingBuffer[splatIndex];
+	uint triangleID = binding.x;
+	if (triangleID == 0xFFFFFFFFu || triangleID >= StableProxyTriangleCount)
+	{
+		return -1.0;
+	}
+	uint4 tri = StableProxyTriangleBuffer[triangleID];
+	if (tri.w == 0u || tri.x >= StableProxyVertexProofCount || tri.y >= StableProxyVertexProofCount || tri.z >= StableProxyVertexProofCount)
+	{
+		return -1.0;
+	}
+	float2 baryUV = UnpackHalf2x16(binding.y);
+	float u = saturate(baryUV.x);
+	float v = saturate(baryUV.y);
+	float w = max(1.0 - u - v, 0.0);
+	float weightSum = max(w + u + v, 1.0e-6);
+	float3 weights = float3(w, u, v) / weightSum;
+	float3 vertexVisibility = bUsePCF3x3
+		? float3(
+			StableProxyVertexProofPreviousBuffer[tri.x].y,
+			StableProxyVertexProofPreviousBuffer[tri.y].y,
+			StableProxyVertexProofPreviousBuffer[tri.z].y)
+		: float3(
+			StableProxyVertexProofPreviousBuffer[tri.x].x,
+			StableProxyVertexProofPreviousBuffer[tri.y].x,
+			StableProxyVertexProofPreviousBuffer[tri.z].x);
+	return saturate(dot(weights, vertexVisibility));
+}
+
+// v2771 mode 19: read the freshly completed hidden Target field directly.
+// Unlike PreviousVisibility this does not require an A/B pair because Target is
+// deliberately not swapped when mode 19 builds the current LightDepth classification.
+float LoadStableProxyLiveTargetVisibility(uint splatIndex, bool bUsePCF3x3)
+{
+	if (StableProxyLiveTargetValid == 0u)
+	{
+		return -2.0;
+	}
+	if (splatIndex >= StableSplatBindingCount)
+	{
+		return -2.0;
+	}
+	uint4 binding = StableSplatBindingBuffer[splatIndex];
+	uint triangleID = binding.x;
+	if (triangleID == 0xFFFFFFFFu || triangleID >= StableProxyTriangleCount)
+	{
+		return -1.0;
+	}
+	uint4 tri = StableProxyTriangleBuffer[triangleID];
+	if (tri.w == 0u || tri.x >= StableProxyVertexProofCount || tri.y >= StableProxyVertexProofCount || tri.z >= StableProxyVertexProofCount)
+	{
+		return -1.0;
+	}
+	float2 baryUV = UnpackHalf2x16(binding.y);
+	float u = saturate(baryUV.x);
+	float v = saturate(baryUV.y);
+	float w = max(1.0 - u - v, 0.0);
+	float weightSum = max(w + u + v, 1.0e-6);
+	float3 weights = float3(w, u, v) / weightSum;
+	float3 vertexVisibility = bUsePCF3x3
+		? float3(
+			StableProxyVertexProofPreviousBuffer[tri.x].y,
+			StableProxyVertexProofPreviousBuffer[tri.y].y,
+			StableProxyVertexProofPreviousBuffer[tri.z].y)
+		: float3(
+			StableProxyVertexProofPreviousBuffer[tri.x].x,
+			StableProxyVertexProofPreviousBuffer[tri.y].x,
+			StableProxyVertexProofPreviousBuffer[tri.z].x);
+	return saturate(dot(weights, vertexVisibility));
+}
+
+float LoadStableProxyDenseCastVisibility(uint splatIndex)
+{
+	if (StableProxyCastGridValid == 0u || StableProxyCastGridWidth == 0u || StableProxyCastGridHeight == 0u)
+	{
+		return LoadStableProxyVisibility(splatIndex, true);
+	}
+	if (splatIndex >= StableSplatBindingCount)
+	{
+		return -2.0;
+	}
+	uint4 binding = StableSplatBindingBuffer[splatIndex];
+	uint triangleID = binding.x;
+	if (triangleID == 0xFFFFFFFFu || triangleID >= StableProxyTriangleCount)
+	{
+		return -1.0;
+	}
+	uint4 tri = StableProxyTriangleBuffer[triangleID];
+	if (tri.w == 0u || tri.x >= StableProxyVertexCount || tri.y >= StableProxyVertexCount || tri.z >= StableProxyVertexCount)
+	{
+		return -1.0;
+	}
+	float2 baryUV = UnpackHalf2x16(binding.y);
+	float b = saturate(baryUV.x);
+	float c = saturate(baryUV.y);
+	float a = max(1.0 - b - c, 0.0);
+	float ws = max(a + b + c, 1.0e-6);
+	a /= ws; b /= ws; c /= ws;
+	float3 localP = StableProxyVertexBuffer[tri.x].xyz * a
+		+ StableProxyVertexBuffer[tri.y].xyz * b
+		+ StableProxyVertexBuffer[tri.z].xyz * c;
+	float3 worldP = mul(float4(localP, 1.0), LocalToWorld).xyz;
+	float3 R = worldP - StableProxyCastGridOriginWidth.xyz;
+	float widthCm = max(StableProxyCastGridOriginWidth.w, 1.0);
+	float2 uv = float2(
+		0.5 + dot(R, StableProxyCastGridRightRange.xyz) / widthCm,
+		0.5 - dot(R, StableProxyCastGridUpSettings.xyz) / widthCm);
+	float receiverDepth = dot(R, StableProxyCastGridForwardEnabled.xyz);
+	if (receiverDepth <= 0.0 || any(uv < 0.0) || any(uv > 1.0))
+	{
+		return 1.0;
+	}
+	float2 dims = float2(StableProxyCastGridWidth, StableProxyCastGridHeight);
+	float2 texelPos = saturate(uv) * dims - 0.5;
+	int2 p0 = int2(floor(texelPos));
+	float2 f = frac(texelPos);
+	int2 maxP = int2(int(StableProxyCastGridWidth) - 1, int(StableProxyCastGridHeight) - 1);
+	int2 p00 = clamp(p0 + int2(0, 0), int2(0, 0), maxP);
+	int2 p10 = clamp(p0 + int2(1, 0), int2(0, 0), maxP);
+	int2 p01 = clamp(p0 + int2(0, 1), int2(0, 0), maxP);
+	int2 p11 = clamp(p0 + int2(1, 1), int2(0, 0), maxP);
+	uint i00 = uint(p00.y) * StableProxyCastGridWidth + uint(p00.x);
+	uint i10 = uint(p10.y) * StableProxyCastGridWidth + uint(p10.x);
+	uint i01 = uint(p01.y) * StableProxyCastGridWidth + uint(p01.x);
+	uint i11 = uint(p11.y) * StableProxyCastGridWidth + uint(p11.x);
+	float v00 = saturate(StableProxyCastGridBuffer[i00]);
+	float v10 = saturate(StableProxyCastGridBuffer[i10]);
+	float v01 = saturate(StableProxyCastGridBuffer[i01]);
+	float v11 = saturate(StableProxyCastGridBuffer[i11]);
+	return saturate(lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y));
+}
+
+bool LoadStableProxyInterpolatedProof(
+	uint splatIndex,
+	bool bPrevious,
+	out float4 proof)
+{
+	proof = float4(1.0, 1.0, 0.0, -1.0);
+	if (splatIndex >= StableSplatBindingCount)
+	{
+		return false;
+	}
+	uint4 binding = StableSplatBindingBuffer[splatIndex];
+	uint triangleID = binding.x;
+	if (triangleID == 0xFFFFFFFFu || triangleID >= StableProxyTriangleCount)
+	{
+		return false;
+	}
+	uint4 tri = StableProxyTriangleBuffer[triangleID];
+	if (tri.w == 0u || tri.x >= StableProxyVertexProofCount ||
+		tri.y >= StableProxyVertexProofCount || tri.z >= StableProxyVertexProofCount)
+	{
+		return false;
+	}
+	float2 baryUV = UnpackHalf2x16(binding.y);
+	float u = saturate(baryUV.x);
+	float v = saturate(baryUV.y);
+	float w = max(1.0 - u - v, 0.0);
+	float3 weights = float3(w, u, v) / max(w + u + v, 1.0e-6);
+	float4 p0 = bPrevious ? StableProxyVertexProofPreviousBuffer[tri.x] : StableProxyVertexProofBuffer[tri.x];
+	float4 p1 = bPrevious ? StableProxyVertexProofPreviousBuffer[tri.y] : StableProxyVertexProofBuffer[tri.y];
+	float4 p2 = bPrevious ? StableProxyVertexProofPreviousBuffer[tri.z] : StableProxyVertexProofBuffer[tri.z];
+	proof = p0 * weights.x + p1 * weights.y + p2 * weights.z;
+	return proof.z > 0.0;
+}
+
+float3 EncodeStableProxyDepthDiagnostic(uint splatIndex, uint mode)
+{
+	float4 currentProof;
+	float4 previousProof;
+	bool currentValid = LoadStableProxyInterpolatedProof(splatIndex, false, currentProof);
+	bool previousValid = LoadStableProxyInterpolatedProof(splatIndex, true, previousProof);
+	if (!currentValid)
+	{
+		return float3(0.0, 0.0, 1.0); // Blue: invalid/missing current depth.
+	}
+
+	// RainOcclusion v5 stores static rain exposure in proof Z as 2..3. The old
+	// depth diagnostics never had meaningful deterministic receiver depth here
+	// (BVH proofs wrote Z=1), so normalize the encoded range back to that legacy
+	// value before executing diagnostic modes. Production cast X/Y is untouched.
+	if (currentProof.z >= 1.5) currentProof.z = 1.0;
+	if (previousValid && previousProof.z >= 1.5) previousProof.z = 1.0;
+
+	if (mode == 78u)
+	{
+		if (splatIndex >= StableSplatBindingCount)
+			return float3(0.0, 0.0, 1.0);
+		uint4 ownerBinding = StableSplatBindingBuffer[splatIndex];
+		if (ownerBinding.x == 0xFFFFFFFFu || ownerBinding.x >= StableProxyTriangleCount)
+			return float3(0.0, 0.0, 1.0);
+		uint4 ownerTri = StableProxyTriangleBuffer[ownerBinding.x];
+		if (ownerTri.w == 0u || ownerTri.x >= StableProxyVertexProofCount ||
+			ownerTri.y >= StableProxyVertexProofCount || ownerTri.z >= StableProxyVertexProofCount)
+			return float3(0.0, 0.0, 1.0);
+		uint currentOwner0 = StableProxyVertexOwnerBuffer[ownerTri.x];
+		uint currentOwner1 = StableProxyVertexOwnerBuffer[ownerTri.y];
+		uint currentOwner2 = StableProxyVertexOwnerBuffer[ownerTri.z];
+		uint previousOwner0 = StableProxyVertexOwnerPreviousBuffer[ownerTri.x];
+		uint previousOwner1 = StableProxyVertexOwnerPreviousBuffer[ownerTri.y];
+		uint previousOwner2 = StableProxyVertexOwnerPreviousBuffer[ownerTri.z];
+		bool currentSelf0 = currentOwner0 != 0xFFFFFFFFu &&
+			any(StableProxyTriangleBuffer[currentOwner0].xyz == ownerTri.xxx);
+		bool currentSelf1 = currentOwner1 != 0xFFFFFFFFu &&
+			any(StableProxyTriangleBuffer[currentOwner1].xyz == ownerTri.yyy);
+		bool currentSelf2 = currentOwner2 != 0xFFFFFFFFu &&
+			any(StableProxyTriangleBuffer[currentOwner2].xyz == ownerTri.zzz);
+		bool previousSelf0 = previousOwner0 != 0xFFFFFFFFu &&
+			any(StableProxyTriangleBuffer[previousOwner0].xyz == ownerTri.xxx);
+		bool previousSelf1 = previousOwner1 != 0xFFFFFFFFu &&
+			any(StableProxyTriangleBuffer[previousOwner1].xyz == ownerTri.yyy);
+		bool previousSelf2 = previousOwner2 != 0xFFFFFFFFu &&
+			any(StableProxyTriangleBuffer[previousOwner2].xyz == ownerTri.zzz);
+		bool ownerChanged = currentSelf0 != previousSelf0 || currentSelf1 != previousSelf1 || currentSelf2 != previousSelf2;
+		return ownerChanged ? float3(1.0, 0.0, 0.0) : 0.0.xxx;
+	}
+
+	if (currentProof.w <= 0.01 || currentProof.w >= 60000.0)
+	{
+		return float3(0.0, 0.0, 1.0);
+	}
+
+	if (mode == 76u)
+	{
+		// Raw blocker-receiver separation. Neutral gray is equal depth; red means
+		// blocker is closer (shadow side), green means receiver is in front (lit side).
+		float separationCm = currentProof.w - currentProof.z;
+		float magnitude = saturate(abs(separationCm) / 20.0);
+		return separationCm < 0.0
+			? lerp(0.5.xxx, float3(1.0, 0.0, 0.0), magnitude)
+			: lerp(0.5.xxx, float3(0.0, 1.0, 0.0), magnitude);
+	}
+
+	if (!previousValid)
+	{
+		// The first completed field has no previous frame yet. Treat it as a zero
+		// delta instead of painting the whole splat blue; after the next light-field
+		// update the swapped target contains the real previous proof.
+		previousProof = currentProof;
+	}
+
+	if (mode == 77u)
+	{
+		// Red: visibility moved toward shadow. Green: visibility moved toward light.
+		float visibilityDelta = currentProof.x - previousProof.x;
+		float magnitude = saturate(abs(visibilityDelta) * 4.0);
+		return visibilityDelta < 0.0
+			? float3(magnitude, 0.0, 0.0)
+			: float3(0.0, magnitude, 0.0);
+	}
+
+	float depthDeltaCm = mode == 74u
+		? currentProof.z - previousProof.z
+		: currentProof.w - previousProof.w;
+	// Receiver/blocker A/B motion: red is closer, green is farther. Black is stable.
+	float magnitude = saturate(abs(depthDeltaCm) / 2.0);
+	return depthDeltaCm < 0.0
+		? float3(magnitude, 0.0, 0.0)
+		: float3(0.0, magnitude, 0.0);
+}
+
+// Dense light-space visibility is spatially stable, but its equal-depth rejection
+// deliberately removes receiver self-depth. Recover only well-supported self-cast
+// from the welded proxy field. The wide dead zone prevents small per-frame depth
+// differences around fully lit vertices from turning back into MRQ sparkle.
+float LoadStableProxyHybridCastVisibility(uint splatIndex)
+{
+	float currentVertexVisibility = LoadStableProxyVisibility(splatIndex, true);
+	// The deterministic proxy-BVH ray result is the only self-cast authority.
+	// Never mix the rotating 2D LightDepth grid back into the final render.
+	// Current is already the persistent, frame-rate-independent CPU temporal EMA.
+	// Blending the retained GPU A/B pair here would filter it twice and add ghosting.
+	return currentVertexVisibility >= 0.0 ? saturate(currentVertexVisibility) : currentVertexVisibility;
+}
+
+// Check if a leaf cluster is visible using the visibility bitmap
+bool IsClusterVisible(uint clusterIndex)
+{
+	uint bitmapIndex = clusterIndex / 32;
+	uint bitMask = 1u << (clusterIndex % 32);
+	return (ClusterVisibilityBitmap[bitmapIndex] & bitMask) != 0;
+}
+
+// Check if a parent cluster is selected for LOD rendering
+bool IsLODClusterSelected(uint clusterIndex)
+{
+	uint bitmapIndex = clusterIndex / 32;
+	uint bitMask = 1u << (clusterIndex % 32);
+	return (LODClusterSelectedBitmap[bitmapIndex] & bitMask) != 0;
+}
+
+
+float3 SelectRawSplatAxisNormal(float4 rotation, float3 scale, float3x3 localToWorldRot)
+{
+	// Surface-like 3DGS splats usually have one much thinner covariance axis.
+	// Use the smallest local scale axis as an approximate normal.
+	float3 localNormal = float3(1.0, 0.0, 0.0);
+	if (scale.y <= scale.x && scale.y <= scale.z)
+	{
+		localNormal = float3(0.0, 1.0, 0.0);
+	}
+	else if (scale.z <= scale.x && scale.z <= scale.y)
+	{
+		localNormal = float3(0.0, 0.0, 1.0);
+	}
+
+	float3 localRotatedNormal = QuatRotateVector(rotation, localNormal);
+	return normalize(mul(localRotatedNormal, localToWorldRot));
+}
+
+float4 LoadProxyNormal(float3 localPosition)
+{
+	uint cacheStatus = (uint)round(ProxyNormalGridDimensionsStatus.w);
+	uint3 gridDimensions = (uint3)max(round(ProxyNormalGridDimensionsStatus.xyz), float3(0.0, 0.0, 0.0));
+	float cellSize = ProxyNormalGridMinCellSize.w;
+	if (ProxyNormalParams.x < 0.5 || cacheStatus != 1u || ProxyNormalGridCount == 0u || cellSize <= 0.0 || any(gridDimensions == uint3(0u, 0u, 0u)))
+	{
+		return float4(0.0, 0.0, 1.0, 0.0);
+	}
+	float3 relativePosition = (localPosition - ProxyNormalGridMinCellSize.xyz) / cellSize;
+	int3 baseCell = (int3)floor(relativePosition);
+	float3 cellFraction = saturate(relativePosition - floor(relativePosition));
+	if (any(baseCell < int3(0, 0, 0)) || baseCell.x >= (int)gridDimensions.x || baseCell.y >= (int)gridDimensions.y || baseCell.z >= (int)gridDimensions.z)
+	{
+		return float4(0.0, 0.0, 1.0, 0.0);
+	}
+
+	// Interpolate the normal cache instead of snapping every splat to one voxel.
+	// Nearest-cell lookup produced long, axis-aligned lighting/shadow bands on
+	// broad ground surfaces. Confidence-weighted trilinear filtering keeps empty
+	// proxy cells from pulling a valid surface normal toward the default value.
+	float3 accumulatedNormal = float3(0.0, 0.0, 0.0);
+	float accumulatedConfidence = 0.0;
+	float accumulatedWeight = 0.0;
+	[unroll]
+	for (int zOffset = 0; zOffset <= 1; ++zOffset)
+	{
+		[unroll]
+		for (int yOffset = 0; yOffset <= 1; ++yOffset)
+		{
+			[unroll]
+			for (int xOffset = 0; xOffset <= 1; ++xOffset)
+			{
+				int3 cell = baseCell + int3(xOffset, yOffset, zOffset);
+				if (any(cell < int3(0, 0, 0)) ||
+					cell.x >= (int)gridDimensions.x ||
+					cell.y >= (int)gridDimensions.y ||
+					cell.z >= (int)gridDimensions.z)
+				{
+					continue;
+				}
+
+				float3 cornerWeight3 = lerp(1.0 - cellFraction, cellFraction, float3(xOffset, yOffset, zOffset));
+				float cornerWeight = cornerWeight3.x * cornerWeight3.y * cornerWeight3.z;
+				uint cellID = (uint)cell.x + gridDimensions.x * ((uint)cell.y + gridDimensions.y * (uint)cell.z);
+				if (cellID >= ProxyNormalGridCount)
+				{
+					continue;
+				}
+
+				uint2 packed = ProxyNormalGridBuffer[cellID];
+				float4 encoded = float4(UnpackHalf2x16(packed.x), UnpackHalf2x16(packed.y));
+				float confidence = saturate(encoded.a);
+				float validWeight = cornerWeight * confidence;
+				accumulatedNormal += (encoded.rgb * 2.0 - 1.0) * validWeight;
+				accumulatedConfidence += confidence * cornerWeight;
+				accumulatedWeight += cornerWeight;
+			}
+		}
+	}
+
+	if (accumulatedConfidence <= 0.0001 || dot(accumulatedNormal, accumulatedNormal) <= 0.000001)
+	{
+		return float4(0.0, 0.0, 1.0, 0.0);
+	}
+
+	float3 proxyLocalNormal = normalize(accumulatedNormal);
+	float3 proxyWorldNormal = normalize(mul(proxyLocalNormal, (float3x3)LocalToWorld));
+	return float4(proxyWorldNormal, saturate(accumulatedConfidence / max(accumulatedWeight, 0.0001)));
+}
+
+float3 SelectLightingNormal(float4 rotation, float3 scale, float3x3 localToWorldRot, float3 viewDirWorld, float3 localPosition, out float proxyConfidence)
+{
+	float3 rawSplatNormal = SelectRawSplatAxisNormal(rotation, scale, localToWorldRot);
+	float3 worldUpNormal = float3(0.0, 0.0, 1.0);
+	proxyConfidence = 0.0;
+
+	if (UnrealNormalMode == 0u)
+	{
+		if (dot(rawSplatNormal, viewDirWorld) < 0.0)
+		{
+			rawSplatNormal = -rawSplatNormal;
+		}
+		return normalize(rawSplatNormal);
+	}
+	if (UnrealNormalMode == 1u)
+	{
+		return normalize(rawSplatNormal);
+	}
+	if (UnrealNormalMode == 2u)
+	{
+		return worldUpNormal;
+	}
+	if (UnrealNormalMode == 3u)
+	{
+		if (dot(rawSplatNormal, worldUpNormal) < 0.0)
+		{
+			rawSplatNormal = -rawSplatNormal;
+		}
+		return normalize(lerp(rawSplatNormal, worldUpNormal, 0.45));
+	}
+
+	float4 proxyData = LoadProxyNormal(localPosition);
+	proxyConfidence = proxyData.a;
+	float confidenceThreshold = saturate(ProxyNormalParams.z);
+	float confidenceGate = smoothstep(confidenceThreshold, min(confidenceThreshold + 0.25, 1.0), proxyConfidence);
+	float3 proxyNormal = normalize(proxyData.xyz);
+	// The proxy mesh owns the stable surface orientation. Align the ambiguous
+	// covariance axis to the proxy, never the proxy to the per-splat sign.
+	if (dot(rawSplatNormal, proxyNormal) < 0.0)
+	{
+		rawSplatNormal = -rawSplatNormal;
+	}
+	if (UnrealNormalMode == 4u)
+	{
+		return normalize(lerp(rawSplatNormal, proxyNormal, confidenceGate));
+	}
+
+	// Hybrid proxy: preserve covariance detail where the proxy cache is weak and
+	// reduce proxy influence on strongly green foliage later in ProcessSplat.
+	float proxyBlend = saturate(ProxyNormalParams.y) * confidenceGate;
+	return normalize(lerp(rawSplatNormal, proxyNormal, proxyBlend));
+}
+
+float WrappedNdotL(float3 normal, float3 L)
+{
+	float raw = dot(normal, L);
+	float wrap = saturate(UnrealLightWrap);
+	return saturate((raw + wrap) / max(1.0 + wrap, 0.001));
+}
+
+// Decode the trained/display-referred GS color once, before any lighting math.
+// Values above 1.0 are intentionally preserved for HDR highlights.
+float3 SRGBToSceneLinearExact(float3 color)
+{
+	color = max(color, 0.0);
+	float3 low = color / 12.92;
+	float3 high = pow(max((color + 0.055) / 1.055, 0.0), 2.4);
+	return lerp(low, high, step(0.04045, color));
+}
+
+float3 SceneLinearToSRGBExact(float3 color)
+{
+	color = max(color, 0.0);
+	float3 low = color * 12.92;
+	float3 high = 1.055 * pow(color, 1.0 / 2.4) - 0.055;
+	return lerp(low, high, step(0.0031308, color));
+}
+
+float SceneLinearLuminance(float3 color)
+{
+	return max(dot(max(color, 0.0), float3(0.2126, 0.7152, 0.0722)), 0.0);
+}
+
+// v2798: real whole-image solar-phase chroma for the baked GS carrier.
+// Preserve luminance to avoid a second exposure curve; only hue follows golden hour,
+// the orange/red horizon and blue hour. Source/originalLinear is never rewritten.
+float3 ApplyTimeOfDayHueGrade(float3 sourceColor)
+{
+	float weight = saturate(TimeOfDayGradeTint.w);
+	if (weight <= 0.0001)
+	{
+		return max(sourceColor, 0.0);
+	}
+	float3 source = max(sourceColor, 0.0);
+	float sourceLuma = max(SceneLinearLuminance(source), 1.0e-5);
+	float3 tint = max(TimeOfDayGradeTint.rgb, float3(0.001, 0.001, 0.001));
+	float tintLuma = max(dot(tint, float3(0.2126, 0.7152, 0.0722)), 1.0e-4);
+	tint /= tintLuma;
+	float3 tinted = source * tint;
+	float tintedLuma = max(SceneLinearLuminance(tinted), 1.0e-5);
+	tinted *= sourceLuma / tintedLuma;
+	return max(lerp(source, tinted, weight), 0.0);
+}
+
+void GetPrimaryDirectionalLighting(
+	float3 lightingNormal,
+	out float outFacing,
+	out float outWeight,
+	out float3 outTint)
+{
+	outFacing = 0.0;
+	outWeight = 0.0;
+	outTint = float3(1.0, 1.0, 1.0);
+
+	[loop]
+	for (uint lightIndex = 0u; lightIndex < UnrealLightCount && lightIndex < 8u; ++lightIndex)
+	{
+		// Type 0 is the collected Unreal Directional Light.
+		if (UnrealLightDirectionType[lightIndex].w >= 0.5)
+		{
+			continue;
+		}
+
+		float weight = max(UnrealLightColorIntensity[lightIndex].w, 0.0);
+		if (weight <= outWeight)
+		{
+			continue;
+		}
+
+		float3 lightDirection = normalize(UnrealLightDirectionType[lightIndex].xyz);
+		float3 lightColor = max(UnrealLightColorIntensity[lightIndex].rgb, 0.0);
+		float lightLuma = max(SceneLinearLuminance(lightColor), 0.001);
+		outWeight = weight;
+		outFacing = WrappedNdotL(lightingNormal, lightDirection);
+		outTint = clamp(lightColor / lightLuma, 0.72, 1.35);
+	}
+}
+
+
+void GetStrongestDirectionalState(
+	out float3 outSurfaceToLight,
+	out float3 outTint,
+	out float outWeight)
+{
+	outSurfaceToLight = float3(0.0, 0.0, 1.0);
+	outTint = float3(1.0, 1.0, 1.0);
+	outWeight = 0.0;
+	[unroll(8)]
+	for (uint lightIndex = 0u; lightIndex < 8u; ++lightIndex)
+	{
+		if (lightIndex >= UnrealLightCount || UnrealLightDirectionType[lightIndex].w >= 0.5)
+		{
+			continue;
+		}
+		float weight = max(UnrealLightColorIntensity[lightIndex].w, 0.0);
+		if (weight <= outWeight)
+		{
+			continue;
+		}
+		float3 lightColor = max(UnrealLightColorIntensity[lightIndex].rgb, 0.0);
+		float lightLuma = max(SceneLinearLuminance(lightColor), 0.001);
+		outSurfaceToLight = normalize(UnrealLightDirectionType[lightIndex].xyz);
+		outTint = clamp(lightColor / lightLuma, 0.65, 1.45);
+		outWeight = weight;
+	}
+}
+
+float3 NormalizeGaussianLightTint(float3 tint)
+{
+	float3 safeTint = max(tint, 0.001);
+	return safeTint / max(SceneLinearLuminance(safeTint), 0.001);
+}
+
+// Gaussian-native light effects use a broad solar-presence fade.  The previous
+// v21 hard gate started at z=0 and therefore returned exactly zero for a
+// horizontal Directional Light (Pitch 0), which made both new effects appear
+// completely disconnected.  Sunlight remains present around the horizon, but
+// fades to zero once the light is clearly below it.
+float ComputeGaussianSunPresence(float3 surfaceToLight)
+{
+	// v2816: broad, double-smoothed celestial phase. The old narrow -0.12..0.10
+	// window made direct energy change too quickly around sunrise/sunset.
+	float z = normalize(surfaceToLight).z;
+	float phase = smoothstep(-0.22, 0.18, z);
+	return phase * phase * (3.0 - 2.0 * phase);
+}
+
+float ComputeGaussianVegetationMaterialMask(float3 trainedSrgb)
+{
+	float3 color01 = saturate(SRGBToSceneLinearExact(trainedSrgb));
+	float colorMax = max(color01.r, max(color01.g, color01.b));
+	float colorMin = min(color01.r, min(color01.g, color01.b));
+	float saturation = colorMax > 1e-5 ? (colorMax - colorMin) / colorMax : 0.0;
+	float3 sourceFrom = saturate(SeasonalSourceColorFrom.rgb);
+	float3 sourceTo = saturate(SeasonalSourceColorTo.rgb);
+	float3 sourceAxis = sourceTo - sourceFrom;
+	float sourceAxisLength2 = max(dot(sourceAxis, sourceAxis), 1e-5);
+	float rangePosition = saturate(dot(color01 - sourceFrom, sourceAxis) / sourceAxisLength2);
+	float3 closestSourceColor = lerp(sourceFrom, sourceTo, rangePosition);
+	float tolerance = clamp(SeasonalColorSelectParams.y, 0.04, 0.40);
+	float feather = clamp(SeasonalColorSelectParams.z, 0.02, min(tolerance, 0.12));
+	float rangeMask = 1.0 - smoothstep(max(tolerance - feather, 0.0), tolerance, length(color01 - closestSourceColor));
+	float saturationMask = smoothstep(max(SeasonalColorSelectParams.w, 0.12), min(max(SeasonalColorSelectParams.w, 0.12) + 0.12, 1.0), saturation);
+	float greenEvidence = smoothstep(0.0, 0.055, color01.g - color01.b)
+		* smoothstep(-0.035, 0.045, color01.g - color01.r);
+	float yellowLeafEvidence = smoothstep(0.12, 0.32, saturation)
+		* smoothstep(0.02, 0.20, max(color01.r, color01.g) - color01.b)
+		* smoothstep(0.68, 1.05, color01.g / max(color01.r, 0.03));
+	float neutralHighlight = smoothstep(0.72, 0.94, colorMax) * (1.0 - smoothstep(0.18, 0.34, saturation));
+	return saturate(rangeMask * saturationMask * max(greenEvidence, yellowLeafEvidence * 0.72) * (1.0 - neutralHighlight));
+}
+
+float3 ComputeGaussianSunAccent(
+	float3 approximateAlbedo,
+	float3 lightingNormal)
+{
+	if (GaussianSunAccentParams0.x < 0.5 || GaussianSunAccentParams0.y <= 0.0001)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+	float3 surfaceToLight;
+	float3 liveTint;
+	float lightWeight;
+	GetStrongestDirectionalState(surfaceToLight, liveTint, lightWeight);
+	float horizonGate = ComputeGaussianSunPresence(surfaceToLight);
+	if (lightWeight <= 0.0001 || horizonGate <= 0.0001)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+	float startFacing = saturate(GaussianSunAccentParams0.z);
+	float fullFacing = max(GaussianSunAccentParams0.w, startFacing + 0.001);
+	float gaussianFacing = saturate(dot(normalize(lightingNormal), surfaceToLight)) * horizonGate;
+	float accentMask = smoothstep(startFacing, fullFacing, gaussianFacing);
+	accentMask = pow(saturate(accentMask), max(GaussianSunAccentParams1.x, 0.25));
+	float sourceLuma = max(SceneLinearLuminance(approximateAlbedo), 1e-5);
+	float compressedLuma = sourceLuma / (1.0 + sourceLuma * max(GaussianSunAccentParams1.z, 0.0));
+	float3 sourceHue = max(approximateAlbedo, 0.0) / sourceLuma;
+	float3 carrier = lerp(compressedLuma.xxx, sourceHue * compressedLuma, saturate(GaussianSunAccentParams1.w));
+	float3 authoredTint = NormalizeGaussianLightTint(GaussianSunAccentTint.rgb);
+	float3 finalTint = NormalizeGaussianLightTint(liveTint * lerp(float3(1.0, 1.0, 1.0), authoredTint, saturate(GaussianSunAccentParams1.y)));
+	float energy = max(GaussianSunAccentParams0.y, 0.0)
+		* min(sqrt(max(lightWeight, 0.0)), 2.5)
+		* accentMask * horizonGate;
+	return max(carrier * finalTint * energy, 0.0);
+}
+
+float3 ComputeGaussianPlantTransmission(
+	float3 approximateAlbedo,
+	float3 lightingNormal,
+	float3 viewDirection,
+	float vegetationMask)
+{
+	if (GaussianPlantTransmissionParams0.x < 0.5 || GaussianPlantTransmissionParams0.y <= 0.0001 || vegetationMask <= 0.0001)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+	float3 surfaceToLight;
+	float3 liveTint;
+	float lightWeight;
+	GetStrongestDirectionalState(surfaceToLight, liveTint, lightWeight);
+	float horizonGate = ComputeGaussianSunPresence(surfaceToLight);
+	if (lightWeight <= 0.0001 || horizonGate <= 0.0001)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+	float backFacing = saturate(-dot(normalize(lightingNormal), surfaceToLight));
+	float startFacing = saturate(GaussianPlantTransmissionParams0.z);
+	float fullFacing = max(GaussianPlantTransmissionParams0.w, startFacing + 0.001);
+	float backMask = smoothstep(startFacing, fullFacing, backFacing);
+	backMask = pow(saturate(backMask), max(GaussianPlantTransmissionParams1.x, 0.25));
+	float viewPhase = pow(
+		saturate(dot(normalize(viewDirection), -surfaceToLight)),
+		max(GaussianPlantTransmissionParams1.w, 0.25));
+	float phaseWeight = lerp(0.28, 1.0, viewPhase);
+	float mask = saturate(vegetationMask) * backMask * phaseWeight * horizonGate;
+	if (mask <= 0.0001)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+	float sourceLuma = max(SceneLinearLuminance(approximateAlbedo), 1e-5);
+	float carrierLuma = sourceLuma / (1.0 + sourceLuma * 0.65);
+	float3 sourceAtLuma = max(approximateAlbedo, 0.0) * (carrierLuma / sourceLuma);
+	float3 carrier = lerp(carrierLuma.xxx, sourceAtLuma, clamp(GaussianPlantTransmissionParams1.z, 0.0, 2.0));
+	float3 authoredTint = NormalizeGaussianLightTint(GaussianPlantTransmissionTint.rgb);
+	float3 finalTint = NormalizeGaussianLightTint(liveTint * lerp(float3(1.0, 1.0, 1.0), authoredTint, saturate(GaussianPlantTransmissionParams1.y)));
+	float energy = max(GaussianPlantTransmissionParams0.y, 0.0)
+		* min(sqrt(max(lightWeight, 0.0)), 2.5)
+		* mask;
+	return max(carrier * finalTint * energy, 0.0);
+}
+
+// Strict proxy direct-light authority for the plugin-only shadow path.
+// This deliberately removes wrapped lighting, upward-normal blending, broad
+// horizon fields and any minimum-light floor. A surface is directly lit only
+// when the proxy normal faces the collected Directional Light and the sun is
+// above the world horizon.
+float ComputeExactProxyDirectionalVisibility(
+	float3 localPosition,
+	float3 fallbackNormal)
+{
+	if (ReceiveUnrealLighting == 0u || UnrealLightCount == 0u)
+	{
+		return 0.0;
+	}
+
+	float3 receiverNormal = normalize(fallbackNormal);
+	float4 proxyData = LoadProxyNormal(localPosition);
+	float confidenceThreshold = saturate(ProxyNormalParams.z);
+	if (proxyData.a >= confidenceThreshold && dot(proxyData.xyz, proxyData.xyz) > 0.01)
+	{
+		receiverNormal = normalize(proxyData.xyz);
+	}
+
+	float visibility = 0.0;
+	[loop]
+	for (uint lightIndex = 0u; lightIndex < UnrealLightCount && lightIndex < 8u; ++lightIndex)
+	{
+		if (UnrealLightDirectionType[lightIndex].w >= 0.5 ||
+			UnrealLightColorIntensity[lightIndex].w <= 0.001)
+		{
+			continue;
+		}
+
+		float3 surfaceToLight = normalize(UnrealLightDirectionType[lightIndex].xyz);
+		// A Directional Light below the world horizon must not illuminate the
+		// proxy from underneath. Use a tiny transition only to avoid a one-frame pop.
+		float horizonGate = smoothstep(-0.08, 0.10, surfaceToLight.z);
+		float exactFacing = saturate(dot(receiverNormal, surfaceToLight));
+		visibility = max(visibility, exactFacing * horizonGate);
+	}
+
+	return saturate(visibility);
+}
+
+// Camera-independent receiver signal reserved for the light-space proxy-shadow
+// path. Missing proxy-normal cells use one coherent world-up fallback instead of
+// each splat's covariance axis; confidence is blended continuously so broad floor
+// regions cannot turn into alternating normal/shadow stripes.
+float ComputeStableProxyReceiverSignal(float3 localPosition)
+{
+	if (ReceiveUnrealLighting == 0u || UnrealLightCount == 0u)
+	{
+		return 0.0;
+	}
+
+	float4 proxyData = LoadProxyNormal(localPosition);
+	float confidenceThreshold = saturate(ProxyNormalParams.z);
+	float confidenceStart = max(0.01, confidenceThreshold * 0.35);
+	float confidenceEnd = min(max(confidenceThreshold + 0.20, confidenceStart + 0.05), 1.0);
+	float confidenceGate = smoothstep(
+		confidenceStart, confidenceEnd, saturate(proxyData.a));
+	float3 proxyNormal = (dot(proxyData.xyz, proxyData.xyz) > 0.01)
+		? normalize(proxyData.xyz)
+		: float3(0.0, 0.0, 1.0);
+	float3 receiverNormal = normalize(lerp(
+		float3(0.0, 0.0, 1.0), proxyNormal, confidenceGate));
+
+	float visibility = 0.0;
+	[loop]
+	for (uint lightIndex = 0u; lightIndex < UnrealLightCount && lightIndex < 8u; ++lightIndex)
+	{
+		if (UnrealLightDirectionType[lightIndex].w >= 0.5 ||
+			UnrealLightColorIntensity[lightIndex].w <= 0.001)
+		{
+			continue;
+		}
+		float3 surfaceToLight = normalize(UnrealLightDirectionType[lightIndex].xyz);
+		float horizonGate = smoothstep(-0.08, 0.10, surfaceToLight.z);
+		visibility = max(
+			visibility,
+			saturate(dot(receiverNormal, surfaceToLight)) * horizonGate);
+	}
+	return saturate(visibility);
+}
+
+float4 LoadSpatialBakedLighting(float3 localPosition, out uint spatialCellID)
+{
+	spatialCellID = 0u;
+	uint cacheStatus = (uint)round(SpatialLightingGridDimensionsStatus.w);
+	uint3 gridDimensions = (uint3)max(round(SpatialLightingGridDimensionsStatus.xyz), float3(0.0, 0.0, 0.0));
+	float cellSize = SpatialLightingGridMinCellSize.w;
+	if (cacheStatus != 1u || ClusterLightingCount == 0u || cellSize <= 0.0 || any(gridDimensions == uint3(0u, 0u, 0u)))
+	{
+		return float4(1.0, 1.0, 1.0, 0.0);
+	}
+
+	float3 relativePosition = (localPosition - SpatialLightingGridMinCellSize.xyz) / cellSize;
+	int3 cell = (int3)floor(relativePosition);
+	if (any(cell < int3(0, 0, 0)) || cell.x >= (int)gridDimensions.x || cell.y >= (int)gridDimensions.y || cell.z >= (int)gridDimensions.z)
+	{
+		return float4(1.0, 1.0, 1.0, 0.0);
+	}
+
+	spatialCellID = (uint)cell.x + gridDimensions.x * ((uint)cell.y + gridDimensions.y * (uint)cell.z);
+	if (spatialCellID >= ClusterLightingCount)
+	{
+		return float4(1.0, 1.0, 1.0, 0.0);
+	}
+	uint2 packed = ClusterLightingBuffer[spatialCellID];
+	return float4(UnpackHalf2x16(packed.x), UnpackHalf2x16(packed.y));
+}
+
+float3 ApplySpatialDelighting(
+	float3 originalLinear,
+	float3 fallbackApproxAlbedo,
+	float3 localPosition,
+	out float3 bakedLightingEstimate,
+	out float spatialConfidence,
+	out float correctionWeight,
+	out uint spatialCellID)
+{
+	float4 cached = LoadSpatialBakedLighting(localPosition, spatialCellID);
+	bakedLightingEstimate = max(cached.rgb, 0.001);
+	spatialConfidence = saturate(cached.a);
+	correctionWeight = 0.0;
+
+	if (SpatialDelightingParams0.x < 0.5 || spatialConfidence <= 0.0)
+	{
+		return fallbackApproxAlbedo;
+	}
+
+	float originalLuma = max(SceneLinearLuminance(originalLinear), 0.001);
+	float lightingLuma = max(SceneLinearLuminance(bakedLightingEstimate), 0.001);
+	float3 lightingTint = bakedLightingEstimate / lightingLuma;
+	lightingTint = lerp(float3(1.0, 1.0, 1.0), lightingTint, saturate(SpatialDelightingParams0.z));
+
+	// The cache stores a relative low-frequency lighting factor around 1.0.
+	// Only cells with enough broad EV deviation from neutral are considered evidence
+	// of baked illumination; material brightness alone should not trigger correction.
+	float lightingDeviationEV = abs(log2(lightingLuma));
+	float evidenceMinEV = max(SpatialDelightingParams3.x, 0.0);
+	float evidenceMaxEV = max(SpatialDelightingParams3.y, evidenceMinEV + 0.001);
+	float bakedEvidence = smoothstep(evidenceMinEV, evidenceMaxEV, lightingDeviationEV);
+
+	float minLighting = clamp(SpatialDelightingParams0.w, 0.25, 1.0);
+	float maxLighting = max(SpatialDelightingParams1.x, minLighting);
+	float maxShadowLift = clamp(SpatialDelightingParams4.x, 1.0, 2.0);
+	float minHighlightRetention = clamp(SpatialDelightingParams4.y, 0.50, 1.0);
+
+	// Baked shadow removal and baked highlight suppression have independent safety
+	// bounds. Shadows cannot be lifted by more than maxShadowLift, and highlights
+	// cannot be reduced below minHighlightRetention of the trained brightness.
+	float boundedLightingLuma = clamp(lightingLuma, minLighting, maxLighting);
+	if (boundedLightingLuma < 1.0)
+	{
+		boundedLightingLuma = max(boundedLightingLuma, rcp(maxShadowLift));
+	}
+	else
+	{
+		boundedLightingLuma = min(boundedLightingLuma, rcp(minHighlightRetention));
+	}
+	float3 boundedLighting = clamp(lightingTint * boundedLightingLuma, minLighting.xxx, maxLighting.xxx);
+
+	float darkGate = smoothstep(0.015, 0.18, originalLuma);
+	float protectedDarkGate = lerp(1.0, darkGate, saturate(SpatialDelightingParams1.y));
+	float greenDominance = saturate((originalLinear.g - max(originalLinear.r, originalLinear.b)) / max(originalLuma, 0.03));
+	float foliageProtection = saturate(SpatialDelightingParams2.x);
+	float foliageCorrectionScale = saturate(SpatialDelightingParams3.w);
+	float foliageGate = lerp(1.0, foliageCorrectionScale, greenDominance * foliageProtection);
+
+	float rawCorrectionWeight = saturate(SpatialDelightingParams0.y)
+		* saturate(UnrealRelightParams.z)
+		* spatialConfidence
+		* bakedEvidence
+		* protectedDarkGate
+		* foliageGate;
+	float maxCorrectionWeight = saturate(SpatialDelightingParams3.z);
+	correctionWeight = min(rawCorrectionWeight, maxCorrectionWeight);
+
+	float3 reconstructed = originalLinear / boundedLighting;
+	float reconstructedLuma = SceneLinearLuminance(reconstructed);
+	float maxAlbedoLuma = max(SpatialDelightingParams1.z, 0.25);
+	if (reconstructedLuma > maxAlbedoLuma)
+	{
+		reconstructed *= maxAlbedoLuma / max(reconstructedLuma, 0.001);
+		reconstructedLuma = maxAlbedoLuma;
+	}
+
+	// Preserve trained material chroma while allowing broad luminance removal.
+	float3 originalTint = originalLinear / max(originalLuma, 0.02);
+	float3 reconstructedTint = reconstructed / max(reconstructedLuma, 0.02);
+	float maxTintScale = max(SpatialDelightingParams2.y, 1.0);
+	reconstructedTint = clamp(
+		reconstructedTint,
+		originalTint / maxTintScale,
+		originalTint * maxTintScale);
+	reconstructed = max(reconstructedTint * reconstructedLuma, 0.0);
+
+	// No-evidence areas retain the existing bounded legacy approximation instead of
+	// reverting to the raw trained color. This prevents enabling spatial de-lighting
+	// from changing the entire scene even when the spatial correction weight is zero.
+	return lerp(fallbackApproxAlbedo, reconstructed, correctionWeight);
+}
+
+float3 EstimateBoundedApproxAlbedo(
+	float3 originalLinear,
+	float directionalFacing)
+{
+	if (UnrealRelightParams.x < 0.5)
+	{
+		return originalLinear;
+	}
+
+	float luma = SceneLinearLuminance(originalLinear);
+	float maxChannel = max(max(originalLinear.r, originalLinear.g), originalLinear.b);
+	float minChannel = min(min(originalLinear.r, originalLinear.g), originalLinear.b);
+	float chroma = saturate((maxChannel - minChannel) / max(luma, 0.045));
+	float bakedShadowSignal = 1.0 - smoothstep(0.040, 0.24, luma);
+	float bakedHighlightSignal = smoothstep(0.34, 1.18, luma) * lerp(0.48, 1.0, directionalFacing);
+
+	// Color Fix 2: treat bright, sun-facing and low-chroma regions as likely
+	// baked illumination. This does not claim to reconstruct true albedo; it only
+	// creates enough headroom for the replacement direct-light/shadow layer.
+	float paleSurfaceConfidence = lerp(0.62, 1.0, 1.0 - chroma);
+	float bakedSunMask = smoothstep(0.28, 1.05, luma)
+		* smoothstep(0.08, 0.82, directionalFacing)
+		* paleSurfaceConfidence;
+
+	// Bounded correction prevents shadow noise and saturated foliage from exploding.
+	float lift = bakedShadowSignal * saturate(UnrealRelightParams.w);
+	float reduction = bakedHighlightSignal * saturate(UnrealRelightLookParams.x);
+	// Give the full public range enough authority to remove a captured highlight;
+	// zero remains neutral and the existing confidence mask prevents a global dim.
+	float bakedSunReduction = bakedSunMask * saturate(UnrealRelightDetailParams.x) * 0.88;
+	float correction = clamp(1.0 + lift - reduction - bakedSunReduction, 0.48, 1.34);
+	float3 estimate = max(originalLinear * correction, 0.0);
+
+	// Keep very bright trained highlights within a stable HDR range without clipping.
+	float estimateLuma = SceneLinearLuminance(estimate);
+	float softCeiling = 1.38 + 0.22 * directionalFacing;
+	if (estimateLuma > softCeiling)
+	{
+		estimate *= softCeiling / max(estimateLuma, 0.001);
+	}
+
+	return lerp(originalLinear, estimate, saturate(UnrealRelightParams.z));
+}
+
+float3 ComputeBoundedDirectionalLightContribution(
+	float3 approximateAlbedo,
+	float3 lightingNormal,
+	float lightVisibility)
+{
+	if (ReceiveUnrealLighting == 0u || UnrealLightCount == 0u)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+
+	float strongestFacing;
+	float strongestWeight;
+	float3 strongestTint;
+	GetPrimaryDirectionalLighting(lightingNormal, strongestFacing, strongestWeight, strongestTint);
+
+	if (strongestWeight <= 0.0)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+
+	// lightVisibility is now the exact proxy-normal N.L and horizon gate. Do not
+	// reconstruct another wrapped/broadened light direction here.
+	float sunFacing = saturate(lightVisibility);
+	if (sunFacing <= 0.0001)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+
+	// Direct sun is independent from the optional de-lighting core. Disabling
+	// captured-light removal must not silently disconnect the real-time sun UI.
+	float3 warmTint = max(UnrealRelightSunTint.rgb, 0.0) * strongestTint;
+	// Preserve the full normalized Unreal light energy. Its user-facing scale
+	// already controls the range; do not silently saturate it here.
+	float lightEnergy = sqrt(max(strongestWeight, 0.0));
+	float directEnergy = lightEnergy * max(UnrealRelightSunTint.w, 0.0);
+	directEnergy *= clamp(UnrealLightingInfluence, 0.0, 4.0) * sunFacing;
+
+	// Compress, rather than eliminate, illumination on already bright capture
+	// colors. The source color remains the carrier, preventing a white overlay.
+	float albedoLuma = SceneLinearLuminance(approximateAlbedo);
+	float highlightProtection = lerp(1.0, 0.62, smoothstep(0.65, 1.55, albedoLuma));
+	directEnergy *= highlightProtection;
+
+	return max(approximateAlbedo * warmTint * directEnergy, 0.0);
+}
+
+// Point, Spot and Rect lights are collected separately from the production
+// Directional/Stable-shadow authority. They do not cast the Stable sun shadow,
+// but they must still illuminate each splat using its world-space position.
+float3 ComputeLocalLightContribution(
+	float3 worldPosition,
+	float3 approximateAlbedo,
+	float3 lightingNormal)
+{
+	if (ReceiveUnrealLighting == 0u || UnrealLightCount == 0u)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+
+	float3 result = float3(0.0, 0.0, 0.0);
+	[loop]
+	for (uint lightIndex = 0u; lightIndex < UnrealLightCount && lightIndex < 8u; ++lightIndex)
+	{
+		float type = UnrealLightDirectionType[lightIndex].w;
+		if (type < 0.5)
+		{
+			continue;
+		}
+
+		float3 toLight = UnrealLightPositionRadius[lightIndex].xyz - worldPosition;
+		float distanceToLight = length(toLight);
+		float radius = max(UnrealLightPositionRadius[lightIndex].w, 1.0);
+		if (distanceToLight >= radius)
+		{
+			continue;
+		}
+
+		float3 L = toLight / max(distanceToLight, 0.001);
+		float attenuation = saturate(1.0 - distanceToLight / radius);
+		attenuation *= attenuation;
+
+		// Spot type = 2. The CPU stores the emitted forward direction and
+		// cos(inner/outer) in LightConeAngles. Point and Rect use radial falloff;
+		// Rect remains a bounded approximation until area-light sampling is added.
+		if (type >= 1.5 && type < 2.5)
+		{
+			float3 emittedDirection = normalize(UnrealLightDirectionType[lightIndex].xyz);
+			float coneCos = dot(emittedDirection, -L);
+			float innerCos = UnrealLightConeAngles[lightIndex].x;
+			float outerCos = UnrealLightConeAngles[lightIndex].y;
+			attenuation *= smoothstep(outerCos, max(innerCos, outerCos + 0.0001), coneCos);
+		}
+
+		float facing = saturate(dot(normalize(lightingNormal), L));
+		float energy = max(UnrealLightColorIntensity[lightIndex].w, 0.0)
+			* attenuation * facing * clamp(UnrealLightingInfluence, 0.0, 4.0);
+		result += approximateAlbedo * max(UnrealLightColorIntensity[lightIndex].rgb, 0.0) * energy;
+	}
+
+	return max(result, 0.0);
+}
+
+
+float3 ApplyBoundedIndirectLightGrade(
+	float3 baseColor,
+	float3 worldNormal,
+	float lightVisibility)
+{
+	if (ReceiveUnrealLighting == 0)
+	{
+		return baseColor;
+	}
+
+	float indirectStrength = saturate(UnrealIndirectLightParams.x);
+	float groundBounce = saturate(UnrealIndirectLightParams.y);
+	float skyFacing = saturate(worldNormal.z * 0.5 + 0.5);
+	float groundFacing = saturate(-worldNormal.z);
+	float litGate = smoothstep(0.18, 0.78, saturate(lightVisibility));
+
+	float skyFill = indirectStrength * (0.28 + 0.72 * skyFacing);
+	float groundFill = groundBounce * (0.20 + 0.80 * groundFacing);
+	float totalFill = min((skyFill + groundFill) * litGate, 0.32);
+
+	float3 shadowTint = max(UnrealIndirectShadowTint.rgb, float3(0.001, 0.001, 0.001));
+	float tintLuma = max(SceneLinearLuminance(shadowTint), 0.001);
+	shadowTint /= tintLuma;
+	float3 warmGroundTint = float3(1.08, 0.96, 0.84);
+	float groundMix = saturate(groundFill / max(skyFill + groundFill, 0.001));
+	float3 indirectTint = lerp(shadowTint, warmGroundTint, groundMix);
+
+	float tintAmount = min(totalFill * 0.35, 0.18);
+	float3 gradedColor = baseColor * lerp(float3(1.0, 1.0, 1.0), indirectTint, tintAmount);
+	gradedColor *= 1.0 + totalFill;
+
+	float shadowLightingEnabled = step(0.5, UnrealIndirectLightParams.w);
+	float3 shadowColor = lerp(baseColor, gradedColor, shadowLightingEnabled);
+	return max(lerp(shadowColor, gradedColor, litGate), 0.0);
+}
+
+float3 ComputeRelitIndirectBase(
+	float3 originalLinear,
+	float3 approximateAlbedo,
+	float3 worldNormal,
+	float lightVisibility)
+{
+	if (ReceiveUnrealLighting == 0u)
+	{
+		return max(originalLinear, 0.0);
+	}
+
+	if (UnrealRelightParams.x < 0.5)
+	{
+		return ApplyBoundedIndirectLightGrade(
+			originalLinear, worldNormal, lightVisibility);
+	}
+
+	float skyFacing = saturate(worldNormal.z * 0.5 + 0.5);
+	float groundFacing = saturate(-worldNormal.z);
+
+	float3 ambientTint = max(UnrealAmbientColorIntensity.rgb, 0.0);
+	float ambientEnergy = max(UnrealAmbientColorIntensity.w, 0.0);
+	float3 skyTint = max(UnrealRelightSkyTint.rgb, 0.0);
+	float skyEnergy = saturate(UnrealIndirectLightParams.x) * (0.24 + 0.76 * skyFacing);
+	float3 groundTint = float3(1.10, 0.91, 0.72);
+	float groundEnergy = saturate(UnrealIndirectLightParams.y) * (0.18 + 0.82 * groundFacing);
+
+	float3 illumination = ambientTint * ambientEnergy;
+	illumination += skyTint * skyEnergy;
+	illumination += groundTint * groundEnergy;
+	illumination = clamp(illumination, 0.08, 1.35);
+
+	float3 relitIndirect = approximateAlbedo * illumination;
+
+	// Color grading is intentionally deferred until Base+Indirect and the
+	// proxy-shadowed Direct term have been combined in the pixel shader.
+	// Applying the target look here made the direct layer bypass the grade and
+	// produced the washed-out result seen in the first v0.9.2 test.
+	return max(lerp(originalLinear, relitIndirect, saturate(UnrealRelightParams.y)), 0.0);
+}
+
+
+float Hash13(float3 p)
+{
+	p = frac(p * 0.1031);
+	p += dot(p, p.yzx + 33.33);
+	return frac((p.x + p.y) * p.z);
+}
+
+float Hash21(float2 p)
+{
+	float3 p3 = frac(float3(p.xyx) * 0.1031);
+	p3 += dot(p3, p3.yzx + 33.33);
+	return frac((p3.x + p3.y) * p3.z);
+}
+
+float ValueNoise2D(float2 uv)
+{
+	float2 i = floor(uv);
+	float2 f = frac(uv);
+	f = f * f * (3.0 - 2.0 * f);
+	float a = Hash21(i + float2(0.0, 0.0));
+	float b = Hash21(i + float2(1.0, 0.0));
+	float c = Hash21(i + float2(0.0, 1.0));
+	float d = Hash21(i + float2(1.0, 1.0));
+	return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+float3 ToneCompressCinematicSplat(float3 color)
+{
+	// The splat renderer blends in sRGB-like training space, so keep this compact and
+	// luminance based. It prevents roads and pale leaves from turning into white plates
+	// while leaving midtones mostly untouched.
+	float luma = max(dot(color, float3(0.2126, 0.7152, 0.0722)), 0.0001);
+	float over = max(luma - 0.82, 0.0);
+	float compressedLuma = 0.82 + over / (1.0 + over * 1.35);
+	return color * (compressedLuma / luma);
+}
+
+float3 PreserveHueScaleLuma(float3 baseColor, float targetLuma)
+{
+	float baseLuma = max(dot(baseColor, float3(0.2126, 0.7152, 0.0722)), 0.0001);
+	return baseColor * (targetLuma / baseLuma);
+}
+
+float3 ApplyGaussianCinematicAtmosphere(
+	float3 sceneLinearColor,
+	float3 worldPos,
+	float lightMask,
+	float3 directionalLightTint,
+	out float atmosphereTransmission,
+	out float3 shadowableBloomLinear)
+{
+	float4 atmosphereGrade = UnrealLightConeAngles[6];
+	float4 atmosphereHighlight = UnrealLightConeAngles[7];
+	bool hasPackedAtmosphere = atmosphereGrade.x >= 0.0 && atmosphereGrade.y >= 0.0 && atmosphereHighlight.x >= 0.0;
+
+	float atmosphereStrength = hasPackedAtmosphere ? clamp(UnrealShadowParams2.w, 0.0, 2.0) : 0.75;
+	if (atmosphereStrength <= 0.0001)
+	{
+		atmosphereTransmission = 1.0;
+		shadowableBloomLinear = float3(0.0, 0.0, 0.0);
+		return sceneLinearColor;
+	}
+	float groundFogDensity = hasPackedAtmosphere ? max(UnrealShadowHeight.z, 0.0) : 0.65;
+	float distanceHaze = hasPackedAtmosphere ? max(UnrealShadowHeight.w, 0.0) : 0.70;
+	float warmSunScatter = hasPackedAtmosphere ? max(atmosphereHighlight.w, 0.0) : 0.70;
+	float coolShadowTint = hasPackedAtmosphere ? saturate(atmosphereGrade.x) : 0.55;
+	float shadowCrush = hasPackedAtmosphere ? saturate(atmosphereGrade.y) : 0.35;
+	float fogDensityVariation = hasPackedAtmosphere ? saturate(atmosphereGrade.z) : 0.28;
+	float fogHeightFalloff = hasPackedAtmosphere ? max(atmosphereGrade.w, 0.1) : 1.35;
+	// Bloom-only control. Do not reuse it for grading, exposure, fog, or shadow
+	// response; doing so made a bloom adjustment alter the entire captured image.
+	// Negative Z is a V13 diagnostic sentinel. Do not alter non-bloom atmosphere
+    // controls: the original relighting, cast shadow, fog and color remain live.
+    const bool bSuppressLocalBloom = UnrealAtmosphereBloomParams.z < -99.0;
+    float highlightBloomBoost = bSuppressLocalBloom ? 0.0 : (hasPackedAtmosphere ? max(atmosphereHighlight.x, 0.0) : 0.25);
+	float sunExposureBoost = hasPackedAtmosphere ? saturate(atmosphereHighlight.y) : 0.20;
+	float shadowDesaturation = hasPackedAtmosphere ? saturate(atmosphereHighlight.z) : 0.20;
+	float farLightFade = hasPackedAtmosphere ? saturate(UnrealAtmosphereDistanceParams.x) : 0.0;
+	float farSaturationFade = hasPackedAtmosphere ? saturate(UnrealAtmosphereDistanceParams.y) : 0.0;
+	float highlightGlareScale = hasPackedAtmosphere ? max(UnrealAtmosphereDistanceParams.z, 0.0) : 1.0;
+	float colorSaturationBoost = hasPackedAtmosphere ? max(UnrealAtmosphereDistanceParams.w, 0.0) : 0.18;
+	float2 fogDistanceRange = hasPackedAtmosphere ? max(UnrealAtmosphereFogShapeParams.xy, float2(0.0, 0.01)) : float2(0.018, 0.48);
+	float2 nearAirRange = hasPackedAtmosphere ? max(UnrealAtmosphereFogShapeParams.zw, float2(0.0, 0.01)) : float2(0.010, 0.24);
+	// These four artist controls have independent ownership of fog amount and
+	// density. Older builds uploaded this vector but replaced it with constants,
+	// leaving the corresponding Details sliders with no effect.
+	float distanceFogWeight = hasPackedAtmosphere ? max(UnrealAtmosphereFogAmountParams.x, 0.0) : 0.44;
+	float nearFogWeight = hasPackedAtmosphere ? max(UnrealAtmosphereFogAmountParams.y, 0.0) : 0.16;
+	float hazeDensityMin = hasPackedAtmosphere ? max(UnrealAtmosphereFogAmountParams.z, 0.0) : 0.16;
+	float hazeDensityMax = hasPackedAtmosphere ? max(UnrealAtmosphereFogAmountParams.w, hazeDensityMin) : 0.46;
+	float2 highlightLumaGate = hasPackedAtmosphere ? UnrealAtmosphereHighlightShapeParams.xy : float2(0.66, 1.02);
+	float2 sunMaskGate = hasPackedAtmosphere ? UnrealAtmosphereHighlightShapeParams.zw : float2(0.48, 0.94);
+	float2 localBloomMaskGate = hasPackedAtmosphere ? UnrealAtmosphereBloomParams.xy : float2(0.68, 0.98);
+	float localBloomStrength = bSuppressLocalBloom ? 0.0 : (hasPackedAtmosphere ? max(UnrealAtmosphereBloomParams.z, 0.0) : 0.32);
+	float localBloomGlareMix = bSuppressLocalBloom ? 0.0 : (hasPackedAtmosphere ? max(UnrealAtmosphereBloomParams.w, 0.0) : 0.18);
+	float litAirNearWeight = hasPackedAtmosphere ? max(UnrealAtmosphereGlareParams.x, 0.0) : 0.18;
+	float litAirFarWeight = hasPackedAtmosphere ? max(UnrealAtmosphereGlareParams.y, 0.0) : 0.34;
+	float hazeGlowStrength = hasPackedAtmosphere ? max(UnrealAtmosphereGlareParams.z, 0.0) : 0.38;
+	float litAirGlowStrength = hasPackedAtmosphere ? max(UnrealAtmosphereGlareParams.w, 0.0) : 0.34;
+	float lightShaftBaseStrength = hasPackedAtmosphere ? max(UnrealAtmosphereShaftParams.x, 0.0) : 0.18;
+	float lightShaftHighlightStrength = hasPackedAtmosphere ? max(UnrealAtmosphereShaftParams.y, 0.0) : 0.20;
+	float sunLiftBase = hasPackedAtmosphere ? max(UnrealAtmosphereShaftParams.z, 0.0) : 0.14;
+	float sunLiftDistance = hasPackedAtmosphere ? max(UnrealAtmosphereShaftParams.w, 0.0) : 0.22;
+	fogDistanceRange.y = max(fogDistanceRange.y, fogDistanceRange.x + 0.001);
+	nearAirRange.y = max(nearAirRange.y, nearAirRange.x + 0.001);
+	highlightLumaGate.y = max(highlightLumaGate.y, highlightLumaGate.x + 0.14);
+	sunMaskGate.y = max(sunMaskGate.y, sunMaskGate.x + 0.16);
+	localBloomMaskGate.y = max(localBloomMaskGate.y, localBloomMaskGate.x + 0.18);
+
+	// UE's exponential fog pass runs before this plugin composites the splats, so
+	// ordinary mesh fog cannot affect 3DGS. Evaluate aerial perspective per splat
+	// in world space, before the splats are alpha blended.
+	float sceneRadius = max(UnrealShadowBounds.w, 500.0);
+	float cameraDistance = length(CameraPosition - worldPos);
+	float fogVisibility = max(sceneRadius * fogDistanceRange.y, 100.0);
+	float denseFogEvidence = saturate((hazeDensityMax - 0.80) * 0.90) *
+		saturate((distanceHaze - 0.75) * 1.35);
+	float legacyDistance01 = smoothstep(sceneRadius * fogDistanceRange.x, fogVisibility, cameraDistance);
+	float legacyNearAir01 = smoothstep(sceneRadius * nearAirRange.x, sceneRadius * nearAirRange.y, cameraDistance);
+	// Dense weather fog is a continuous optical medium. An exponential curve has
+	// no visible start ring and reaches all the way to the camera, unlike two
+	// stacked smoothstep bands. The visibility control is the physical scale of
+	// both the near veil and the far extinction.
+	float opticalDistance01 = 1.0 - exp2(-cameraDistance / fogVisibility * 2.35);
+	float opticalNearAir01 = 1.0 - exp2(-cameraDistance / max(fogVisibility * 0.34, 80.0));
+	float distance01 = lerp(legacyDistance01, opticalDistance01, denseFogEvidence);
+	float nearAir01 = lerp(legacyNearAir01, opticalNearAir01, denseFogEvidence);
+
+	// Fog-only native bridge: the dense Fog weather is now composited against the
+	// same UE Exponential/Volumetric Fog authority after GS grading. Retire only the
+	// old dense-fog surface recolour here so the two fog systems are not stacked.
+	// Clear/Dawn/Rain/Snow keep their existing atmospheric path unchanged.
+	const float nativeFogBridge = smoothstep(0.78, 0.90, hazeDensityMax);
+	distance01 *= (1.0 - nativeFogBridge);
+	nearAir01 *= (1.0 - nativeFogBridge);
+
+	float heightRange = max(UnrealShadowHeight.y - UnrealShadowHeight.x, 100.0);
+	float height01 = saturate((worldPos.z - UnrealShadowHeight.x) / heightRange);
+	// Exponential height falloff gives a real ground layer instead of uniformly
+	// bleaching buildings and sky. Two broad world-space waves form stable fog
+	// banks without temporal shimmer or per-splat dot patterns.
+	float groundDensity = 0.42 + (1.0 + 1.15 * groundFogDensity) *
+		exp2(-height01 * fogHeightFalloff * 4.0);
+	float fogWaveA = sin(dot(worldPos.xy, float2(0.00043, 0.00031)) + worldPos.z * 0.00017);
+	float fogWaveB = sin(dot(worldPos.xy, float2(-0.00019, 0.00051)) - worldPos.z * 0.00011);
+	float fogBank = saturate(0.5 + 0.28 * fogWaveA + 0.22 * fogWaveB);
+	// Keep broad variation subtle in dense fog so it reads as volume rather than
+	// a sequence of flat colour stages.
+	float variationAmplitude = fogDensityVariation * lerp(1.0, 0.24, denseFogEvidence);
+	float densityVariation = lerp(1.0, lerp(0.72, 1.22, fogBank), variationAmplitude);
+	float fogAmount = saturate(
+		(distance01 * distanceFogWeight + nearAir01 * nearFogWeight) *
+		groundDensity * densityVariation *
+		lerp(hazeDensityMin, hazeDensityMax, saturate(distanceHaze * 0.5)) *
+		atmosphereStrength);
+	// Dense weather presets may approach full extinction in the distance while
+	// clear/dawn presets retain the conservative aerial-perspective ceiling.
+	float fogOpacityLimit = lerp(
+		0.18,
+		0.985,
+		saturate(distanceHaze * 0.72 + max(hazeDensityMax - 0.35, 0.0) * 0.42));
+	fogAmount = min(fogAmount, fogOpacityLimit);
+
+	// Cool aerial perspective in shadow, warmer forward scattering in lit areas.
+	float3 coolAir = SRGBToSceneLinearExact(float3(0.58, 0.66, 0.74));
+	// Atmospheric scattering and bloom inherit the actual collected Unreal
+	// Directional Light color instead of converging to a fixed white/yellow.
+	float directionalTintLuma = max(SceneLinearLuminance(directionalLightTint), 0.001);
+	float3 sunAir = max(directionalLightTint / directionalTintLuma, 0.0);
+	float2 highlightLumaGateLinear = float2(
+		SRGBToSceneLinearExact(highlightLumaGate.x.xxx).x,
+		SRGBToSceneLinearExact(highlightLumaGate.y.xxx).x);
+	float sourceLumaForBloom = SceneLinearLuminance(sceneLinearColor);
+	float highlightGate = smoothstep(highlightLumaGateLinear.x, highlightLumaGateLinear.y, sourceLumaForBloom);
+	float sunScatter = smoothstep(sunMaskGate.x, sunMaskGate.y, lightMask) * distance01;
+	float3 airColor = lerp(coolAir, sunAir, saturate(sunScatter * warmSunScatter * 0.70));
+	// Preserve readable silhouettes inside fog: shadowed splats receive less
+	// in-scattering and retain a cool, darker body instead of becoming flat grey.
+	float preFogShadow = 1.0 - smoothstep(0.14, 0.72, lightMask);
+	float shadowFogAmount = fogAmount * lerp(1.0, 0.62, preFogShadow);
+	float3 fogged = lerp(sceneLinearColor, airColor, shadowFogAmount);
+	fogged *= lerp(1.0, 0.58, preFogShadow * shadowCrush * (1.0 - fogAmount * 0.28));
+
+	// Absorption grows continuously from the camera to the visibility limit.
+	// It approaches black in the far volume while silhouettes and captured GS
+	// shadows remain readable through the near/middle portion.
+	float visibilityRatio = cameraDistance / fogVisibility;
+	float farFogExtinction = smoothstep(0.08, 1.08, visibilityRatio) *
+		denseFogEvidence * saturate(fogAmount * 1.35);
+	float farBlackTransmission = exp2(-7.0 * farFogExtinction);
+	fogged *= farBlackTransmission;
+
+	float litAir = smoothstep(sunMaskGate.x, sunMaskGate.y, lightMask) * (nearAir01 * litAirNearWeight + distance01 * litAirFarWeight);
+	litAir *= atmosphereStrength * lerp(0.12, 0.42, saturate(distanceHaze * 0.5));
+	fogged = lerp(fogged, sunAir, saturate(litAir));
+
+	// Create readable near/mid/far separation without crushing the captured GS.
+	float luma = dot(fogged, float3(0.2126, 0.7152, 0.0722));
+	float localContrast = lerp(1.16, 0.92, saturate(visibilityRatio)) *
+		lerp(1.0, 1.10, denseFogEvidence * (1.0 - farFogExtinction));
+	float3 lumaColor = float3(luma, luma, luma);
+	fogged = (fogged - lumaColor) * localContrast + lumaColor;
+
+	float shadowAmount = 1.0 - smoothstep(0.10, 0.76, lightMask);
+	float shadowCool = shadowAmount * (1.0 - distance01) * coolShadowTint;
+	fogged *= lerp(float3(1.0, 1.0, 1.0), float3(0.97, 0.995, 1.025), shadowCool * 0.08);
+
+	float shadowLuma = dot(fogged, float3(0.2126, 0.7152, 0.0722));
+	fogged = lerp(fogged, float3(shadowLuma, shadowLuma, shadowLuma), shadowAmount * shadowDesaturation * 0.018);
+
+	float sunlightGrade = smoothstep(sunMaskGate.x, sunMaskGate.y, lightMask);
+	float sunlightLuma = dot(fogged, float3(0.2126, 0.7152, 0.0722));
+	float3 sunlightLumaColor = float3(sunlightLuma, sunlightLuma, sunlightLuma);
+	float sunlightSaturation = min(1.0 + colorSaturationBoost * 0.10 + sunlightGrade * (0.16 + colorSaturationBoost * 0.26) + highlightGate * (0.045 + colorSaturationBoost * 0.08), 1.42);
+	fogged = lerp(sunlightLumaColor, fogged, sunlightSaturation);
+	// v2818 sunlight exposure is no longer allowed to act as a second global
+	// exposure control. Keep only a subtle photographic shoulder; spatial bloom
+	// below owns the perceived glare around the hottest pixels.
+	fogged *= 1.0 + sunlightGrade * (sunExposureBoost * 0.10);
+
+	// Build clear warm sunlight patches without changing shadowed splats or
+	// lowering the exposure of the whole scene.
+	float sunLocalContrast = sunlightGrade * saturate(lightShaftBaseStrength);
+	float sunTonalPivot = 0.18;
+	float separatedSunLuma = max(
+		sunTonalPivot + (sunlightLuma - sunTonalPivot) * (1.0 + sunLocalContrast * 0.55),
+		0.0);
+	float sunTonalScale = separatedSunLuma / max(sunlightLuma, 0.001);
+	fogged *= lerp(1.0, clamp(sunTonalScale, 0.90, 1.10), sunlightGrade);
+	fogged *= 1.0 + sunlightGrade * saturate(lightShaftHighlightStrength) *
+		smoothstep(0.24, 0.82, sunlightLuma) * 0.055;
+	fogged *= lerp(float3(1.0, 1.0, 1.0), float3(1.045, 1.012, 0.965),
+		sunlightGrade * saturate(lightShaftHighlightStrength));
+
+	float sunLift = smoothstep(0.62, 0.98, lightMask) * (sunLiftBase + distance01 * sunLiftDistance);
+	float hazeGlow = sunScatter * fogAmount;
+	// Keep only a small in-scattering lift in the base carrier. Strong perceived
+	// glare should come from the post-grade bloom pass rather than washing the whole
+	// GS payload toward white.
+	fogged += sunAir * sunLift * (sunExposureBoost * 0.055) * highlightGlareScale;
+	fogged += sunAir * (hazeGlow * hazeGlowStrength + litAir * litAirGlowStrength) * 0.045 * highlightGlareScale;
+	// Bloom is emitted only by positively lit splats. The old 0.04 floor leaked
+	// highlight energy into fully shadowed regions and made proxy shadows glow.
+	float3 bloomEnergy = 0.0.xxx;
+	[branch] if (!bSuppressLocalBloom)
+	{
+		float bloomLitGate = smoothstep(
+			max(localBloomMaskGate.x, sunMaskGate.x),
+			max(localBloomMaskGate.y, sunMaskGate.y),
+			lightMask);
+		float localBloom = highlightGate * bloomLitGate;
+		float3 warmBloomTint = sunAir;
+		// Preserve a vivid color shoulder around the bloom source, then let only the
+		// hottest HDR core converge to white. This produces photographic colored
+		// halation without globally increasing scene or shadow saturation.
+		float sourceBloomLuma = max(SceneLinearLuminance(sceneLinearColor), 0.0001);
+		float3 sourceBloomHue = sceneLinearColor / sourceBloomLuma;
+		float sourceHueLuma = SceneLinearLuminance(sourceBloomHue);
+		float3 saturatedSourceHue = max(
+			sourceHueLuma.xxx + (sourceBloomHue - sourceHueLuma.xxx) * 1.42,
+			0.0);
+		saturatedSourceHue /= max(SceneLinearLuminance(saturatedSourceHue), 0.0001);
+		float shoulderColorWeight = smoothstep(0.12, 0.72, localBloom) * (1.0 - smoothstep(0.72, 0.98, localBloom));
+		float3 coloredBloomShoulder = lerp(warmBloomTint, saturatedSourceHue, shoulderColorWeight * 0.72);
+		float bloomDrive = 1.0 - exp(-max(localBloomStrength + localBloomGlareMix * highlightGlareScale, 0.0) * 0.38);
+		// The brightest part of a photographic bloom approaches neutral white.
+		// Preserve warmth in the shoulder, but progressively whiten only the HDR
+		// core instead of retaining the source hue at every intensity.
+		float whiteCore = smoothstep(0.42, 0.96, localBloom)
+			* saturate(highlightBloomBoost * bloomDrive * 0.42);
+		float3 bloomTint = lerp(coloredBloomShoulder, float3(1.0, 1.0, 1.0), whiteCore * 0.92);
+		bloomEnergy = bloomTint * localBloom * highlightBloomBoost * bloomDrive * 0.95;
+	}
+	float farFade = saturate(distance01);
+	float farLightScale = lerp(1.0, 0.68, farFade * farLightFade);
+	float finalLuma = dot(fogged, float3(0.2126, 0.7152, 0.0722));
+	float3 finalGray = float3(finalLuma, finalLuma, finalLuma);
+	float3 distanceGraded = lerp(fogged, finalGray, farFade * farSaturationFade);
+	float3 resultColor = max(distanceGraded * farLightScale, 0.0);
+	// Direct lighting remains a separate payload so the proxy SceneCapture
+	// visibility can still be applied later in the pixel shader. This is the
+	// physical transmittance portion; additive in-scattering stays in the base.
+	atmosphereTransmission = saturate(
+		(1.0 - fogAmount) * (1.0 - saturate(litAir)) * farLightScale);
+	// Local highlight bloom is classified as direct illumination so the later
+	// proxy SceneCapture visibility attenuates it inside inserted-object shadows.
+	// The plugin has a dedicated post-grade spatial bloom composite. Inject only a
+	// small seed here so bloom remains shadow-aware without turning its source energy
+	// into another broad additive exposure term in the base image.
+	shadowableBloomLinear = max(bloomEnergy * farLightScale * 0.18, 0.0);
+	return resultColor;
+}
+
+float3 AddMicroNormalDetail(float3 baseNormal, float4 rotation, float3 scale, float3x3 localToWorldRot, float3 viewDirWorld)
+{
+	float detailStrength = saturate(UnrealShadowParams.w);
+	if (detailStrength <= 0.001)
+	{
+		return normalize(baseNormal);
+	}
+
+	float3 rawNormal = SelectRawSplatAxisNormal(rotation, scale, localToWorldRot);
+	if (dot(rawNormal, baseNormal) < 0.0)
+	{
+		rawNormal = -rawNormal;
+	}
+	if (dot(rawNormal, viewDirWorld) < -0.25 && UnrealNormalMode == 0u)
+	{
+		rawNormal = -rawNormal;
+	}
+	return normalize(lerp(baseNormal, rawNormal, detailStrength));
+}
+
+float ComputeApproxDirectionalShadow(float3 worldPos, float3 normal, float3 L, float ndotl)
+{
+	float enabled = UnrealShadowParams2.z;
+	if (enabled < 0.5)
+	{
+		return 1.0;
+	}
+
+	float strength = saturate(UnrealShadowParams.x);
+	float contactStrength = saturate(UnrealShadowParams.y);
+	float softness = saturate(UnrealShadowParams2.x);
+	float breakupAmount = saturate(UnrealShadowParams2.y);
+	float radius = max(UnrealShadowBounds.w, 1.0);
+
+	float zRange = max(UnrealShadowHeight.y - UnrealShadowHeight.x, 1.0);
+	float height01 = saturate((worldPos.z - UnrealShadowHeight.x) / zRange);
+	float receiverMask = pow(1.0 - height01, 0.45);
+	float upperMask = pow(height01, 0.75);
+
+	// 1) Sun-side / back-side separation. Keep this moderate; the source 3DGS already
+	// contains baked daylight, so this should steer the image, not replace it.
+	float angularShadow = saturate((softness + 0.46 - ndotl) / max(softness + 0.46, 0.001));
+	angularShadow = pow(angularShadow, 0.72);
+
+	// v2792: below-horizon darkness is no longer injected as fake occlusion.
+	// Day/night is now driven by the active sun/moon Directional Light plus night ambient.
+
+	// 2) Contact and underside darkening. Low splats receive stronger grounding darkness.
+	float contactShadow = pow(1.0 - height01, 1.10) * contactStrength * 0.72;
+
+	// 3) Directional cast-shadow impression. This projects a world-space shadow texture along the sun direction.
+	// It is still approximate, but it creates visible UE-like shadow breakup on roads/ground instead of a flat tint.
+	float2 lightXY = L.xy;
+	float lightXYLen = length(lightXY);
+	float2 fromLightDir = lightXYLen > 0.001 ? normalize(-lightXY) : float2(0.0, 0.0);
+	float2 rel = (worldPos.xy - UnrealShadowBounds.xy) / radius;
+	float lowSun = pow(saturate(1.0 - L.z), 0.55);
+	float leeSide = saturate(0.45 + 0.55 * dot(rel, fromLightDir));
+	float projectedRamp = leeSide * lowSun * 0.28;
+
+	// Projected blob UV. The lower the sun, the longer the fake projected offset.
+	float invSunZ = 1.0 / max(abs(L.z), 0.18);
+	float2 projectedUV = (worldPos.xy + (-L.xy * invSunZ) * (worldPos.z - UnrealShadowHeight.x) * 0.55);
+	projectedUV *= (0.0045 + 0.0065 * lowSun);
+	float blobA = ValueNoise2D(projectedUV);
+	float blobB = ValueNoise2D(projectedUV * 2.37 + float2(13.7, 41.2));
+	float blobC = ValueNoise2D(projectedUV * 5.11 + float2(7.3, 19.1));
+	float blob = blobA * 0.52 + blobB * 0.33 + blobC * 0.15;
+	blob = smoothstep(0.48, 0.88, blob);
+	float projectedBlobShadow = blob * receiverMask * lowSun * contactStrength * 0.42;
+
+	// 4) Fine breakup prevents flat airbrushed shadows and gives foliage/stone detail some bite.
+	float fineNoise = Hash13(worldPos * 0.037 + float3(L.xy * 23.0, L.z * 17.0));
+	float breakup = lerp(1.0, 0.74 + 0.26 * fineNoise, breakupAmount);
+
+	// 5) Slight upper/foliage occlusion so trees/eaves are not uniformly over-lit.
+	float canopyOcclusion = upperMask * (0.25 + 0.75 * blob) * breakupAmount * 0.16;
+
+	float occlusion = max(angularShadow, max(contactShadow, max(projectedRamp, projectedBlobShadow)));
+	occlusion = max(occlusion, canopyOcclusion);
+	occlusion = saturate(occlusion * breakup);
+	// Nonlinear darkening makes the shadow side visually read as shadow instead of a mild tint.
+	float shadow = saturate(1.0 - strength * occlusion);
+	return pow(shadow, lerp(1.0, 1.85, strength));
+}
+
+float ComputeUnrealPostProcessLightMask(float3 worldPos, float3 lightingNormal)
+{
+	if (ReceiveUnrealLighting == 0u || UnrealLightCount == 0u)
+	{
+		return 1.0;
+	}
+
+	// Final pre-mask stage: retain the collected Unreal light intensity and all
+	// cinematic atmosphere effects, but present them as fully lit. The CPU proxy
+	// classification mask will be multiplied later in a separate step.
+	if (UnrealShadowParams2.z < -0.5)
+	{
+		return 1.0;
+	}
+
+	// In proxy mode keep a clean normal-facing mask. This mirrors the CPU validator's
+	// red/cyan back-face test without reintroducing the old procedural shadow field.
+	if (UnrealShadowParams2.z < 0.5)
+	{
+		float3 proxyNormal = lightingNormal;
+		float proxyVisibility = 0.0;
+		[loop]
+		for (uint proxyLightIndex = 0u; proxyLightIndex < UnrealLightCount && proxyLightIndex < 8u; ++proxyLightIndex)
+		{
+			if (UnrealLightDirectionType[proxyLightIndex].w < 0.5 && UnrealLightColorIntensity[proxyLightIndex].w > 0.001)
+			{
+				float3 proxyL = normalize(UnrealLightDirectionType[proxyLightIndex].xyz);
+				proxyVisibility = max(proxyVisibility, smoothstep(-0.015, 0.055, dot(proxyNormal, proxyL)));
+			}
+		}
+		return proxyVisibility;
+	}
+
+	float visibility = 0.0;
+	bool hasDirectionalLight = false;
+	float lightingContrast = clamp(UnrealShadowParams.z, 0.35, 2.35);
+	float userSoftness = saturate(UnrealShadowParams2.x);
+	float userBreakup = saturate(UnrealShadowParams2.y);
+	float3 normalBase = lightingNormal;
+	float3 receiverNormal = normalize(lerp(normalBase, float3(0.0, 0.0, 1.0), lerp(0.86, 0.72, saturate(UnrealDirectionalResponse))));
+
+	[loop]
+	for (uint lightIndex = 0u; lightIndex < UnrealLightCount && lightIndex < 8u; ++lightIndex)
+	{
+		float type = UnrealLightDirectionType[lightIndex].w;
+		if (type >= 0.5)
+		{
+			continue;
+		}
+
+		hasDirectionalLight = true;
+		float3 L = normalize(UnrealLightDirectionType[lightIndex].xyz);
+		float lightLuxScale = max(UnrealLightColorIntensity[lightIndex].w, 0.0);
+		if (lightLuxScale <= 0.001)
+		{
+			continue;
+		}
+		float lightPower = saturate(lerp(0.72, 1.0, saturate(lightLuxScale)));
+
+		// Keep this elevation gate very broad. A narrow horizon threshold makes the
+		// preview pop from dark to full-screen white while the DirectionalLight rotates.
+		float sunElevation = smoothstep(-0.28, 0.72, L.z);
+		float horizonFade = smoothstep(-0.18, 0.18, L.z);
+		// Use mostly broad sun elevation, with a small receiver-normal term so the
+		// mask still feels like a lit surface instead of a uniform fog overlay.
+		float normalFacing = smoothstep(0.08, 0.92, WrappedNdotL(receiverNormal, L));
+		float broadFacing = lerp(sunElevation, normalFacing, 0.28 * saturate(UnrealDirectionalResponse));
+		float angleLight = pow(saturate(broadFacing), lerp(1.25, 0.78, userSoftness) * lightingContrast);
+
+		float2 lightXY = L.xy;
+		float lightXYLen = length(lightXY);
+		float horizontalStrength = smoothstep(0.04, 0.45, lightXYLen);
+		float2 fromLightDir = lightXYLen > 0.001 ? normalize(-lightXY) : float2(1.0, 0.0);
+		float2 crossLightDir = float2(-fromLightDir.y, fromLightDir.x);
+		float radius = max(UnrealShadowBounds.w, 1.0);
+		float2 rel = (worldPos.xy - UnrealShadowBounds.xy) / radius;
+
+		float alongLight = dot(rel, fromLightDir);
+		float acrossLight = dot(rel, crossLightDir);
+		float edgeWidth = lerp(0.58, 1.36, userSoftness);
+		float travelGradient = smoothstep(-edgeWidth, edgeWidth, alongLight);
+		travelGradient = lerp(0.22, travelGradient, horizontalStrength);
+
+		float height01 = smoothstep(UnrealShadowHeight.x - 120.0, UnrealShadowHeight.y + 120.0, worldPos.z);
+		float distanceGradient = 1.0 - smoothstep(0.68, 1.85, length(rel));
+
+		// World-space canopy breakup. Two broad frequencies form coherent pools of
+		// sunlight that stay fixed to the GS while the camera moves.
+		float waveA = sin((alongLight * 0.82 + acrossLight * 0.31) * 3.14159);
+		float waveB = sin((acrossLight * 0.56 - alongLight * 0.20) * 3.14159 + 1.7);
+		float broadBreakup = 0.5 + 0.5 * (waveA * 0.58 + waveB * 0.42);
+		float patchScale = max(radius * 0.075, 180.0);
+		float2 patchUV = (worldPos.xy + fromLightDir * worldPos.z * 0.42) / patchScale;
+		float canopyA = ValueNoise2D(patchUV + float2(11.7, 4.3));
+		float canopyB = ValueNoise2D(patchUV * 2.13 + float2(37.1, 19.6));
+		float canopyField = canopyA * 0.68 + canopyB * 0.32;
+		float sunPatch = smoothstep(0.43, 0.69, canopyField);
+		sunPatch = pow(saturate(sunPatch), lerp(1.28, 0.82, userSoftness));
+		broadBreakup = lerp(broadBreakup, sunPatch, lerp(0.62, 0.88, userBreakup));
+
+		float sunField = saturate(
+			angleLight * lerp(0.18, 1.12, broadBreakup) * 0.76 +
+			travelGradient * horizontalStrength * 0.16 +
+			height01 * 0.025 +
+			distanceGradient * 0.015 +
+			broadBreakup * 0.24);
+		sunField *= sunElevation;
+
+		// Contrast-expand after the soft field is built. This keeps motion smooth while
+		// giving the preview real black/white separation instead of a flat gray wash.
+		float contrastLow = lerp(0.16, 0.12, userSoftness);
+		float contrastHigh = lerp(0.70, 0.80, userSoftness);
+		float litCore = smoothstep(contrastLow, contrastHigh, sunField);
+		litCore = pow(saturate(litCore), lerp(1.35, 0.82, userSoftness));
+
+		float softFloor = lerp(0.00, 0.045, userSoftness) * horizonFade;
+		float directionMask = saturate(softFloor + litCore * lerp(0.78, 1.15, lightPower));
+		float rawLightMask = saturate(directionMask * lightPower);
+
+		// Expand to full black/white range. The broad field above keeps the mask soft,
+		// while this stage prevents everything from sitting in the safe middle grays.
+		float blackPoint = lerp(0.040, 0.028, saturate(UnrealDirectionalResponse));
+		float whitePoint = lerp(0.50, 0.68, userSoftness);
+		float lightMask = smoothstep(blackPoint, whitePoint, rawLightMask);
+		lightMask = pow(saturate(lightMask), lerp(0.74, 1.08, userSoftness));
+
+		// Keep this as a smooth grade mask, not a relight or a noisy fake shadow.
+		// Sun-facing areas brighten; non-lit areas fall off with a broad gradient.
+		visibility = max(visibility, lerp(0.0, lightMask, saturate(UnrealLightingInfluence)));
+	}
+
+	return hasDirectionalLight ? saturate(visibility) : 0.0;
+}
+
+uint PackLODAndPostLightMask(
+	uint lodLevel,
+	float lightMask,
+	float stableProxyReceiverSignal)
+{
+	uint lod8 = lodLevel & 0xFFu;
+	uint mask8 = (uint)round(saturate(lightMask) * 255.0);
+	// The receiver response changes continuously while the Directional Light
+	// rotates. Preserve the remaining 16 bits so the nonlinear closure curve does
+	// not magnify an 8-bit step into a visible brightness pulse.
+	uint stableReceiver16 =
+		(uint)round(saturate(stableProxyReceiverSignal) * 65535.0);
+	return lod8 | (mask8 << 8) | (stableReceiver16 << 16);
+}
+
+// Helper: write an invalid (culled) splat into ViewDataBuffer
+void WriteInvalidSplat(uint outputIndex, uint clusterID, uint lodLevel)
+{
+	FGaussianSplatViewData viewData;
+	viewData.ClipPosition = float4(0, 0, 0, -1);
+	viewData.TranslatedWorldPos = float3(0, 0, 0);
+	viewData.TranslatedWorldPosPad = asfloat(0xFFFFFFFEu);
+	viewData.PackedColorRG = 0;
+	viewData.PackedColorBA = 0;
+	viewData.PackedDirectRG = 0;
+	viewData.PackedDirectBA = 0;
+	viewData.Axis1 = float2(0, 0);
+	viewData.Axis2 = float2(0, 0);
+	viewData.ClusterID = clusterID;
+	viewData.Padding = lodLevel;
+	viewData.StructPadding0 = 0;
+	viewData.StructPadding1 = 0;
+	ViewDataBuffer[outputIndex] = viewData;
+}
+
+float QuantizeFootprintRadius(float radiusPixels, float stepPixels)
+{
+	if (stepPixels <= 1.0e-4)
+	{
+		return radiusPixels;
+	}
+	return max(stepPixels, round(radiusPixels / stepPixels) * stepPixels);
+}
+
+void ApplyAdaptiveProjectedFootprint(
+	inout float2 axis1Pixels,
+	inout float2 axis2Pixels,
+	float cameraDistance,
+	inout float opacity,
+	out float4 footprintMetrics)
+{
+	float originalMajor = max(length(axis1Pixels), 1.0e-4);
+	float originalMinor = max(length(axis2Pixels), 1.0e-4);
+	float adjustedMajor = originalMajor;
+	float adjustedMinor = originalMinor;
+
+	if (UseAdaptiveFootprint != 0u)
+	{
+		// Stabilization policy:
+		// - close splats keep their legacy footprint except for a minimum AA floor;
+		// - shrinking, anisotropy limiting and radius quantization fade in only through mid/far range;
+		// - opacity compensation is partial and hard-capped so individual splats cannot become coins/rings.
+		float strength = min(saturate(FootprintParams0.x), 0.65);
+		float nearMin = max(FootprintParams0.y, 1.0);
+		float midMin = max(FootprintParams0.z, 0.65);
+		float farMin = max(FootprintParams0.w, 0.50);
+		float nearMax = max(FootprintParams1.x, 8.0);
+		float midMax = max(FootprintParams1.y, 10.0);
+		float farMax = max(FootprintParams1.z, 14.0);
+		float anisotropyLimit = max(FootprintParams1.w, 2.0);
+		float adaptiveStart = max(FootprintParams2.x, 2000.0);
+		float adaptiveFull = max(FootprintParams2.y, adaptiveStart + 1000.0);
+		float opacityStrength = min(saturate(FootprintParams2.z), 0.20);
+		float maxCompensationExponent = clamp(FootprintParams2.w, 1.0, 1.35);
+		float radiusQuantization = max(FootprintParams3.x, 0.0);
+
+		float distance01 = saturate((cameraDistance - adaptiveStart) / (adaptiveFull - adaptiveStart));
+		float adaptiveGate = distance01 * distance01 * (3.0 - 2.0 * distance01);
+		float adaptiveBlend = strength * adaptiveGate;
+
+		float minRadius = distance01 < 0.5
+			? lerp(nearMin, midMin, distance01 * 2.0)
+			: lerp(midMin, farMin, (distance01 - 0.5) * 2.0);
+		float maxRadius = distance01 < 0.5
+			? lerp(nearMax, midMax, distance01 * 2.0)
+			: lerp(midMax, farMax, (distance01 - 0.5) * 2.0);
+
+		// Near range only blends toward a sub-pixel AA floor; it never shrinks the legacy footprint.
+		// Keeping the floor under the user strength means strength=0 remains an exact Legacy A/B reference.
+		float aaMinor = max(originalMinor, minRadius);
+		float aaMajor = max(originalMajor, aaMinor);
+		float baseMinor = lerp(originalMinor, aaMinor, strength);
+		float baseMajor = lerp(originalMajor, aaMajor, strength);
+		float targetMinor = clamp(baseMinor, minRadius, maxRadius);
+		float targetMajor = clamp(baseMajor, targetMinor, maxRadius);
+		targetMajor = min(targetMajor, targetMinor * anisotropyLimit);
+
+		// Quantization is disabled near the camera and fades in only after adaptation is established.
+		float quantizationGate = smoothstep(0.20, 0.70, adaptiveGate);
+		float effectiveQuantization = radiusQuantization * quantizationGate;
+		targetMajor = clamp(QuantizeFootprintRadius(targetMajor, effectiveQuantization), minRadius, maxRadius);
+		targetMinor = clamp(QuantizeFootprintRadius(targetMinor, effectiveQuantization), minRadius, maxRadius);
+
+		adjustedMajor = max(lerp(baseMajor, targetMajor, adaptiveBlend), minRadius);
+		adjustedMinor = max(lerp(baseMinor, targetMinor, adaptiveBlend), minRadius);
+		adjustedMajor = max(adjustedMajor, adjustedMinor);
+
+		axis1Pixels *= adjustedMajor / originalMajor;
+		axis2Pixels *= adjustedMinor / originalMinor;
+
+		float originalArea = max(originalMajor * originalMinor, 1.0e-4);
+		float adjustedArea = max(adjustedMajor * adjustedMinor, 1.0e-4);
+		float shrinkAreaRatio = max(originalArea / adjustedArea, 1.0);
+		float cappedExponent = min(shrinkAreaRatio, maxCompensationExponent);
+		float compensationExponent = lerp(1.0, cappedExponent, opacityStrength * adaptiveGate);
+		float originalOpacity = saturate(opacity);
+		float compensatedOpacity = saturate(1.0 - pow(max(1.0 - originalOpacity, 1.0e-5), compensationExponent));
+		// Additional alpha gain clamp prevents low-alpha splats from becoming isolated opaque dots.
+		float maxSafeOpacity = min(1.0, originalOpacity * 1.35 + 0.015);
+		opacity = min(compensatedOpacity, maxSafeOpacity);
+	}
+
+	footprintMetrics = float4(originalMajor, adjustedMajor, originalMinor, adjustedMinor);
+}
+
+float4 LoadHighPrecisionColorOpacity(uint splatIndex)
+{
+	uint width = 1u;
+	uint height = 1u;
+	HighPrecisionColorTexture.GetDimensions(width, height);
+	uint2 coord = SplatIndexToTextureCoord(splatIndex, max(width, 1u));
+	if (coord.y >= height)
+	{
+		return float4(1.0, 1.0, 1.0, 1.0);
+	}
+	return HighPrecisionColorTexture.Load(int3(coord, 0));
+}
+
+// Core: transform a single splat to screen space and write to ViewDataBuffer
+void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uint selectedLODLevel)
+{
+	#if !GS_VR_BASELINE
+	// Proof mode: avoid changing the root component visibility because the
+	// child puddle render component is attached beneath it. Works for LOD too.
+	if (PuddleHideMainSource != 0u)
+	{
+		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+		return;
+	}
+	// Editor proof: the real source is skipped; the separate world-anchored
+	// Snow Gaussian asset stays visible. Do not touch any other weather path.
+	if (SnowCoveragePackedCount > 0u && DirectSplatSurfaceEffectParams0.x > 1.5 &&
+		DirectSnowTuningParams.w >= 1.0 && DirectSplatSurfaceEffectParams2.z > 2.5)
+	{
+		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+		return;
+	}
+
+	#endif
+	// Attributes remain in the legacy compact buffer for this first precision step.
+	// Position can be switched per component for exact A/B comparison.
+	FUnpackedSplat splat = UnpackSplat(PackedSplatBuffer, splatIndex);
+
+	float3 localPos = (UseFloat32Position != 0u)
+		? LoadPositionFloat32(Float32PositionBuffer, splatIndex)
+		: splat.Position;
+	float4 rotation = splat.Rotation;
+	// Precision Foundation 2 showed no meaningful visual gain from the 8-byte FP16 scale side buffer.
+	// Keep the compact legacy UInt8 log scale to recover memory and bandwidth.
+	float3 scale = splat.Scale * SplatScale;
+	float4 colorOpacity = splat.ColorOpacity;
+	if (UseHighPrecisionColorOpacity != 0u)
+	{
+		// The asset already owns a Morton-swizzled PF_FloatRGBA texture. Reusing it
+		// preserves Float16 base color and opacity without allocating another buffer.
+		colorOpacity = LoadHighPrecisionColorOpacity(splatIndex);
+	}
+	float opacity = saturate(colorOpacity.a) * OpacityScale;
+#if GS_VR_BASELINE
+    // Half-packed alpha is what the raster stage actually uses.
+    if (UnpackHalf2x16(PackHalf2x16(float2(0, opacity))).y < (1.0 / 255.0))
+    { WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel); return; }
+#endif
+
+
+	// Transform to world space
+	float4 worldPos = mul(float4(localPos, 1.0), LocalToWorld);
+	float4 clipPos = mul(worldPos, WorldToClip);
+
+	// Store translated world position for velocity calculation in pixel shader
+	// TranslatedWorld = World + PreViewTranslation (matches UE convention)
+	float3 translatedWorldPos = worldPos.xyz + PreViewTranslation;
+
+	// Cull if behind camera
+	if (clipPos.w <= 0.0)
+	{
+		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+		return;
+	}
+
+	// Transform to view space
+	float4 viewPos = mul(worldPos, WorldToView);
+
+	// Clamp view position to prevent extreme projections at edge of view
+	float tanFovX = (ScreenSize.x * 0.5) / FocalLength.x;
+	float tanFovY = (ScreenSize.y * 0.5) / FocalLength.y;
+	float limX = 1.3 * tanFovX;
+	float limY = 1.3 * tanFovY;
+	viewPos.x = clamp(viewPos.x / viewPos.z, -limX, limX) * viewPos.z;
+	viewPos.y = clamp(viewPos.y / viewPos.z, -limY, limY) * viewPos.z;
+
+	// Calculate covariance
+	float3x3 cov3D_local = CalcCovariance3D(rotation, scale);
+	float3x3 localToWorldRot = (float3x3)LocalToWorld;
+	float3x3 cov3D_world = mul(transpose(localToWorldRot), mul(cov3D_local, localToWorldRot));
+	#if !GS_VR_BASELINE
+	// P08: optional world-space, source-only per-Gaussian opacity attenuation.
+	// This has NO camera position, view depth or screen mask dependency.
+	if (PuddleDampenStrength > 0.001 &&
+		splatIndex < OriginalSplatCount && (splatIndex >> 3u) < PuddleDampenPackedCount)
+	{
+		uint word = PuddleDampenPackedMask[splatIndex >> 3u];
+		if (((word >> ((splatIndex & 7u) * 4u)) & 1u) != 0u)
+			opacity *= (1.0 - saturate(PuddleDampenStrength));
+	}
+	#endif
+	// v29: camera-independent intrinsic world splat size used only by Rain water optics.
+	// sqrt(trace(covariance)) is rotation-invariant and remains fixed for a fixed splat.
+	float directRainWorldSplatSizeCm = sqrt(max(
+		cov3D_world[0][0] + cov3D_world[1][1] + cov3D_world[2][2], 0.0));
+	float3x3 viewMat = (float3x3)WorldToView;
+	float2x2 cov2D = CalcCovariance2D(cov3D_world, viewMat, viewPos.xyz, FocalLength);
+
+	// Production path: use the original projected covariance footprint.
+	float2 axis1, axis2;
+	DecomposeCovariance2D(cov2D, axis1, axis2);
+
+	// Convert the adjusted pixel-space axes to NDC.
+	axis1 = axis1 / ScreenSize * 4.0;
+	axis2 = axis2 / ScreenSize * 4.0;
+
+	// Safety clamp
+	float maxAxisSize = 2.0;
+	if (any(isnan(axis1)) || any(isinf(axis1)) || length(axis1) > maxAxisSize)
+	{
+		axis1 = float2(0.01, 0.0);
+	}
+	if (any(isnan(axis2)) || any(isinf(axis2)) || length(axis2) > maxAxisSize)
+	{
+		axis2 = float2(0.0, 0.01);
+	}
+
+	// Frustum culling
+	float2 ndcCenter = clipPos.xy / clipPos.w;
+	float2 ndcExtent = abs(axis1) + abs(axis2);
+	if (ndcCenter.x - ndcExtent.x > 1.0 || ndcCenter.x + ndcExtent.x < -1.0 ||
+		ndcCenter.y - ndcExtent.y > 1.0 || ndcCenter.y + ndcExtent.y < -1.0)
+	{
+		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+		return;
+	}
+
+	// Decode the trained GS color, then immediately enter one scene-linear HDR
+	// contract. All lighting and splat accumulation after this point is linear.
+	float3 decodedSrgb;
+
+	if (UseSHRendering && NumSHCoeffs > 0)
+	{
+		// View-dependent SH rendering
+		float3 shDC;
+		float3 sh[15];
+		LoadSH(SHBuffer, splatIndex, SHBufferCoeffs, NumSHCoeffs, shDC, sh);
+
+		float3 viewDirWorld = normalize(CameraPosition - worldPos.xyz);
+		float3 viewDirLocal = mul(viewDirWorld, transpose((float3x3)LocalToWorld));
+		float3 viewDirPLY = float3(viewDirLocal.y, -viewDirLocal.z, viewDirLocal.x);
+		viewDirPLY = normalize(-viewDirPLY);
+
+		float3 shColor = EvaluateSH(viewDirPLY, shDC, sh, SHOrder);
+		if (UseHighPrecisionColorOpacity != 0u)
+		{
+			// The Float16 texture stores SHDCToColor. Preserve that base and add only
+			// the higher-order view-dependent residual from the SH buffer.
+			float3 higherOrderResidual = shColor - (SH_C0 * shDC);
+			decodedSrgb = max(colorOpacity.rgb + higherOrderResidual, 0.0);
+		}
+		else
+		{
+			decodedSrgb = max(0.5 + shColor, 0.0);
+		}
+	}
+	else
+	{
+		decodedSrgb = max(colorOpacity.rgb, 0.0);
+	}
+
+#if GS_VR_BASELINE
+    // No relighting, proxy sampling, vegetation, rain, fog or snow evaluation.
+    FGaussianSplatViewData baseline = (FGaussianSplatViewData)0;
+    baseline.ClipPosition = clipPos;
+    baseline.TranslatedWorldPos = translatedWorldPos;
+    float3 trainedLinear = SRGBToSceneLinearExact(decodedSrgb);
+    baseline.PackedColorRG = PackHalf2x16(trainedLinear.rg);
+    baseline.PackedColorBA = PackHalf2x16(float2(trainedLinear.b, opacity));
+    baseline.Axis1 = axis1;
+    baseline.Axis2 = axis2;
+    baseline.ClusterID = selectedClusterID;
+    baseline.Padding = selectedLODLevel;
+    ViewDataBuffer[outputIndex] = baseline;
+    return;
+#endif
+	// Gaussian-native plant transmission uses a stable pre-season material classifier.
+	// It is independent from the seasonal colour enable switch and does not modify colour.
+	float vegetationMaterialMask = ComputeGaussianVegetationMaterialMask(decodedSrgb);
+
+	// Use the trained, pre-lighting color so selection remains stable when
+	// exposure, lights, shadows and atmosphere change.
+	if (SeasonalColorSelectParams.x > 0.5)
+	{
+		// FLinearColor properties arrive in scene-linear space. Perform selection
+		// and remapping in that same space, then encode once back to the trained
+		// display-referred representation before the normal GS decode below.
+		float3 originalLinearForSeason = SRGBToSceneLinearExact(decodedSrgb);
+		float3 color01 = saturate(originalLinearForSeason);
+		float colorMax = max(color01.r, max(color01.g, color01.b));
+		float colorMin = min(color01.r, min(color01.g, color01.b));
+		float chroma = colorMax - colorMin;
+		float saturation = colorMax > 1e-5 ? chroma / colorMax : 0.0;
+		float greenDominance = (color01.g - max(color01.r, color01.b)) / max(colorMax, 0.05);
+
+		float3 sourceFrom = saturate(SeasonalSourceColorFrom.rgb);
+		float3 sourceTo = saturate(SeasonalSourceColorTo.rgb);
+		float3 sourceAxis = sourceTo - sourceFrom;
+		float sourceAxisLength2 = max(dot(sourceAxis, sourceAxis), 1e-5);
+		float rangePosition = saturate(dot(color01 - sourceFrom, sourceAxis) / sourceAxisLength2);
+		float3 closestSourceColor = lerp(sourceFrom, sourceTo, rangePosition);
+		float colorDistance = length(color01 - closestSourceColor);
+		// Serialized test values can be much wider than a useful vegetation
+		// classifier. Keep them inside a safe range so pale ground and walls do
+		// not enter the colour segment merely because they are nearby in RGB.
+		float tolerance = clamp(SeasonalColorSelectParams.y, 1e-4, 0.40);
+		float feather = clamp(SeasonalColorSelectParams.z, 1e-4, min(tolerance, 0.11));
+		float colorRangeMask = 1.0 - smoothstep(max(tolerance - feather, 0.0), tolerance, colorDistance);
+		float safeMinSaturation = max(SeasonalColorSelectParams.w, 0.14);
+		float saturationMask = smoothstep(
+			safeMinSaturation,
+			min(safeMinSaturation + 0.10, 1.0),
+			saturation);
+		float safeMinGreenDominance = max(SeasonalSourceColorFrom.w, 0.02);
+		float greenDominanceMask = smoothstep(
+			safeMinGreenDominance,
+			safeMinGreenDominance + 0.07,
+			greenDominance);
+
+		// Core green evidence remains strict, while a softer yellow-green branch
+		// catches leaves transitioning toward autumn. Selection uses trained
+		// pre-lighting colour, so neutral architecture is still rejected by the
+		// saturation and range gates.
+		float greenOverRed = color01.g - color01.r;
+		float greenOverBlue = color01.g - color01.b;
+		float coreGreenMask =
+			smoothstep(0.005, 0.045, greenOverRed)
+			* smoothstep(0.005, 0.045, greenOverBlue);
+		float yellowGreenBalance = color01.g / max(max(color01.r, color01.b), 0.025);
+		float blueSuppression = saturate((max(color01.r, color01.g) - color01.b) / max(colorMax, 0.04));
+		float transitionLeafMask =
+			smoothstep(0.78, 0.98, yellowGreenBalance)
+			* smoothstep(0.18, 0.32, saturation)
+			* smoothstep(0.05, 0.22, blueSuppression);
+		float vegetationHueMask = max(coreGreenMask, transitionLeafMask * 0.82);
+
+		// Protect near-white highlights where tiny channel differences are not
+		// reliable colour evidence.
+		float neutralHighlight = smoothstep(0.68, 0.92, colorMax)
+			* (1.0 - smoothstep(0.16, 0.30, saturation));
+		float materialProtectionMask = 1.0 - neutralHighlight;
+		float selectionMask = saturate(
+			colorRangeMask
+			* saturationMask
+			* max(greenDominanceMask, transitionLeafMask * 0.78)
+			* vegetationHueMask
+			* materialProtectionMask);
+		if (SeasonalColorAdjustParams.w > 0.5)
+		{
+			decodedSrgb = selectionMask.xxx;
+		}
+		else
+		{
+			// Preserve the original position inside the selected source range and
+			// transfer it into the target range instead of collapsing to one tint.
+			// Bright vegetation occupies most of the upper source segment and
+			// otherwise collapses toward target yellow. Curve the segment
+			// position toward the target start colour to retain red/orange.
+			float targetStartBias = saturate(SeasonalTargetColorTo.w);
+			float mappedRangePosition = pow(
+				saturate(rangePosition),
+				lerp(1.0, 4.0, targetStartBias));
+			float3 mappedColor = lerp(
+				max(SeasonalTargetColorFrom.rgb, 0.0),
+				max(SeasonalTargetColorTo.rgb, 0.0),
+				mappedRangePosition);
+			float originalLuma = dot(color01, float3(0.2126, 0.7152, 0.0722));
+			float mappedLuma = max(dot(mappedColor, float3(0.2126, 0.7152, 0.0722)), 1e-4);
+			mappedColor *= originalLuma / mappedLuma;
+			// Re-inject local residual around the source range. This retains leaf,
+			// grass and material variation instead of collapsing the range to a
+			// perfectly smooth target gradient.
+			float3 sourceReference = lerp(sourceFrom, sourceTo, rangePosition);
+			float3 sourceResidual = color01 - sourceReference;
+			mappedColor = max(
+				mappedColor + sourceResidual * saturate(SeasonalTargetColorFrom.w),
+				0.0);
+			// The public replacement-strength slider is 0..1; do not plateau at
+			// 0.76 before the user reaches the end of that range.
+			float replacementStrength = saturate(SeasonalColorAdjustParams.z);
+			float3 adjusted = lerp(color01, mappedColor, replacementStrength);
+			float adjustedLuma = dot(adjusted, float3(0.2126, 0.7152, 0.0722));
+			float safeSaturationScale = clamp(SeasonalColorAdjustParams.x, 0.0, 1.08);
+			float safeBrightnessScale = clamp(SeasonalColorAdjustParams.y, 0.0, 1.04);
+			adjusted = lerp(adjustedLuma.xxx, adjusted, safeSaturationScale);
+			adjusted *= safeBrightnessScale;
+
+			// Compress only the hot seasonal result, preserving hue and local
+			// variation while preventing neon yellow clipping.
+			float adjustedMax = max(adjusted.r, max(adjusted.g, adjusted.b));
+			if (adjustedMax > 1.08)
+			{
+				adjusted *= 1.08 / adjustedMax;
+			}
+			float3 adjustedSrgb = SceneLinearToSRGBExact(adjusted);
+			decodedSrgb = lerp(decodedSrgb, adjustedSrgb, selectionMask);
+		}
+	}
+
+	float3 baseLinear = SRGBToSceneLinearExact(decodedSrgb);
+	float3 viewDirForLighting = normalize(CameraPosition - worldPos.xyz);
+	float proxyNormalConfidence = 0.0;
+	float3 lightingNormal = SelectLightingNormal(rotation, scale, localToWorldRot, viewDirForLighting, localPos, proxyNormalConfidence);
+	// Reduce proxy influence on strongly green foliage while preserving the cache fallback.
+	float baseLumaForNormal = max(SceneLinearLuminance(baseLinear), 0.02);
+	float foliageMaskForNormal = saturate((baseLinear.g - max(baseLinear.r, baseLinear.b)) / baseLumaForNormal);
+	if (UnrealNormalMode == 5u && foliageMaskForNormal > 0.0)
+	{
+		float3 rawNormalForFoliage = SelectRawSplatAxisNormal(rotation, scale, localToWorldRot);
+		if (dot(rawNormalForFoliage, lightingNormal) < 0.0) rawNormalForFoliage = -rawNormalForFoliage;
+		float foliageProxyScale = lerp(1.0, saturate(ProxyNormalParams.w), foliageMaskForNormal);
+		lightingNormal = normalize(lerp(rawNormalForFoliage, lightingNormal, foliageProxyScale));
+	}
+	// 2.8.73: calculate the deterministic world accumulation field only once per
+	// original splat; reuse the baked UNORM8 value when this source matches.
+	float snowWorldField2873 = 0.0;
+	if (DirectSplatSurfaceEffectParams0.x > 1.5 &&
+		DirectSplatSurfaceEffectParams0.y > 0.0001 &&
+		DirectSnowTuningParams.w >= 1.0)
+	{
+		snowWorldField2873 = SourceSnowWorldField2873(
+			splatIndex, worldPos.xy, DirectSplatSurfaceEffectParams0.w);
+	}
+	float directSnowWeight = 0.0;
+	float directSnowLightFacing = 0.0;
+	float directWetSurfaceMembership = 0.0;
+	float directWetPuddleMembership = 0.0;
+	float3 directWeatherNormal = lightingNormal;
+	// v2785 SNOW LAYER B. Weather classification is stable-geometry based and
+	// camera independent. Snow no longer mutates the original GS splat. Instead,
+	// CalcViewData writes a compact normal+accumulation payload for a dedicated
+	// second snow draw that renders above the untouched source splats.
+	if (DirectSplatSurfaceEffectParams0.x > 0.5 &&
+		DirectSplatSurfaceEffectParams0.y > 0.0001)
+	{
+		const bool snowMode = DirectSplatSurfaceEffectParams0.x > 1.5;
+		bool stableWeatherNormalValid = false;
+		float3 stableWeatherLocalNormal = LoadStableProxyTriangleNormal(splatIndex, stableWeatherNormalValid);
+		float weatherSurfaceMembership = stableWeatherNormalValid ? 1.0 : 0.0;
+		float stableWetPuddleMembership = stableWeatherNormalValid
+			? LoadStableWetGroundMembership(splatIndex, localPos)
+			: 0.0;
+		if (stableWeatherNormalValid)
+		{
+			directWeatherNormal = normalize(mul(stableWeatherLocalNormal, (float3x3)LocalToWorld));
+		}
+		else
+		{
+			float4 fallbackProxyNormal = LoadProxyNormal(localPos);
+			float fallbackConfidence = saturate(fallbackProxyNormal.w);
+			if (fallbackConfidence > 0.015 && dot(fallbackProxyNormal.xyz, fallbackProxyNormal.xyz) > 0.01)
+			{
+				directWeatherNormal = normalize(fallbackProxyNormal.xyz);
+				weatherSurfaceMembership = smoothstep(0.015, 0.16, fallbackConfidence);
+			}
+			else if (!snowMode)
+			{
+				// v29 Rain fallback must never inherit SelectLightingNormal(), because normal
+				// mode 0 can flip that normal toward the current camera. Use the intrinsic
+				// thinnest covariance axis instead. Its sign is irrelevant to Rain because
+				// the Wet pass uses abs(N.z) for horizontal eligibility.
+				directWeatherNormal = normalize(
+					SelectRawSplatAxisNormal(rotation, scale, localToWorldRot));
+			}
+		}
+
+		// SnowGroundUnion v2803: Snow-only union between proxy classification and
+		// the raw GS ground cue.  A valid proxy no longer suppresses a clearly
+		// upward, planar raw splat. This recovers floor seeds where the proxy normal
+		// exists but is locally tilted/noisy. Wet/rain behavior is unchanged.
+		float rawSnowGroundMembership = 0.0;
+		float3 rawSnowGroundNormal = directWeatherNormal;
+		if (snowMode)
+		{
+			rawSnowGroundNormal = SelectRawSplatAxisNormal(rotation, scale, localToWorldRot);
+			// A Gaussian's thinnest covariance eigen-axis has no physical sign:
+			// (n) and (-n) project the SAME ellipsoid. On the hybrid path only,
+			// orient that ambiguous raw axis to world +Z before ground testing.
+			// The independent static sky-exposure test below still rejects roofs'
+			// undersides and indoor floors; Wet/legacy Snow remain unchanged.
+			if (DirectSnowTuningParams.w >= 1.0 && rawSnowGroundNormal.z < 0.0)
+				rawSnowGroundNormal *= -1.0;
+			float3 absScale = abs(scale);
+			float minScale = min(absScale.x, min(absScale.y, absScale.z));
+			float maxScale = max(absScale.x, max(absScale.y, absScale.z));
+			float planarConfidence = 1.0 - saturate(minScale / max(maxScale, 1.0e-5));
+			float groundFillStrength = saturate(DirectSnowTuningParams.x);
+			float rawUpLow = lerp(0.84, 0.60, groundFillStrength);
+			float rawUpHigh = lerp(0.97, 0.84, groundFillStrength);
+			float rawPlanarLow = lerp(0.30, 0.12, groundFillStrength);
+			float rawPlanarHigh = lerp(0.58, 0.40, groundFillStrength);
+			float rawUpMask = smoothstep(rawUpLow, rawUpHigh, rawSnowGroundNormal.z);
+			float rawPlanarMask = smoothstep(rawPlanarLow, rawPlanarHigh, planarConfidence);
+			rawSnowGroundMembership = rawUpMask * rawPlanarMask;
+
+			// When the raw ground cue is clearly stronger than the proxy support, use
+			// its normal for Snow shading/packing only. This avoids keeping a bad proxy
+			// tilt while still leaving all non-Snow paths untouched.
+			float proxyGroundSupport = saturate(weatherSurfaceMembership * directWeatherNormal.z);
+			if (rawSnowGroundMembership > proxyGroundSupport + 0.18)
+			{
+				directWeatherNormal = normalize(rawSnowGroundNormal);
+			}
+		}
+
+		// Preserve authored orientation. Down-facing undersides never accumulate.
+		float upwardFacing = saturate(directWeatherNormal.z);
+		// Snow keeps its authored upward-surface selector. Wet v5 no longer uses this
+		// selector for base wetness; rain exposure is global and only proxy shelter
+		// removes it. The selector remains available later for Snow and puddles.
+		float horizontalThreshold = saturate(DirectSplatSurfaceEffectParams0.z);
+		const bool hybridSnowSource = snowMode && DirectSnowTuningParams.w >= 1.0;
+		// The same authored slope cutoff is used by the proxy relief baker.
+		// The GPU applies a narrow transition to avoid binary cracks in the
+		// source GS colour while the baked geometry uses the hard center cutoff.
+		float horizontalStart = hybridSnowSource
+			? max(0.0, horizontalThreshold - 0.06) : horizontalThreshold;
+		float horizontalEnd = hybridSnowSource
+			? min(0.999, horizontalThreshold + 0.06)
+			: min(horizontalThreshold + 0.12, 0.999);
+		float horizontalMask = smoothstep(horizontalStart, horizontalEnd, upwardFacing);
+		float weatherStrength = saturate(DirectSplatSurfaceEffectParams0.y);
+		float proxyWeatherSupport = horizontalMask * weatherSurfaceMembership;
+		float groundFillStrength = snowMode ? saturate(DirectSnowTuningParams.x) : 0.0;
+		float rawGroundContribution = lerp(0.42, 0.98, groundFillStrength);
+		float snowGroundSupport = snowMode
+			? max(proxyWeatherSupport, rawSnowGroundMembership * rawGroundContribution)
+			: proxyWeatherSupport;
+
+		// SnowStructureCap v2803: the proxy/collider may be one merged mesh, so
+		// separate broad ground from structure faces by the LOCAL surface normal
+		// instead of object identity. Horizontal tops keep full accumulation;
+		// steep/sloped sides fall off non-linearly and vertical faces receive none.
+		// This is Snow-only and does not alter Wet/Rain classification.
+		if (snowMode && !hybridSnowSource)
+		{
+			// The old screen-space coverage path retains its artist-tuned
+			// structure cap. Hybrid source GS follows the SAME proxy-slope cutoff
+			// as the baked relief instead of applying a second, unrelated cap.
+			float structureRemoval = saturate(DirectSnowTuningParams.y);
+			float structureSlopeThreshold = saturate(DirectSnowTuningParams.z);
+			float slopeStart = lerp(0.48, 0.90, structureSlopeThreshold);
+			float slopeEnd = min(slopeStart + lerp(0.30, 0.075, structureSlopeThreshold), 0.999);
+			float structureSlopeCap = smoothstep(slopeStart, slopeEnd, upwardFacing);
+			structureSlopeCap *= structureSlopeCap;
+			float structureGate = lerp(1.0, structureSlopeCap, structureRemoval);
+			snowGroundSupport *= structureGate;
+		}
+
+		float commonWeatherMask = saturate(weatherStrength * snowGroundSupport);
+
+		if (!snowMode)
+		{
+			// RainOcclusion v5:
+			//  1) Base wet/darkening/reflection is allowed on the ENTIRE 3DGS.
+			//  2) Only the static world-up Proxy rain ray can remove wetness, e.g. floors
+			//     under roofs/awnings. Invalid/unbound splats fail open to 1.
+			//  3) Puddle/ripple keep the strict stable-plane attachment and the post-pass
+			//     horizontal selector, so foliage/walls do not become puddle receivers.
+			directWetSurfaceMembership = LoadStableRainExposure(splatIndex);
+			directWetPuddleMembership = saturate(stableWetPuddleMembership);
+		}
+
+		if (snowMode)
+		{
+			// v2837 hybrid: when the separate baked Snow Gaussian is in use,
+			// attach legacy base coverage only to world-up exposed source surfaces.
+			// This is the existing static weather-ray proof, not a camera-space mask
+			// or the light-dependent Stable Geometry Closure. Missing data fail open.
+			if (DirectSnowTuningParams.w >= 2.0)
+			{
+				// Share the same static world-up sky test used by snow geometry.
+				// Do not use the light-dependent cast or camera-space depth.
+				commonWeatherMask *= LoadStableRainExposure(splatIndex);
+			}
+			// v2786: do NOT reuse Stable Geometry Closure as a snow-exposure mask.
+			// Closure is intentionally camera/light independent and is shaped for
+			// indirect/occlusion lighting, not for a strict +Z sky-visibility test.
+			// Reusing it here stamped a stationary dark/no-snow pattern that looked
+			// like a second fixed shadow when the Directional Light rotated.
+			// A dedicated upward weather-ray exposure can be added later without
+			// coupling accumulation to the production Stable Self-Cast field.
+
+			// Keep accumulation continuous and world locked. For this revision the
+			// snow support depends only on authored surface orientation + strength +
+			// low-frequency accumulation variation, so it cannot create a second
+			// stationary shadow mask.
+			float accumulationVariation = 1.0;
+			if (hybridSnowSource)
+			{
+				// Exact artist field (UNORM8 cache for a current bake, live fallback).
+				accumulationVariation = lerp(0.83, 1.03, snowWorldField2873);
+			}
+			else
+			{
+				// This legacy variation is needed ONLY for a non-baked snow overlay.
+				// Neither hybrid Snow nor Wet/Rain executes these trigonometric terms.
+				float worldScale = max(DirectSplatSurfaceEffectParams0.w, 0.001) * 0.012;
+				float broadPattern =
+					0.58 +
+					0.18 * sin(worldPos.x * worldScale + worldPos.y * worldScale * 0.37) +
+					0.14 * sin(worldPos.y * worldScale * 0.71 - worldPos.x * worldScale * 0.23);
+				broadPattern = smoothstep(0.24, 0.74, broadPattern);
+				float finePattern =
+					0.5 + 0.5 * sin((worldPos.x * 1.91 - worldPos.y * 2.37 + worldPos.z * 0.31) * worldScale * 1.71);
+				accumulationVariation =
+					lerp(0.78, 1.0, saturate(broadPattern * 0.72 + finePattern * 0.28));
+			}
+			directSnowWeight = saturate(
+				commonWeatherMask * accumulationVariation);
+
+			// v2791H: Snow shading authority is intentionally minimal.  Capture only
+			// the live directional-light facing here.  Stable cast visibility is packed
+			// separately later and multiplied in the snow overlay draw.  Do NOT feed
+			// postLight, geometry closure, source luma, seasonal grade, or any static
+			// proxy mask into snow color.
+			float snowDirectionalWeight = 0.0;
+			float3 snowDirectionalTint = 1.0.xxx;
+			GetPrimaryDirectionalLighting(
+				directWeatherNormal,
+				directSnowLightFacing,
+				snowDirectionalWeight,
+				snowDirectionalTint);
+			directSnowLightFacing = saturate(directSnowLightFacing);
+		}
+		// Wet shading is deliberately not evaluated per splat. The dedicated
+		// post-grade Wet Surface pass consumes this same stable normal instead.
+	}
+	// Do not synthesize world-space shadow bands here. Direct lighting already
+	// evaluates the selected surface normal, and real cast shadows are applied
+	// later from the proxy capture. The old post mask added two sine waves plus
+	// canopy noise, producing visible stripes even when proxy normals/shadows
+	// were disabled.
+	// v2838 shared snow presentation: transform the ORIGINAL splat's evaluated
+	// SH color, never its position, opacity, covariance or source asset.
+	// The geometric snow bake uses the same world-up slope, real proxy support
+	// and sky-exposure eligibility, and is reserved for small local relief.
+	// Keeping the authoring decision at worldPos makes panorama MRQ view-independent.
+	if (DirectSplatSurfaceEffectParams0.x > 1.5 &&
+		DirectSplatSurfaceEffectParams0.y > 0.0001 &&
+		DirectSnowTuningParams.w >= 1.0)
+	{
+		float hybridMix = (DirectSnowTuningParams.w >= 2.0)
+			? (DirectSnowTuningParams.w - 2.0) * 2.0
+			: (DirectSnowTuningParams.w - 1.0) * 2.0;
+		float sourceCoverage = saturate(directSnowWeight);
+		// The mask is per ORIGINAL splat and derives from the same stable
+		// normals/exposure as the extra layer, with no pixel-neighborhood painting.
+		// The threshold was baked from the exposed and supported proxy area.
+		// Preserve a subdued source-GS snow base beyond the thick snow patches,
+		// then raise the albedo only where actual Gaussian relief is present.
+		// The ONLY authority when a genuine v2842 bake exists: its source-splat
+		// 3D correspondence, not an independent 2D procedural colour threshold.
+		// Missing correspondence means no white paint without snow geometry.
+		float bakedCorrespondence = -1.0;
+		uint bakedCode = 0u;
+		if (SnowCoveragePackedCount > 0u && (splatIndex >> 4u) < SnowCoveragePackedCount)
+		{
+			uint word = SnowCoveragePackedBuffer[splatIndex >> 4u];
+			bakedCode = (word >> ((splatIndex & 15u) * 2u)) & 3u;
+			bakedCorrespondence = bakedCode == 3u ? 1.0 : (bakedCode == 2u ? 0.68 : (bakedCode == 1u ? 0.19 : 0.0));
+		}
+		float sharedField = snowWorldField2873;
+		float bakedCut = DirectSplatSurfaceEffectParams2.y;
+		float inThickSnow = smoothstep(bakedCut - 0.15, bakedCut + 0.035, sharedField);
+		// Keep source GS almost fully snow-covered UNDER baked relief, with a
+		// subtle frost transition instead of painting unbaked surfaces pure white.
+		// v2846 SOURCE-FIRST: source-GS local cells now author the snow layer.
+		// The generated 3D correspondence, not a second proxy-slope threshold,
+		// authorizes the underlying original-GS albedo. Mask code=0 stays dark;
+		// code=3 follows measured source detail even with proxy-normal noise.
+		float sourceSnowBlend = saturate(hybridMix) *
+			(bakedCorrespondence >= 0.0
+				? bakedCorrespondence * lerp(0.83, 1.0, smoothstep(0.05, 0.52, sourceCoverage))
+				: smoothstep(0.04, 0.51, sourceCoverage) * lerp(0.16, 1.0, inThickSnow));
+		// v2872: ONLY the baked correspondence (3=full, 2=partial) may
+		// suppress captured paver colour beneath existing snow. Do not infer
+		// snow from a dark pixel or expand into missing/edge/unsupported GS.
+		float matchedSnowCover = saturate(SnowSourceCoverParams.x) *
+			(bakedCode == 3u ? 1.0 : (bakedCode == 2u ? 0.28 : 0.0));
+		if (SnowCoveragePackedCount == 0u) matchedSnowCover = 0.0;
+		sourceSnowBlend = saturate(sourceSnowBlend +
+			(1.0 - sourceSnowBlend) * matchedSnowCover * 0.80 * saturate(hybridMix));
+		if (sourceSnowBlend > 0.0001)
+		{
+			float3 originalSplatLinear = baseLinear;
+			float sourceLuma = dot(originalSplatLinear, float3(0.2126, 0.7152, 0.0722));
+			float3 originalChromaticRelief = originalSplatLinear - sourceLuma.xxx;
+			float3 snowAlbedo = SRGBToSceneLinearExact(
+				saturate(DirectSplatSurfaceEffectParams1.rgb));
+			// Retain a restrained part of the captured directional/local colour
+			// variation already evaluated by the source 3DGS SH.
+			// Retain texture/stone/albedo variations. Pure white uniform paint
+			// made separate parts of the GS look like featureless flat patches.
+			float relief = clamp(0.80 + sourceLuma * 0.29, 0.78, 1.09);
+			float3 snowWithSourceStructure = max(snowAlbedo * relief +
+				originalChromaticRelief * 0.17, 0.0.xxx);
+			// 2.8.61: on FULLY matched real snow-covered source splats,
+			// reduce the scan's baked dark paver/pattern contrasts which
+			// otherwise remain visible as huge ellipses underneath fine grains.
+			// This does not touch original covariance, source opacity, or
+			// partial/unmatched surfaces and cannot bridge roof/floor layers.
+			if (bakedCode == 3u && SnowCoveragePackedCount > 0u)
+			{
+				float settledNoise = snowWorldField2873;
+				float3 settledBlanket = snowAlbedo * lerp(0.93, 1.015, settledNoise);
+				snowWithSourceStructure = lerp(snowWithSourceStructure, settledBlanket, lerp(0.66, 0.87, matchedSnowCover));
+			}
+			baseLinear = lerp(originalSplatLinear, snowWithSourceStructure, sourceSnowBlend);
+		}
+		// A diagnostic source render, never a world-space snow generator.
+		// red=missing baked snow, yellow=edge, green=partial, blue=full.
+		if (SnowCoveragePackedCount > 0u && DirectSplatSurfaceEffectParams2.z > 0.5 &&
+			DirectSplatSurfaceEffectParams2.z < 1.5)
+		{
+			float3 diagnosticSRGB = bakedCode == 3u ? float3(0.17, 0.63, 1.00) :
+				(bakedCode == 2u ? float3(0.09, 0.90, 0.30) :
+				(bakedCode == 1u ? float3(1.00, 0.80, 0.08) : float3(0.96, 0.12, 0.14)));
+			baseLinear = SRGBToSceneLinearExact(diagnosticSRGB);
+		}
+	}
+	// P19: snow-style ORIGINAL source-GS correspondence. This is not a camera
+	// or screen mask. The existing water layer still creates surface droplets,
+	// while the measured source roof/foliage remains visible underneath.
+	if (PuddleSourceWetSettings.x > 0.001 &&
+		splatIndex < OriginalSplatCount && (splatIndex >> 3u) < PuddleDampenPackedCount)
+	{
+		const uint packed = PuddleDampenPackedMask[splatIndex >> 3u];
+		const uint code = (packed >> ((splatIndex & 7u) * 4u)) & 0xFu;
+		const bool roof = (code & 2u) != 0u;
+		const bool foliage = (code & 4u) != 0u;
+		if (roof || foliage)
+		{
+			const uint debug = (uint)round(PuddleSourceWetSettings.y);
+			if ((roof && (debug == 1u || debug == 3u)) ||
+				(foliage && (debug == 2u || debug == 3u)))
+			{
+				// Diagnose ORIGINAL surface coverage, never the oversized
+				// supplemental roof splat positions used in P15-P18.
+				baseLinear = SRGBToSceneLinearExact(roof ?
+					float3(0.035, 0.20, 1.0) : float3(0.015, 0.94, 0.84));
+			}
+			else
+			{
+				// Conservative source albedo wetting: retain captured tile
+				// texture, unlike flat opaque color painted over the scene.
+				const float strength = saturate(PuddleSourceWetSettings.x);
+				const float luma = dot(baseLinear, float3(0.2126, 0.7152, 0.0722));
+				const float3 wetRoof = baseLinear * (0.60 + 0.08 * saturate(luma));
+				const float3 wetLeaf = baseLinear * 0.78 + float3(0.007, 0.012, 0.014);
+				baseLinear = lerp(baseLinear, roof ? wetRoof : wetLeaf, strength);
+			}
+		}
+	}
+	float postLightMask = ComputeExactProxyDirectionalVisibility(localPos, lightingNormal);
+	float stableProxyReceiverSignal = ComputeStableProxyReceiverSignal(localPos);
+	float primaryFacing;
+	float primaryWeight;
+	float3 primaryTint;
+	GetPrimaryDirectionalLighting(lightingNormal, primaryFacing, primaryWeight, primaryTint);
+	float3 legacyApproxAlbedo = EstimateBoundedApproxAlbedo(baseLinear, primaryFacing);
+	float3 bakedLightingEstimate = float3(1.0, 1.0, 1.0);
+	float spatialConfidence = 0.0;
+	float spatialCorrectionWeight = 0.0;
+	uint spatialCellID = 0u;
+	float3 spatialApproxAlbedo = ApplySpatialDelighting(
+		baseLinear, legacyApproxAlbedo, localPos, bakedLightingEstimate, spatialConfidence, spatialCorrectionWeight, spatialCellID);
+	float spatialEnabled = step(0.5, SpatialDelightingParams0.x) * step(0.001, SpatialDelightingParams0.y) * step(0.001, spatialConfidence);
+	float3 approximateAlbedo = lerp(legacyApproxAlbedo, spatialApproxAlbedo, spatialEnabled);
+
+	// Base/indirect and direct remain separate all the way into the pixel shader.
+	// Captured proxy shadow visibility is therefore applied only to DirectLinear.
+	float3 baseIndirectLinear = ComputeRelitIndirectBase(
+		baseLinear, approximateAlbedo, lightingNormal, postLightMask);
+	float3 directLinear = ComputeBoundedDirectionalLightContribution(
+		approximateAlbedo, lightingNormal, postLightMask);
+	directLinear += ComputeLocalLightContribution(
+		worldPos.xyz, approximateAlbedo, lightingNormal);
+	directLinear *= (UnrealRelightParams.x >= 0.5) ? saturate(UnrealRelightParams.y) : 1.0;
+
+	// These are new Gaussian-native light payloads. They do not call the proxy shadow
+	// functions and do not alter directLinear, postLightMask, or any shadow parameter.
+	float3 gaussianSunAccentLinear = ComputeGaussianSunAccent(
+		approximateAlbedo, lightingNormal);
+	float3 gaussianPlantTransmissionLinear = ComputeGaussianPlantTransmission(
+		approximateAlbedo, lightingNormal, viewDirForLighting, vegetationMaterialMask);
+	uint spatialDebugMode = (uint)round(SpatialDelightingParams1.w);
+	if (spatialDebugMode >= 11u && spatialDebugMode <= 30u)
+	{
+		float3 diagnosticColor = baseIndirectLinear;
+		if (spatialDebugMode == 11u)
+		{
+			diagnosticColor = baseLinear;
+		}
+		else if (spatialDebugMode == 12u)
+		{
+			diagnosticColor = bakedLightingEstimate * 0.60;
+		}
+		else if (spatialDebugMode == 13u)
+		{
+			diagnosticColor = approximateAlbedo;
+		}
+		else if (spatialDebugMode == 14u)
+		{
+			diagnosticColor = abs(baseLinear - approximateAlbedo) * SpatialDelightingParams2.z;
+		}
+		else if (spatialDebugMode == 15u)
+		{
+			diagnosticColor = baseIndirectLinear;
+		}
+		else if (spatialDebugMode == 16u)
+		{
+			diagnosticColor = directLinear * 3.0;
+		}
+		else if (spatialDebugMode == 17u)
+		{
+			diagnosticColor = postLightMask.xxx;
+		}
+		else if (spatialDebugMode == 18u)
+		{
+			float3 approximateFinal = baseIndirectLinear + directLinear * postLightMask;
+			diagnosticColor = abs(approximateFinal - baseLinear) * SpatialDelightingParams2.z;
+		}
+		else if (spatialDebugMode == 19u)
+		{
+			diagnosticColor = spatialConfidence.xxx;
+		}
+		else if (spatialDebugMode == 20u)
+		{
+			// Stable hash color makes cell boundaries and mapping errors visible.
+			float cellHash = frac((float)spatialCellID * 0.61803398875);
+			diagnosticColor = 0.35 + 0.65 * frac(float3(cellHash, cellHash + 0.3333, cellHash + 0.6667));
+		}
+		else if (spatialDebugMode == 21u)
+		{
+			diagnosticColor = spatialCorrectionWeight.xxx;
+		}
+		else if (spatialDebugMode == 22u)
+		{
+			uint cacheStatus = (uint)round(SpatialLightingGridDimensionsStatus.w);
+			diagnosticColor = cacheStatus == 1u ? float3(0.0, 1.0, 0.0) :
+				(cacheStatus == 2u ? float3(1.0, 0.45, 0.0) :
+				(cacheStatus == 3u ? float3(1.0, 0.0, 0.0) : float3(0.8, 0.0, 1.0)));
+		}
+		else if (spatialDebugMode == 23u)
+		{
+			diagnosticColor = abs(spatialApproxAlbedo - legacyApproxAlbedo) * SpatialDelightingParams2.z;
+		}
+		else if (spatialDebugMode == 24u)
+		{
+			float spatialLuma = max(SceneLinearLuminance(spatialApproxAlbedo), 0.001);
+			float legacyLuma = max(SceneLinearLuminance(legacyApproxAlbedo), 0.001);
+			float signedEV = log2(spatialLuma / legacyLuma);
+			float displayRangeEV = max(SpatialDelightingParams4.z, 0.25);
+			float signedDisplay = 0.5 + 0.5 * clamp(signedEV / displayRangeEV, -1.0, 1.0);
+			diagnosticColor = signedDisplay.xxx;
+		}
+		else if (spatialDebugMode == 25u)
+		{
+			float spatialLuma = max(SceneLinearLuminance(spatialApproxAlbedo), 0.02);
+			float legacyLuma = max(SceneLinearLuminance(legacyApproxAlbedo), 0.02);
+			float3 spatialTint = spatialApproxAlbedo / spatialLuma;
+			float3 legacyTint = legacyApproxAlbedo / legacyLuma;
+			diagnosticColor = saturate(0.5 + (spatialTint - legacyTint) * 0.75);
+		}
+		else if (spatialDebugMode == 26u)
+		{
+			diagnosticColor = spatialCorrectionWeight.xxx;
+		}
+		else if (spatialDebugMode == 27u)
+		{
+			float4 proxyData = LoadProxyNormal(localPos);
+			diagnosticColor = proxyData.xyz * 0.5 + 0.5;
+		}
+		else if (spatialDebugMode == 28u)
+		{
+			diagnosticColor = lightingNormal * 0.5 + 0.5;
+		}
+		else if (spatialDebugMode == 29u)
+		{
+			diagnosticColor = proxyNormalConfidence.xxx;
+		}
+		else
+		{
+			float primaryFacingDebug;
+			float primaryWeightDebug;
+			float3 primaryTintDebug;
+			GetPrimaryDirectionalLighting(lightingNormal, primaryFacingDebug, primaryWeightDebug, primaryTintDebug);
+			diagnosticColor = primaryFacingDebug.xxx;
+		}
+		baseIndirectLinear = max(diagnosticColor, 0.0);
+		directLinear = float3(0.0, 0.0, 0.0);
+		gaussianSunAccentLinear = float3(0.0, 0.0, 0.0);
+		gaussianPlantTransmissionLinear = float3(0.0, 0.0, 0.0);
+	}
+
+	// The native UE fog passes have already run before this late GS composite.
+	// Evaluate aerial perspective in scene-linear HDR here, while preserving a
+	// separate transmitted direct term for the proxy-shadow pixel pass.
+	if (spatialDebugMode < 11u || spatialDebugMode > 30u)
+	{
+		float atmosphereTransmission = 1.0;
+		float3 shadowableBloomLinear = float3(0.0, 0.0, 0.0);
+		float3 atmosphereTotalLinear = ApplyGaussianCinematicAtmosphere(
+			baseIndirectLinear + directLinear,
+			worldPos.xyz,
+			postLightMask,
+			primaryTint,
+			atmosphereTransmission,
+			shadowableBloomLinear);
+		float3 transmittedDirectLinear = max(
+			directLinear * atmosphereTransmission,
+			0.0);
+		// v2818 compress broad direct-light energy before the final carrier composite.
+		// This preserves angular shading but prevents a large front-facing wall/floor from
+		// behaving like an exposure boost. The dedicated post-grade bloom still sees the
+		// resulting HDR highlights.
+		float transmittedDirectLuma = SceneLinearLuminance(transmittedDirectLinear);
+		if (transmittedDirectLuma > 1.0e-5)
+		{
+			float compressedDirectLuma = transmittedDirectLuma / (1.0 + transmittedDirectLuma * 0.58);
+			float directCompression = lerp(1.0, compressedDirectLuma / transmittedDirectLuma, 0.72);
+			transmittedDirectLinear *= directCompression;
+		}
+		float3 atmosphereDirectLinear = transmittedDirectLinear + shadowableBloomLinear;
+		// Bloom never entered atmosphereTotalLinear, so only subtract the
+		// transmitted physical direct term. Subtracting bloom here would darken
+		// the base/shadow payload whenever Bloom Strength was increased.
+		baseIndirectLinear = max(atmosphereTotalLinear - transmittedDirectLinear, 0.0);
+		directLinear = atmosphereDirectLinear;
+		gaussianSunAccentLinear *= atmosphereTransmission;
+		gaussianPlantTransmissionLinear *= atmosphereTransmission;
+	}
+
+	// v2798 whole-GS solar hue grade. Do this after physical light/atmosphere so the
+	// visible scan, not just the added ambient/direct terms, enters golden hour / sunset / blue hour.
+	baseIndirectLinear = ApplyTimeOfDayHueGrade(baseIndirectLinear);
+	directLinear = ApplyTimeOfDayHueGrade(directLinear);
+	gaussianSunAccentLinear = ApplyTimeOfDayHueGrade(gaussianSunAccentLinear);
+	gaussianPlantTransmissionLinear = ApplyTimeOfDayHueGrade(gaussianPlantTransmissionLinear);
+
+	// The payload remains scene-linear HDR. Unreal's shared post chain still owns
+	// exposure, bloom and the final display transform after splat accumulation.
+	FGaussianSplatViewData viewData;
+	viewData.ClipPosition = clipPos;
+	viewData.TranslatedWorldPos = translatedWorldPos;
+	// Shared 20-bit stable world normal plus 12-bit snow payload. Wet and Snow
+	// consume the same camera-independent surface orientation without expanding
+	// the 80-byte per-splat view buffer.
+	if (DirectSplatSurfaceEffectParams0.x > 1.5 &&
+		DirectSplatSurfaceEffectParams0.y > 0.0001)
+	{
+		viewData.TranslatedWorldPosPad =
+			asfloat(PackDirectSnowOverlayData(
+				directWeatherNormal, directSnowWeight, directSnowLightFacing));
+	}
+	else if (DirectSplatSurfaceEffectParams0.x > 0.5 &&
+		DirectSplatSurfaceEffectParams0.y > 0.0001)
+	{
+		// v36: upper 12 payload bits carry intrinsic splat-size quality only.
+		// Continuous Rain receiver admission is evaluated later from the collider/proxy
+		// surface; the per-splat payload is never allowed to punch Wet holes.
+		viewData.TranslatedWorldPosPad =
+			asfloat(PackDirectRainWaterData(
+				directWeatherNormal, directRainWorldSplatSizeCm));
+	}
+	else
+	{
+		viewData.TranslatedWorldPosPad =
+			asfloat(PackDirectSnowOverlayData(directWeatherNormal, 0.0, 0.0));
+	}
+	viewData.PackedColorRG = PackHalf2x16(baseIndirectLinear.rg);
+	viewData.PackedColorBA = PackHalf2x16(float2(baseIndirectLinear.b, opacity));
+	// Production uses the camera-independent dense cast field. It stores a stable
+	// receiver-space visibility result and interpolates it inside proxy triangles.
+	const bool stableLightingDiagnostic = StableShadowDebugMode == 72u;
+	// v2805 diagnostic: render ONLY the exact Stable proxy-normal N.L used by the
+	// production direct-light path. No cast, closure, fill, grading, gamma or tint.
+	const bool stableNdotLDiagnostic = StableShadowDebugMode == 79u;
+	const bool stableNormalAttachmentDiagnostic = StableShadowDebugMode == 80u;
+	const bool stableBoundBaryNdotLDiagnostic = StableShadowDebugMode == 81u;
+	const bool stableMultiTriangleNdotLDiagnostic = StableShadowDebugMode == 82u;
+	const bool stableRawRayVisibilityDiagnostic = StableShadowDebugMode == 102u;
+	const bool stableSmoothedRayVisibilityDiagnostic = StableShadowDebugMode == 103u;
+	const bool stableFinalCastVisibilityDiagnostic = StableShadowDebugMode == 104u;
+	const bool stableCastPipelineDiagnostic = stableRawRayVisibilityDiagnostic || stableSmoothedRayVisibilityDiagnostic || stableFinalCastVisibilityDiagnostic;
+	const bool stablePureNormalDiagnostic = stableNdotLDiagnostic || stableNormalAttachmentDiagnostic || stableBoundBaryNdotLDiagnostic || stableMultiTriangleNdotLDiagnostic;
+	const bool stableCastDepthDiagnostic = StableShadowDebugMode >= 74u && StableShadowDebugMode <= 78u;
+	const bool stableProductionShadow = StableShadowDebugMode == 0u || stableLightingDiagnostic || stablePureNormalDiagnostic || stableCastDepthDiagnostic || stableCastPipelineDiagnostic;
+	float stableProxyVisibility = 1.0;
+	float stableRawRayVisibilityOnly = 1.0;
+	float stableSmoothedRayVisibilityOnly = 1.0;
+	float stableFinalCastVisibilityOnly = 1.0;
+	if (stableProductionShadow)
+	{
+		// v2815: split the Stable cast pipeline into three independent diagnostics.
+		// Proof X = raw CPU-BVH vertex visibility before Stable smoothing/EMA.
+		// Proof Y = the current production Stable smoothed/temporal visibility.
+		if (stableRawRayVisibilityDiagnostic)
+		{
+			stableProxyVisibility = LoadStableProxyVisibility(splatIndex, false);
+			stableRawRayVisibilityOnly = stableProxyVisibility >= 0.0 ? saturate(stableProxyVisibility) : 1.0;
+		}
+		else if (stableSmoothedRayVisibilityDiagnostic || stableFinalCastVisibilityDiagnostic)
+		{
+			stableProxyVisibility = LoadStableProxyVisibility(splatIndex, true);
+			stableSmoothedRayVisibilityOnly = stableProxyVisibility >= 0.0 ? saturate(stableProxyVisibility) : 1.0;
+		}
+		else
+		{
+			// Pure normal diagnostics are intentionally independent of the cast field.
+			stableProxyVisibility = stablePureNormalDiagnostic
+				? 1.0
+				: LoadStableProxyHybridCastVisibility(splatIndex);
+		}
+	}
+	float stableFinalCastVisibility = stableProductionShadow ? -2.0 : 1.0;
+	float stableFinalClosureTransmission = 1.0;
+	float3 stableFinalDirectLinear = 0.0.xxx;
+	float stableProxyNdotLOnly = 0.0;
+	float stableNormalAttachmentOnly = 0.0;
+	float stableBoundBaryNdotLOnly = 0.0;
+	float stableMultiTriangleNdotLOnly = 0.0;
+
+	float3 stableProxyLightingColor = 0.0.xxx;
+	if (stableProductionShadow && stableProxyVisibility >= 0.0)
+	{
+		bool stableNormalValid = false;
+		bool stableClosureValid = stablePureNormalDiagnostic || stableCastPipelineDiagnostic;
+		float3 stableLocalNormal = LoadStableProxyTriangleNormal(splatIndex, stableNormalValid);
+		// Pure normal diagnostics must not depend on closure-field readiness.
+		float2 stableClosureOpenPair = (stablePureNormalDiagnostic || stableCastPipelineDiagnostic)
+			? float2(1.0, 1.0)
+			: LoadStableProxyTriangleClosureOpenPair(splatIndex, stableClosureValid);
+		if (stableNormalValid && stableClosureValid)
+		{
+			float3 authoredStableWorldNormal = normalize(mul(stableLocalNormal, (float3x3)LocalToWorld));
+			// v2804 separates broad cast binding from lighting-normal authority. A splat can
+			// stay attached to the proxy for cast/closure out to Max Proxy Distance while
+			// its direct-light normal smoothly returns to the regular splat/proxy-grid
+			// normal when the nearest proxy surface is too far away.
+			bool stableNormalDistanceValid = false;
+			float stableNormalDistanceCm = LoadStableProxyBindingDistanceCm(splatIndex, localPos, stableNormalDistanceValid);
+			float stableNormalFullDistance = max(StableLightingParams4.z, 0.0);
+			float stableNormalMaxDistance = max(StableLightingParams4.w, stableNormalFullDistance + 0.1);
+			// v2808: a valid nearest-proxy binding remains the primary lighting-normal
+			// authority across the visible GS surface thickness. v2807 diagnostics showed
+			// fixed black floor holes exactly where the old 35/90 cm ramp fell back to noisy
+			// splat normals. Use the widened artist distances, add a soft authority tail, and
+			// protect upward floor/roof bindings from dropping abruptly near the old cutoff.
+			float stableNormalAttachment = stableNormalDistanceValid
+				? (1.0 - smoothstep(stableNormalFullDistance, stableNormalMaxDistance, stableNormalDistanceCm))
+				: 0.0;
+			if (stableNormalDistanceValid)
+			{
+				float authorityTailEnd = max(stableNormalMaxDistance * 1.35, stableNormalMaxDistance + 40.0);
+				float bindingTail = 1.0 - smoothstep(stableNormalMaxDistance, authorityTailEnd, stableNormalDistanceCm);
+				float validBindingFloor = 0.32 * bindingTail;
+				float upSurface = smoothstep(0.72, 0.90, authoredStableWorldNormal.z);
+				float floorAuthority = upSurface * (0.58 + 0.32 * bindingTail);
+				stableNormalAttachment = max(stableNormalAttachment, max(validBindingFloor, floorAuthority));
+			}
+			stableNormalAttachment = saturate(stableNormalAttachment);
+			stableNormalAttachmentOnly = stableNormalAttachment;
+			float3 stableWorldNormal = normalize(lerp(lightingNormal, authoredStableWorldNormal, stableNormalAttachment));
+			float3 stableSurfaceToLight;
+			float3 stableLightTint;
+			float stableLightWeight;
+			GetStrongestDirectionalState(stableSurfaceToLight, stableLightTint, stableLightWeight);
+			// v2776 keeps the signed incidence available so the dark-side boundary is
+			// explicit and the positive hemisphere can use the raw cosine without an
+			// extra angular threshold/remap.
+			float stableSignedNdotL = stableLightWeight > 0.0
+				? dot(stableWorldNormal, stableSurfaceToLight)
+				: -1.0;
+			float triangleNdotL = max(stableSignedNdotL, 0.0);
+			stableBoundBaryNdotLOnly = stableLightWeight > 0.0
+				? saturate(max(dot(authoredStableWorldNormal, stableSurfaceToLight), 0.0))
+				: 0.0;
+			bool multiTriangleNormalValid = false;
+			float3 multiTriangleLocalNormal = LoadStableMultiTriangleLocalNormal(splatIndex, multiTriangleNormalValid);
+			if (multiTriangleNormalValid && stableLightWeight > 0.0)
+			{
+				float3 multiTriangleWorldNormal = normalize(mul(multiTriangleLocalNormal, (float3x3)LocalToWorld));
+				stableMultiTriangleNdotLOnly = saturate(max(dot(multiTriangleWorldNormal, stableSurfaceToLight), 0.0));
+			}
+
+			// v2806 STABLE-NORMAL AUTHORITY. v2805 proved the primary flat/stepped artifacts
+			// are already visible in pure N.L, so the proxy-normal grid must no longer be
+			// allowed to conservatively darken a valid barycentric triangle result. The
+			// triangle/vertex-normal binding is now the main authority whenever the splat is
+			// close to its bound proxy surface. The spatial proxy-normal grid is used only as
+			// a soft continuity helper (when both normals already agree) and as a fallback as
+			// the lighting-normal attachment fades out with distance. This preserves smooth
+			// curved continuity, avoids floor cells being darkened by nearby wall normals, and
+			// removes the hard min(triangle, spatial) clamp that created black islands.
+			float stableNdotL = triangleNdotL;
+			float3 angleNormal = stableWorldNormal;
+			float4 spatialProxyNormal = LoadProxyNormal(localPos);
+			float normalConfidenceThreshold = saturate(ProxyNormalParams.z);
+			float normalConfidenceGate = saturate(
+				(spatialProxyNormal.w - normalConfidenceThreshold) / max(1.0 - normalConfidenceThreshold, 1.0e-4));
+			if (stableLightWeight > 0.0 && normalConfidenceGate > 0.0 &&
+				dot(spatialProxyNormal.xyz, spatialProxyNormal.xyz) > 0.01)
+			{
+				float3 spatialWorldNormal = normalize(spatialProxyNormal.xyz);
+				float normalAlignment = saturate(dot(stableWorldNormal, spatialWorldNormal));
+				float similarSurfaceGate = smoothstep(0.55, 0.92, normalAlignment);
+				float stableUpGate = smoothstep(0.72, 0.88, stableWorldNormal.z);
+				float spatialUpGate = smoothstep(0.45, 0.75, spatialWorldNormal.z);
+				float floorReject = stableUpGate * (1.0 - spatialUpGate);
+				float seamBlend = stableNormalAttachment * normalConfidenceGate * similarSurfaceGate * (1.0 - floorReject) * 0.35;
+				float fallbackBlend = (1.0 - stableNormalAttachment) * normalConfidenceGate * (1.0 - floorReject);
+				float spatialBlend = saturate(max(seamBlend, fallbackBlend));
+				if (spatialBlend > 0.0)
+				{
+					angleNormal = normalize(lerp(stableWorldNormal, spatialWorldNormal, spatialBlend));
+					stableNdotL = max(dot(angleNormal, stableSurfaceToLight), 0.0);
+				}
+			}
+			// v2808: freeze the exact production N.L after welded-normal authority/fallback, before cast/closure/fill terms.
+			// This is intentionally independent of light intensity and color so it can be
+			// compared directly against the UE-lit proxy's angular response.
+			stableProxyNdotLOnly = saturate(stableNdotL);
+
+			float skyFacing = saturate(angleNormal.z * 0.5 + 0.5);
+			float groundFacing = saturate(-angleNormal.z);
+
+			// v2748 unified cast control. One density value replaces separate Strength/Gamma.
+			// 0 = hard OFF, 1 = neutral response, >1 expands/deepens mid-shadow.
+			float castDensity = clamp(StableLightingParams0.x, 0.0, 2.0);
+			float castSoftness = clamp(StableLightingParams1.z, 0.0, 1.0);
+			float castMinimum = clamp(StableLightingParams1.w, 0.0, 1.0);
+			float rawCastVisibility = saturate(stableProxyVisibility);
+			float rawCastAmount = 1.0 - rawCastVisibility;
+			// v2781: restore the exact mode-21 continuous shaping that the MRQ test proved stable.
+			// Dense light-space cast values now carry the silhouette, so the edge can remain filtered.
+			float firmCastAmount = smoothstep(0.22, 0.78, rawCastAmount);
+			float softCastAmount = lerp(firmCastAmount, rawCastAmount, castSoftness);
+			float castAmount = 0.0;
+			if (castDensity > 0.0)
+			{
+				float castCurve = max(castDensity, 0.05);
+				float castGain = min(castDensity, 1.0);
+				castAmount = saturate(pow(max(softCastAmount, 0.0), 1.0 / castCurve) * castGain);
+			}
+
+			// v2826 unified shadow response. Low-angle time-specific reinforcement is removed.
+			// The Stable field already contains the continuous cast solution, so +/-2 degrees
+			// must not receive a second cast gain or a second reduction of the shadow floor.
+			// Ground keeps only a small geometry-oriented fill adjustment that is independent
+			// of time/solar angle.
+			float environmentShadowFloor = saturate(
+				0.07
+					+ saturate(StableLightingParams2.y) * 0.17
+					+ saturate(StableLightingParams2.z) * 0.09
+					+ saturate(StableLightingParams3.z) * 0.07);
+			float groundFloorScale = lerp(1.0, 0.92, groundFacing);
+			float adaptiveCastMinimum = max(castMinimum, environmentShadowFloor * groundFloorScale);
+			float castVisibility = saturate(lerp(1.0, adaptiveCastMinimum, castAmount));
+			stableFinalCastVisibilityOnly = saturate(castVisibility);
+
+			// v2783 DECOUPLED GEOMETRY CLOSURE. Closure is a geometry-only layer.
+			// Density controls darkness only, Area controls local->broad geometry extent only,
+			// Softness controls only the local/broad transition, and Minimum Brightness is an
+			// absolute floor. Stable cast is intentionally NOT a closure support source: the
+			// previous coupling made modest Area/Density values spread closure across ordinary
+			// cast-shadow regions and could drive nearly the whole scene dark.
+			float closureDensity = clamp(StableLightingParams0.y, 0.0, 2.0);
+			float closureAreaScale = clamp(StableLightingParams0.z, 0.0, 2.50);
+			float closureSoftness = clamp(StableLightingParams0.w, 0.25, 3.00);
+			float localClosure = 1.0 - saturate(stableClosureOpenPair.x);
+			float broadClosure = max(localClosure, 1.0 - saturate(stableClosureOpenPair.y));
+
+			float areaClosure = 0.0;
+			if (closureAreaScale > 0.0 && closureDensity > 0.0)
+			{
+				if (closureAreaScale <= 1.0)
+				{
+					// 0..1 reveals only the native local geometry-closure core.
+					areaClosure = localClosure * closureAreaScale;
+				}
+				else
+				{
+					// 1..2.5 expands only toward the precomputed broad GEOMETRY field.
+					// Softness changes the transition rate but cannot create support where
+					// both geometry fields are zero.
+					float spreadT = saturate((closureAreaScale - 1.0) / 1.5);
+					float softness01 = saturate((closureSoftness - 0.25) / 2.75);
+					float spreadExponent = lerp(1.55, 0.85, softness01);
+					spreadT = pow(spreadT, spreadExponent);
+					areaClosure = lerp(localClosure, broadClosure, spreadT);
+				}
+			}
+
+			// Density is continuous and spatially neutral: 0=off, 1=native mask,
+			// 2=deeper response inside the SAME geometry support. No hard threshold and no
+			// solar-angle multiplier: closure is geometry-owned, not time-of-day-owned.
+			float closureAmount = 0.0;
+			if (closureDensity > 0.0 && areaClosure > 0.0)
+			{
+				closureAmount = 1.0 - pow(1.0 - saturate(areaClosure), closureDensity);
+			}
+
+			// Keep one stable environment floor at every solar angle. The previous horizon
+			// relaxation made closure abruptly deeper in the same +/-2 degree band as cast.
+			float closureFloor = clamp(StableLightingParams1.x, 0.0, 1.0);
+			closureFloor = max(closureFloor, environmentShadowFloor * 0.72);
+
+			// Closure remains last/highest priority, but only actual proxy geometry can
+			// produce it. NdotL remains exclusive to direct sun, matching the UE-lit proxy.
+			float finalClosureTransmission = lerp(1.0, closureFloor, closureAmount);
+			stableFinalCastVisibility = castVisibility;
+			stableFinalClosureTransmission = finalClosureTransmission;
+
+			// Bounded energy shares remain from v2747 so the diagnostic keeps visible headroom.
+
+			float3 ambientTint = max(UnrealAmbientColorIntensity.rgb, float3(0.001, 0.001, 0.001));
+			float3 skyTint = max(UnrealRelightSkyTint.rgb, float3(0.001, 0.001, 0.001));
+			float indirectStrength = saturate(StableLightingParams2.y);
+			float groundBounceStrength = saturate(StableLightingParams2.z);
+
+			float sunTintMax = max(max(stableLightTint.r, stableLightTint.g), max(stableLightTint.b, 1.0e-4));
+			float ambientTintMax = max(max(ambientTint.r, ambientTint.g), max(ambientTint.b, 1.0e-4));
+			float skyTintMax = max(max(skyTint.r, skyTint.g), max(skyTint.b, 1.0e-4));
+			float3 unitSunTint = stableLightWeight > 0.0 ? max(stableLightTint, 0.0) / sunTintMax : 1.0.xxx;
+			float3 unitAmbientTint = ambientTint / ambientTintMax;
+			float3 unitSkyTint = skyTint / skyTintMax;
+
+			// Convert the old Gaussian-only sun accent into the Stable proxy authority.
+			// Direction/facing come from the same proxy normals as the shadow; color and
+			// strength still follow the artist-facing real-time sun controls and live UE
+			// Directional Light intensity. This prevents two different normal/light paths
+			// from fighting in Final.
+			float3 authoredSunTint = NormalizeGaussianLightTint(max(UnrealRelightSunTint.rgb, float3(0.001, 0.001, 0.001)));
+			float3 stableSunTint = NormalizeGaussianLightTint(unitSunTint * authoredSunTint);
+			float stableSunScale = max(StableLightingParams3.x, 0.0);
+			float stableGlobalInfluence = max(StableLightingParams3.y, 0.0);
+			// v2816 bounded live-light energy. sqrt(weight) kept increasing broad midtones
+			// as the light angle changed. Normalize around the existing 0.40 reference and
+			// use a shoulder so strong light becomes highlight energy instead of exposure.
+			float normalizedDirectionalEnergy = max(stableLightWeight, 0.0) / 0.40;
+			float stableLiveEnergy = min(1.25, 1.30 * normalizedDirectionalEnergy / (1.0 + normalizedDirectionalEnergy));
+			float stableHorizonGate = ComputeGaussianSunPresence(stableSurfaceToLight);
+			float brightDayPhase = saturate(StableLightingParams3.w);
+			// The original scan already contains photographed daylight. At high solar angles,
+			// reduce only the replacement direct layer so baked + Stable direct do not stack
+			// into white surfaces. Shadows/ambient are not darkened by this control.
+			float brightDayDirectScale = lerp(1.0, 0.56, brightDayPhase);
+			float stableDirectEnergy = stableSunScale * stableGlobalInfluence * stableLiveEnergy * brightDayDirectScale;
+			// v2819 move energy toward the front-facing highlight core. Broad oblique
+			// surfaces receive less additive energy, reducing angle-dependent washout.
+			float stableDirectFacing = pow(saturate(stableNdotL), 1.55);
+			stableFinalDirectLinear = max(approximateAlbedo, 0.0) * stableSunTint
+				* (stableDirectEnergy * stableDirectFacing * castVisibility * finalClosureTransmission * stableHorizonGate);
+
+			// Bounded reference direct share: preserves ordinary daylight response but no
+			// longer lets strong lights wash the whole Stable preview toward white.
+			float directionalEnergyShare = saturate(1.60 * normalizedDirectionalEnergy / (1.0 + normalizedDirectionalEnergy));
+			float directShare = 0.62 * directionalEnergyShare * brightDayDirectScale;
+			// v2796: StableLightingParams4.x is the shared day/night phase. The old hard
+			// sky/ground/bounce floors were large enough to make full night brighter again
+			// once the moon became the active Directional. Fade only those hidden floors;
+			// artist-authored indirect/ground values continue through their normal controls.
+			float stableNightBlend = saturate(StableLightingParams4.x);
+			float nonDirectFloorScale = lerp(1.0, 0.24, stableNightBlend);
+			float shadowBounceNightScale = lerp(1.0, 0.28, stableNightBlend);
+			float skyShare = 0.18 * nonDirectFloorScale + indirectStrength * 0.16;
+			float groundShare = 0.025 * nonDirectFloorScale + groundBounceStrength * 0.055;
+
+			float3 direct = unitSunTint * (directShare * stableDirectFacing * castVisibility);
+			float skyShape = 0.46 + 0.54 * skyFacing;
+			float3 indirect = lerp(unitAmbientTint, unitSkyTint, 0.35)
+				* (skyShare * skyShape);
+
+			float groundShape = 0.25 + 0.75 * groundFacing;
+			float3 groundBounce = float3(1.0, 0.94, 0.84)
+				* (groundShare * groundShape);
+
+			float shadowBounceStrength = saturate(StableLightingParams2.x);
+			float bounceEnergy = castAmount
+				* (0.035 * nonDirectFloorScale + indirectStrength * 0.055 + groundBounceStrength * 0.050
+					+ shadowBounceStrength * 0.120 * shadowBounceNightScale);
+			float3 bounceTint = lerp(unitSkyTint, float3(1.0, 0.92, 0.80), groundFacing);
+			float3 bounce = bounceTint * bounceEnergy;
+
+			float3 indirectAndBounce = max(indirect + groundBounce + bounce, 0.0);
+			// v2792: only direct celestial light is horizon-gated. Sky/ground/bounce
+			// remain available after sunset so the 3DGS transitions into night instead
+			// of collapsing to black. The moon becomes the active directional source.
+			float3 preClosureLighting = max(
+				direct * stableHorizonGate + indirectAndBounce, 0.0);
+			// Closure remains last/highest priority, but is now purely geometry-driven.
+			// Direct angle response lives in direct/stableFinalDirectLinear, while open proxy
+			// surfaces retain sky/ground fill like the UE-lit reference.
+			stableProxyLightingColor = preClosureLighting * finalClosureTransmission;
+		}
+		else
+		{
+			stableProxyVisibility = -1.0;
+			stableFinalCastVisibility = -1.0;
+			stableFinalClosureTransmission = 1.0;
+		}
+	}
+
+	// Mode 02 receives the full Stable lighting reference. Final receives a color-
+	// preserving Stable DIRECT sun layer built from the same proxy normal/cast/closure
+	// authority. The old Gaussian-native direct accent is no longer a competing Final path.
+	float3 packedDirectDebug = stableRawRayVisibilityDiagnostic
+		? stableRawRayVisibilityOnly.xxx
+		: (stableSmoothedRayVisibilityDiagnostic
+			? stableSmoothedRayVisibilityOnly.xxx
+			: (stableFinalCastVisibilityDiagnostic
+				? stableFinalCastVisibilityOnly.xxx
+				: (stableCastDepthDiagnostic
+					? EncodeStableProxyDepthDiagnostic(splatIndex, StableShadowDebugMode)
+					: (stableNdotLDiagnostic
+			? stableProxyNdotLOnly.xxx
+			: (stableNormalAttachmentDiagnostic
+				? stableNormalAttachmentOnly.xxx
+				: (stableBoundBaryNdotLDiagnostic
+					? stableBoundBaryNdotLOnly.xxx
+					: (stableMultiTriangleNdotLDiagnostic
+						? stableMultiTriangleNdotLOnly.xxx
+						: (stableLightingDiagnostic
+							? stableProxyLightingColor
+							: (stableProductionShadow ? stableFinalDirectLinear : gaussianSunAccentLinear)))))))));
+	viewData.PackedDirectRG = PackHalf2x16(packedDirectDebug.rg);
+	viewData.PackedDirectBA = PackHalf2x16(float2(packedDirectDebug.b, stableFinalCastVisibility));
+	viewData.Axis1 = axis1;
+	viewData.Axis2 = axis2;
+	viewData.ClusterID = selectedClusterID;
+	// v2778 repurposes the former camera-capture receiver scalar as the production
+	// Stable closure/angle transmission. This makes every downstream light effect
+	// consume the same dark-side authority as mode 02.
+	float packedStableClosure = stableProductionShadow
+		? stableFinalClosureTransmission
+		: stableProxyReceiverSignal;
+	viewData.Padding = PackLODAndPostLightMask(
+		selectedLODLevel, postLightMask, packedStableClosure);
+    // P13: a water splat's DC RGB are PRIVATE coverage metadata. Only the
+    // dedicated Puddle component decodes them. Other splats keep their original
+    // plant transmission/vegetation ABI without any differences.
+    // roof R=0.96; floor R=0.035; G,B contain unsigned 8-bit roof 4x4 mask.
+    const bool bRoofPuddle = PuddleWaterLayer != 0u && colorOpacity.r > 0.85;
+    const bool bLeafPuddle = PuddleWaterLayer != 0u && colorOpacity.r > 0.50 && colorOpacity.r < 0.80;
+    viewData.StructPadding0 = PackHalf2x16(PuddleWaterLayer != 0u
+        ? float2(bRoofPuddle ? 1.0 : (bLeafPuddle ? 0.65 : 0.0), bRoofPuddle ? colorOpacity.g : 0.0)
+        : gaussianPlantTransmissionLinear.rg);
+    viewData.StructPadding1 = PackHalf2x16(float2(
+        PuddleWaterLayer != 0u ? (bRoofPuddle ? colorOpacity.b : 0.0) : gaussianPlantTransmissionLinear.b,
+        PuddleWaterLayer != 0u ? -2.0 : vegetationMaterialMask));
+	// Nonlinear target grading and sharpening run once on the fully accumulated
+	// scene-linear HDR intermediate. Keep the per-splat payload compact.
+	ViewDataBuffer[outputIndex] = viewData;
+}
+
+[numthreads(256, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint threadIndex = DispatchThreadId.x;
+
+	// COMPACTION MODE: Use pre-compacted visible splat indices
+	// This eliminates visibility checks and ensures contiguous output
+	if (UseCompaction)
+	{
+        // The indirect dispatch is rounded up; the final group must use the
+        // exact GPU count, not the original source capacity.
+        uint exactVisibleCount=UseGlobalCompactionPath
+            ? GlobalBaseOffsetsBuffer[ProxyIndex+1]-GlobalBaseOffsetsBuffer[ProxyIndex]
+            : VisibleSplatCount;
+		if (threadIndex >= exactVisibleCount)
+		{
+			return;
+		}
+
+		// Determine the base offset for writing into ViewDataBuffer.
+		uint CompactionGlobalBase = UseGlobalCompactionPath
+			? GlobalBaseOffsetsBuffer[ProxyIndex]
+			: GlobalBaseOffset;
+
+		// Budget cap: skip writes beyond MaxRenderBudget to prevent OOB access
+		if (MaxRenderBudget > 0u && (CompactionGlobalBase + threadIndex) >= MaxRenderBudget)
+		{
+			return;
+		}
+
+		// Read actual splat index from compacted list
+		uint splatIndex = CompactedSplatIndices[threadIndex];
+
+		// Get cluster info for debug visualization
+		uint clusterIndex = UseClusterCulling != 0 ? SplatClusterIndexBuffer[splatIndex] : 0;
+		bool isLODSplat = (splatIndex >= OriginalSplatCount);
+
+		uint selectedClusterID = clusterIndex;
+		uint selectedLODLevel = isLODSplat ? 1 : 0;
+
+		if (!isLODSplat && UseClusterCulling != 0)
+		{
+			uint packedSelected = SelectedClusterBuffer[clusterIndex];
+			selectedClusterID = packedSelected & 0x00FFFFFF;
+			selectedLODLevel = (packedSelected >> 24) & 0xFF;
+		}
+
+		ProcessSplat(splatIndex, CompactionGlobalBase + threadIndex, selectedClusterID, selectedLODLevel);
+		return;
+	}
+
+	// NON-COMPACTION MODE: Original behavior (process all splats)
+	uint splatIndex = threadIndex;
+	if (splatIndex >= SplatCount)
+	{
+		return;
+	}
+
+	uint outputIndex = GlobalBaseOffset + splatIndex;
+	// MaxRenderBudget is also used as the actual global-buffer capacity guard.
+	// Never write invalid or valid view data beyond the allocated UAV range.
+	if (MaxRenderBudget > 0u && outputIndex >= MaxRenderBudget)
+	{
+		return;
+	}
+
+	// UNIFIED APPROACH: Handle both original and LOD splats
+	bool isLODSplat = (splatIndex >= OriginalSplatCount);
+	uint clusterIndex = 0;
+	uint selectedClusterID = 0;
+	uint selectedLODLevel = 0;
+
+	if (UseClusterCulling)
+	{
+		clusterIndex = SplatClusterIndexBuffer[splatIndex];
+
+		if (isLODSplat)
+		{
+			// LOD splat: check if its parent cluster is selected for LOD rendering
+			if (!UseLODRendering || !IsLODClusterSelected(clusterIndex))
+			{
+				WriteInvalidSplat(outputIndex, clusterIndex, 1);
+				return;
+			}
+			selectedClusterID = clusterIndex;
+			selectedLODLevel = 1;
+		}
+		else
+		{
+			// Original splat: use leaf cluster visibility logic
+			uint leafClusterIndex = clusterIndex;
+
+			uint packedSelected = SelectedClusterBuffer[leafClusterIndex];
+			selectedClusterID = packedSelected & 0x00FFFFFF;
+			selectedLODLevel = (packedSelected >> 24) & 0xFF;
+
+			if (!IsClusterVisible(leafClusterIndex))
+			{
+				WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+				return;
+			}
+
+			// LOD Rendering: Skip original splats when covered by a parent's LOD representation
+			if (UseLODRendering && selectedClusterID != leafClusterIndex)
+			{
+				WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+				return;
+			}
+		}
+	}
+
+	ProcessSplat(splatIndex, outputIndex, selectedClusterID, selectedLODLevel);
+}

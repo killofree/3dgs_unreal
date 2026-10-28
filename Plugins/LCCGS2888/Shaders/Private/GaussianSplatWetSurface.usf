@@ -1,0 +1,933 @@
+#include "/Engine/Public/Platform.ush"
+
+Texture2D WetSourceTexture;
+Texture2D WetDepthTexture;
+Texture2D WetNormalTexture;
+// v36: collider/proxy depth capture used ONLY to decide continuous water-receiver
+// geometry. Reflected colour still comes from the GS source, never from this texture.
+Texture2D WetProxySurfaceDepthTexture;
+SamplerState WetProxySurfaceDepthSampler;
+float4 WetProxySurfaceOriginTanFOV;
+float4 WetProxySurfaceForwardAspect;
+float4 WetProxySurfaceRightEnabled;
+float4 WetProxySurfaceUp;
+// v26: read-only incoming Unreal SceneColor. No per-splat Wet classification is used.
+Texture2D WetSceneColorTexture;
+float4 WetSourceRect;
+float4 WetSceneColorRect;
+float4 WetOutputRect;
+float WetSceneColorInvPreExposure;
+float4x4 WetInvViewProjection;
+float4x4 WetWorldToClip;
+float4 WetCameraTime;
+// x mode, y strength, z horizontal selector, w world pattern scale
+float4 WetSettings0;
+// Existing vector's spare W transports the UI mode without a new uniform.
+#define WetProxySurfaceTest ((int)clamp(WetProxySurfaceUp.w, 0.0, 4.0))
+// rgb reflection tint, w specular strength
+float4 WetSettings1;
+// x/y snow-only, z wet darkening, w puddle amount
+float4 WetSettings2;
+// x ripple strength, y ripple size (cm), z ripple spacing (cm), w speed
+// v8: TRUE GLOBAL WET + TRUE GLOBAL WATER. All rendered GS pixels receive both.
+float4 WetSettings3;
+// Rain-only post-grade color overlay: x strength, y exposure EV, z gamma, w saturation
+float4 WetRainGrade0;
+// rgb tint, w tint strength
+float4 WetRainGrade1;
+// xyz light travel direction, w validity
+float4 WetLightDirectionValid;
+float4 WetLightColorIntensity;
+// v31: existing Day/Night moon state. No camera/view vector participates in the moon cue.
+// xyz surface-to-moon world direction, w angular diameter in degrees.
+float4 WetMoonDirectionSize;
+// rgb authored moon color, w 0..1 runtime night/elevation strength.
+float4 WetMoonColorStrength;
+
+struct FScreenVertexOutput { float4 Position : SV_POSITION; };
+
+float Hash21(float2 P)
+{
+	P = frac(P * float2(123.34, 456.21));
+	P += dot(P, P + 45.32);
+	return frac(P.x * P.y);
+}
+
+float2 RippleGradient(float2 WorldXY, float Time, float RippleSizeCm, float RippleSpacingCm, float RippleSpeed)
+{
+	float CellSize = max(RippleSpacingCm, 10.0);
+	float2 Cell = floor(WorldXY / CellSize);
+	float2 Local = frac(WorldXY / CellSize) - 0.5;
+	float2 Center = float2(Hash21(Cell), Hash21(Cell + 17.7)) - 0.5;
+	float2 Delta = Local - Center * 0.72;
+	float Radius = length(Delta);
+	float Phase = frac(Time * max(RippleSpeed, 0.0) + Hash21(Cell + 4.1));
+	float MaxRadius = saturate(RippleSizeCm / CellSize) * 0.5;
+	float RingRadius = Phase * MaxRadius;
+	float RingWidth = max(0.018, MaxRadius * 0.10);
+	float Ring = exp(-((Radius - RingRadius) * (Radius - RingRadius)) / max(RingWidth * RingWidth, 1.0e-5)) * (1.0 - Phase);
+	return Radius > 1.0e-4 ? (Delta / Radius) * Ring : 0.0.xx;
+}
+
+// v30: explicit bright/dark ring bands. They are computed only from world-space XY + time,
+// never from view direction/FOV/screen radius, so the same puddle location keeps the same
+// ripple animation while the camera moves. x=bright crest, y=darker outer trough.
+float2 RippleRingBands(float2 WorldXY, float Time, float RippleSizeCm, float RippleSpacingCm, float RippleSpeed)
+{
+	float CellSize = max(RippleSpacingCm, 10.0);
+	float2 Cell = floor(WorldXY / CellSize);
+	float2 Local = frac(WorldXY / CellSize) - 0.5;
+	float2 Center = float2(Hash21(Cell), Hash21(Cell + 17.7)) - 0.5;
+	float2 Delta = Local - Center * 0.72;
+	float Radius = length(Delta);
+	float Phase = frac(Time * max(RippleSpeed, 0.0) + Hash21(Cell + 4.1));
+	float MaxRadius = saturate(RippleSizeCm / CellSize) * 0.5;
+	float RingRadius = Phase * MaxRadius;
+	float RingWidth = max(0.018, MaxRadius * 0.10);
+	float Life = 1.0 - Phase;
+	float D0 = Radius - RingRadius;
+	float Bright = exp(-(D0 * D0) / max(RingWidth * RingWidth * 0.55, 1.0e-5)) * Life;
+	float D1 = Radius - (RingRadius + RingWidth * 1.55);
+	float Dark = exp(-(D1 * D1) / max(RingWidth * RingWidth * 1.35, 1.0e-5)) * Life;
+	return saturate(float2(Bright, Dark));
+}
+
+float3 ReconstructWorld(int2 Pixel, int2 MaxPixel, float RadialDepth)
+{
+	float2 Size = max(WetSourceRect.zw, 1.0.xx);
+	float2 UV = saturate((float2(Pixel) - WetSourceRect.xy + 0.5) / Size);
+	float2 NDC = float2(UV.x * 2.0 - 1.0, 1.0 - UV.y * 2.0);
+	float4 FarH = mul(float4(NDC, 0.0, 1.0), WetInvViewProjection);
+	float3 FarWorld = FarH.xyz / max(abs(FarH.w), 1.0e-6);
+	return WetCameraTime.xyz + normalize(FarWorld - WetCameraTime.xyz) * RadialDepth;
+}
+
+// v36 fallback/reflection-size quality resolve. WetNormalTexture.a now stores only
+// intrinsic-size-quality coverage. This function does NOT define the primary water
+// receiver when a collider/proxy depth capture is available.
+float ResolveWaterReceiver(int2 P, int2 MaxPixel, float CenterDepth)
+{
+    float ReceiverSum = 0.0;
+    float WeightSum = 0.0;
+    float DepthTolerance = clamp(12.0 + CenterDepth * 0.004, 12.0, 72.0);
+
+    [unroll] for (int DY = -2; DY <= 2; ++DY)
+    {
+        [unroll] for (int DX = -2; DX <= 2; ++DX)
+        {
+            int2 S = clamp(P + int2(DX, DY), int2(0,0), MaxPixel);
+            float D = WetDepthTexture.Load(int3(S, 0)).r;
+            if (D <= 0.0 || D >= 60000.0)
+                continue;
+
+            float DepthDelta = abs(D - CenterDepth);
+            float DepthWeight = saturate(1.0 - DepthDelta / max(DepthTolerance, 1.0));
+            if (DepthWeight <= 0.0)
+                continue;
+
+            float4 GS = WetSourceTexture.Load(int3(S, 0));
+            float TotalCoverage = saturate(GS.a);
+            if (TotalCoverage <= (1.0 / 255.0))
+                continue;
+
+            float EligibleCoverage = saturate(WetNormalTexture.Load(int3(S, 0)).a);
+            float ReceiverFraction = EligibleCoverage;
+
+            float R2 = float(DX * DX + DY * DY);
+            float SpatialWeight = 1.0 / (1.0 + 0.55 * R2);
+            float W = SpatialWeight * DepthWeight * saturate(TotalCoverage * 1.35);
+            ReceiverSum += ReceiverFraction * W;
+            WeightSum += W;
+        }
+    }
+
+    float Resolved = WeightSum > 1.0e-5 ? ReceiverSum / WeightSum : 0.0;
+    // Soften isolated 1-splat spikes while keeping continuous floor/roof receivers.
+    return smoothstep(0.08, 0.72, saturate(Resolved));
+}
+
+// v36 CONTINUOUS COLLIDER/PROXY WATER RECEIVER ------------------------------
+bool SampleWetProxySurfaceDepth(float2 UV, out float ForwardDepth)
+{
+    ForwardDepth = 0.0;
+    if (WetProxySurfaceRightEnabled.w < 0.5 || any(UV < 0.0) || any(UV > 1.0))
+        return false;
+    ForwardDepth = WetProxySurfaceDepthTexture.SampleLevel(WetProxySurfaceDepthSampler, UV, 0).r;
+    return ForwardDepth > 0.01 && ForwardDepth < 60000.0;
+}
+
+float3 GetWetProxyRayDirection(float2 UV)
+{
+    float2 NDC = float2((UV.x - 0.5) * 2.0, (0.5 - UV.y) * 2.0);
+    float TanHalfFOV = max(WetProxySurfaceOriginTanFOV.w, 0.001);
+    float Aspect = max(WetProxySurfaceForwardAspect.w, 0.001);
+    return normalize(
+        WetProxySurfaceForwardAspect.xyz +
+        WetProxySurfaceRightEnabled.xyz * (NDC.x * TanHalfFOV) +
+        WetProxySurfaceUp.xyz * (NDC.y * TanHalfFOV / Aspect));
+}
+
+float3 ReconstructWetProxySurfaceWorld(float2 UV, float ForwardDepth)
+{
+    float3 RayDir = GetWetProxyRayDirection(UV);
+    float RayForward = max(dot(RayDir, WetProxySurfaceForwardAspect.xyz), 0.0001);
+    return WetProxySurfaceOriginTanFOV.xyz + RayDir * (ForwardDepth / RayForward);
+}
+
+bool ProjectWorldToWetProxy(float3 WorldPos, out float2 UV, out float ForwardDepth)
+{
+    UV = 0.0.xx;
+    ForwardDepth = 0.0;
+    if (WetProxySurfaceRightEnabled.w < 0.5)
+        return false;
+
+    float3 Delta = WorldPos - WetProxySurfaceOriginTanFOV.xyz;
+    ForwardDepth = dot(Delta, WetProxySurfaceForwardAspect.xyz);
+    if (ForwardDepth <= 0.01)
+        return false;
+
+    float TanHalfFOV = max(WetProxySurfaceOriginTanFOV.w, 0.001);
+    float Aspect = max(WetProxySurfaceForwardAspect.w, 0.001);
+    float NDCX = dot(Delta, WetProxySurfaceRightEnabled.xyz) / max(ForwardDepth * TanHalfFOV, 0.001);
+    float NDCY = dot(Delta, WetProxySurfaceUp.xyz) / max(ForwardDepth * TanHalfFOV / Aspect, 0.001);
+    UV = float2(NDCX * 0.5 + 0.5, 0.5 - NDCY * 0.5);
+    return all(UV >= 0.0) && all(UV <= 1.0);
+}
+
+float ResolveProxyWaterReceiver(float3 GSWorldPos, out float ProxyConfidence)
+{
+    ProxyConfidence = 0.0;
+    float2 UV;
+    float GSForwardDepth;
+    if (!ProjectWorldToWetProxy(GSWorldPos, UV, GSForwardDepth))
+        return 0.0;
+
+    float CenterDepth;
+    if (!SampleWetProxySurfaceDepth(UV, CenterDepth))
+        return 0.0;
+
+    // The visible GS point must lie on the same proxy/collider surface. This prevents
+    // a horizontal floor behind a wall/foliage layer from admitting water in front.
+    float DepthTolerance = clamp(10.0 + GSForwardDepth * 0.0035, 10.0, 60.0);
+    float DepthDelta = abs(CenterDepth - GSForwardDepth);
+    float DepthMatch = 1.0 - smoothstep(DepthTolerance * 0.45, DepthTolerance, DepthDelta);
+    if (DepthMatch <= 0.001)
+        return 0.0;
+
+    uint Width = 1u;
+    uint Height = 1u;
+    WetProxySurfaceDepthTexture.GetDimensions(Width, Height);
+    float2 Texel = 1.0 / max(float2(Width, Height), 1.0.xx);
+
+    float DL, DR, DU, DD;
+    bool VL = SampleWetProxySurfaceDepth(UV - float2(Texel.x, 0.0), DL);
+    bool VR = SampleWetProxySurfaceDepth(UV + float2(Texel.x, 0.0), DR);
+    bool VU = SampleWetProxySurfaceDepth(UV - float2(0.0, Texel.y), DU);
+    bool VD = SampleWetProxySurfaceDepth(UV + float2(0.0, Texel.y), DD);
+
+    float3 C = ReconstructWetProxySurfaceWorld(UV, CenterDepth);
+    float3 TX = WetProxySurfaceRightEnabled.xyz;
+    float3 TY = WetProxySurfaceUp.xyz;
+    float AxisConfidence = 0.35;
+
+    if (VL && VR)
+    {
+        TX = ReconstructWetProxySurfaceWorld(UV + float2(Texel.x, 0.0), DR) -
+             ReconstructWetProxySurfaceWorld(UV - float2(Texel.x, 0.0), DL);
+        AxisConfidence += 0.325;
+    }
+    else if (VR)
+    {
+        TX = ReconstructWetProxySurfaceWorld(UV + float2(Texel.x, 0.0), DR) - C;
+        AxisConfidence += 0.16;
+    }
+    else if (VL)
+    {
+        TX = C - ReconstructWetProxySurfaceWorld(UV - float2(Texel.x, 0.0), DL);
+        AxisConfidence += 0.16;
+    }
+
+    if (VU && VD)
+    {
+        TY = ReconstructWetProxySurfaceWorld(UV + float2(0.0, Texel.y), DD) -
+             ReconstructWetProxySurfaceWorld(UV - float2(0.0, Texel.y), DU);
+        AxisConfidence += 0.325;
+    }
+    else if (VD)
+    {
+        TY = ReconstructWetProxySurfaceWorld(UV + float2(0.0, Texel.y), DD) - C;
+        AxisConfidence += 0.16;
+    }
+    else if (VU)
+    {
+        TY = C - ReconstructWetProxySurfaceWorld(UV - float2(0.0, Texel.y), DU);
+        AxisConfidence += 0.16;
+    }
+
+    float3 ProxyN = cross(TX, TY);
+    float NLenSq = dot(ProxyN, ProxyN);
+    if (NLenSq <= 1.0e-8)
+        return 0.0;
+    ProxyN *= rsqrt(NLenSq);
+
+    // Only the proxy/collider slope decides where optical water may exist. The
+    // absolute value makes triangle winding irrelevant across imported colliders.
+    float Horizontal = smoothstep(0.45, 0.75, abs(ProxyN.z));
+    ProxyConfidence = saturate(DepthMatch * AxisConfidence);
+    return saturate(Horizontal * ProxyConfidence);
+}
+
+// v37 layered hit-then-resolve reflection -----------------------------------
+// Thin wet film and standing puddles share the same depth hit logic but resolve
+// reflected GS colour at different spatial widths.  Thin film deliberately uses a
+// wide 9x9 resolve (blurred/low-contrast); puddles use a tighter 5x5 resolve.
+// Large-splat suppression remains a REFLECTION-SOURCE quality filter only.
+float ReflectionSourceSizeWeight(int2 S, float4 Hit)
+{
+    if (WetProxySurfaceTest >= 3) return 1.0;
+    float SizeCoverage = saturate(WetNormalTexture.Load(int3(S, 0)).a);
+    float SizeQuality = SizeCoverage;
+    return smoothstep(0.06, 0.72, SizeQuality);
+}
+
+float3 ResolveReflectionThinAtHit(
+    int2 HitPixel,
+    float RayDepth,
+    float Tolerance,
+    int2 MaxPixel,
+    out float ResolveConfidence)
+{
+    float3 PremulColorSum = 0.0.xxx;
+    float AlphaWeightSum = 0.0;
+    float KernelWeightSum = 0.0;
+
+    [unroll] for (int DY = -4; DY <= 4; ++DY)
+    {
+        [unroll] for (int DX = -4; DX <= 4; ++DX)
+        {
+            int2 S = clamp(HitPixel + int2(DX, DY), int2(0,0), MaxPixel);
+            float D = WetDepthTexture.Load(int3(S, 0)).r;
+            if (D <= 0.0 || D >= 60000.0)
+                continue;
+
+            float DepthDelta = abs(D - RayDepth);
+            float LocalTolerance = Tolerance * 1.95;
+            float DepthWeight = saturate(1.0 - DepthDelta / max(LocalTolerance, 1.0));
+            if (DepthWeight <= 0.0)
+                continue;
+
+            float4 Hit = WetSourceTexture.Load(int3(S, 0));
+            if (Hit.a <= (1.0 / 255.0))
+                continue;
+
+            float R2 = float(DX * DX + DY * DY);
+            float SpatialWeight = 1.0 / (1.0 + 0.18 * R2);
+            float SizeWeight = ReflectionSourceSizeWeight(S, Hit);
+            float W = SpatialWeight * DepthWeight * SizeWeight;
+
+            PremulColorSum += max(Hit.rgb, 0.0) * W;
+            AlphaWeightSum += Hit.a * W;
+            KernelWeightSum += W;
+        }
+    }
+
+    float Coverage = AlphaWeightSum / max(KernelWeightSum, 1.0e-5);
+    ResolveConfidence = smoothstep(0.020, 0.13, Coverage);
+    return PremulColorSum / max(AlphaWeightSum, 1.0e-5);
+}
+
+float3 ResolveReflectionPuddleAtHit(
+    int2 HitPixel,
+    float RayDepth,
+    float Tolerance,
+    int2 MaxPixel,
+    out float ResolveConfidence)
+{
+    float3 PremulColorSum = 0.0.xxx;
+    float AlphaWeightSum = 0.0;
+    float KernelWeightSum = 0.0;
+
+    [unroll] for (int DY = -2; DY <= 2; ++DY)
+    {
+        [unroll] for (int DX = -2; DX <= 2; ++DX)
+        {
+            int2 S = clamp(HitPixel + int2(DX, DY), int2(0,0), MaxPixel);
+            float D = WetDepthTexture.Load(int3(S, 0)).r;
+            if (D <= 0.0 || D >= 60000.0)
+                continue;
+
+            float DepthDelta = abs(D - RayDepth);
+            float LocalTolerance = Tolerance * 1.35;
+            float DepthWeight = saturate(1.0 - DepthDelta / max(LocalTolerance, 1.0));
+            if (DepthWeight <= 0.0)
+                continue;
+
+            float4 Hit = WetSourceTexture.Load(int3(S, 0));
+            if (Hit.a <= (1.0 / 255.0))
+                continue;
+
+            float R2 = float(DX * DX + DY * DY);
+            float SpatialWeight = 1.0 / (1.0 + 0.46 * R2);
+            float SizeWeight = ReflectionSourceSizeWeight(S, Hit);
+            float W = SpatialWeight * DepthWeight * SizeWeight;
+
+            PremulColorSum += max(Hit.rgb, 0.0) * W;
+            AlphaWeightSum += Hit.a * W;
+            KernelWeightSum += W;
+        }
+    }
+
+    float Coverage = AlphaWeightSum / max(KernelWeightSum, 1.0e-5);
+    ResolveConfidence = smoothstep(0.025, 0.15, Coverage);
+    return PremulColorSum / max(AlphaWeightSum, 1.0e-5);
+}
+
+bool FindReflectionHit(
+    float3 WorldPos,
+    float3 ReflectionDir,
+    int2 MaxPixel,
+    int MaxSteps,
+    out int2 HitPixel,
+    out float HitRayDepth,
+    out float HitTolerance)
+{
+    HitPixel = int2(0, 0);
+    HitRayDepth = 0.0;
+    HitTolerance = 0.0;
+
+    [loop] for (int Step = 1; Step <= 28; ++Step)
+    {
+        if (Step > MaxSteps)
+            break;
+
+        float Distance = 16.0 * Step * (1.0 + 0.14 * Step);
+        float3 RayP = WorldPos + ReflectionDir * Distance;
+        float4 Clip = mul(float4(RayP, 1.0), WetWorldToClip);
+        if (Clip.w <= 0.0)
+            break;
+
+        float2 NDC = Clip.xy / Clip.w;
+        float2 UV = float2(NDC.x * 0.5 + 0.5, 0.5 - NDC.y * 0.5);
+        if (any(UV < 0.01) || any(UV > 0.99))
+            break;
+
+        int2 Q = clamp(int2(WetSourceRect.xy + UV * WetSourceRect.zw), int2(0,0), MaxPixel);
+        float RayDepth = length(RayP - WetCameraTime.xyz);
+        float Tolerance = 9.0 + Distance * 0.040;
+
+        float BestDelta = 1.0e30;
+        int2 BestPixel = Q;
+        [unroll] for (int DY = -1; DY <= 1; ++DY)
+        {
+            [unroll] for (int DX = -1; DX <= 1; ++DX)
+            {
+                int2 S = clamp(Q + int2(DX, DY), int2(0,0), MaxPixel);
+                float D = WetDepthTexture.Load(int3(S, 0)).r;
+                if (D <= 0.0 || D >= 60000.0)
+                    continue;
+                float Delta = abs(D - RayDepth);
+                if (Delta < BestDelta)
+                {
+                    BestDelta = Delta;
+                    BestPixel = S;
+                }
+            }
+        }
+
+        if (BestDelta < Tolerance)
+        {
+            HitPixel = BestPixel;
+            HitRayDepth = RayDepth;
+            HitTolerance = Tolerance;
+            return true;
+        }
+    }
+    return false;
+}
+
+float3 TraceGSThinReflection(
+    float3 WorldPos,
+    float3 ReflectionDir,
+    int2 MaxPixel,
+    float3 Fallback,
+    out float HitValid)
+{
+    HitValid = 0.0;
+    int2 HitPixel;
+    float HitRayDepth;
+    float HitTolerance;
+    // Thin film is intentionally shorter-range for cost/stability and is heavily blurred.
+    if (FindReflectionHit(WorldPos, ReflectionDir, MaxPixel, 16, HitPixel, HitRayDepth, HitTolerance))
+    {
+        float Confidence = 0.0;
+        float3 C = ResolveReflectionThinAtHit(HitPixel, HitRayDepth, HitTolerance, MaxPixel, Confidence);
+        if (Confidence > 0.01)
+        {
+            HitValid = Confidence;
+            return min(max(C, 0.0), 3.0.xxx);
+        }
+    }
+    return Fallback;
+}
+
+float3 TraceGSPuddleReflection(
+    float3 WorldPos,
+    float3 ReflectionDir,
+    int2 MaxPixel,
+    float3 Fallback,
+    out float HitValid)
+{
+    HitValid = 0.0;
+    int2 HitPixel;
+    float HitRayDepth;
+    float HitTolerance;
+    if (FindReflectionHit(WorldPos, ReflectionDir, MaxPixel, 28, HitPixel, HitRayDepth, HitTolerance))
+    {
+        float Confidence = 0.0;
+        float3 C = ResolveReflectionPuddleAtHit(HitPixel, HitRayDepth, HitTolerance, MaxPixel, Confidence);
+        if (Confidence > 0.01)
+        {
+            HitValid = Confidence;
+            return min(max(C, 0.0), 3.0.xxx);
+        }
+    }
+    return Fallback;
+}
+
+float RainLuma(float3 C)
+{
+	return dot(max(C, 0.0), float3(0.2126, 0.7152, 0.0722));
+}
+
+float3 ApplyRainColorOverlay(float3 Source)
+{
+	float Strength = saturate(WetRainGrade0.x);
+	if (Strength <= 0.0001) return Source;
+
+	float3 Working = max(Source, 0.0);
+	Working *= exp2(clamp(WetRainGrade0.y, -3.0, 3.0));
+
+	// Gamma is allowed to shape the Rain mood, but its luminance ratio is bounded so
+	// a small pre-existing view variation cannot collapse the whole GS to black.
+	float L0 = max(RainLuma(Working), 1.0e-5);
+	float Gamma = clamp(WetRainGrade0.z, 0.5, 2.0);
+	// v9: keep the Rain gamma control visibly responsive.  The previous 0.65 ratio
+	// floor plus the later 72% source-luma floor cancelled most of the UI range.
+	float L1 = pow(clamp(L0, 1.0e-5, 4.0), Gamma);
+	float GammaRatio = clamp(L1 / L0, 0.28, 3.20);
+	Working *= GammaRatio;
+
+	float TintStrength = saturate(WetRainGrade1.w);
+	float3 Tint = max(WetRainGrade1.rgb, 1.0e-4.xxx);
+	float TintLuma = max(RainLuma(Tint), 1.0e-4);
+	float3 LumaNeutralTint = Tint / TintLuma;
+	Working *= lerp(1.0.xxx, LumaNeutralTint, TintStrength);
+
+	// Saturation is deliberately LAST so a colored Rain tint cannot re-introduce
+	// saturation after the user has reduced it. Sat=0 is truly grayscale; Sat=1 is neutral.
+	float Sat = clamp(WetRainGrade0.w, 0.0, 2.0);
+	float L = RainLuma(Working);
+	Working = lerp(L.xxx, Working, Sat);
+
+	return lerp(Source, max(Working, 0.0), Strength);
+}
+
+float4 WetSurfacePS(FScreenVertexOutput Input) : SV_Target0
+{
+    int2 MaxPixel = int2(WetSourceRect.xy + WetSourceRect.zw - 1.0);
+    float2 OutputUV = saturate((Input.Position.xy - WetOutputRect.xy + 0.5) / max(WetOutputRect.zw, 1.0.xx));
+    int2 P = clamp(int2(WetSourceRect.xy + OutputUV * max(WetSourceRect.zw - 1.0.xx, 0.0.xx)), int2(0,0), MaxPixel);
+    float4 Accum = WetSourceTexture.Load(int3(P, 0));
+
+    // Legacy GlobalFirst rule: actual rendered GS coverage is the ONLY admission gate.
+    // No proxy / depth / normal / horizontal / rain-exposure membership can remove a GS
+    // pixel from Rain Wet/Water after this point.
+    // v2888: transparent-write equivalent of the former cleared RT+discard.
+    // Required for safe no-clear fast path on full-extent MRQ/viewport views.
+    if (Accum.a <= (1.0 / 255.0)) return 0.0.xxxx;
+
+    float3 Source = Accum.rgb / max(Accum.a, 1.0e-5);
+    float Strength = saturate(WetSettings0.y);
+    if (Strength <= 0.0001) return Accum;
+    // v32: renderer encodes post-rain mode as WetPuddles(1.0)+0.25. This is
+    // camera-independent and changes only the Rain Wet presentation.
+    bool bResidualPuddleMode = WetSettings0.x > 1.10 && WetSettings0.x < 1.50;
+
+    // Rain-only color overlay remains isolated in this dedicated Rain pass, but its
+    // luminance excursion is bounded relative to the finished source GS so exposure
+    // cannot bleach the complete splat cloud toward white or crush it to black.
+    float3 OverlayColor = ApplyRainColorOverlay(Source);
+    float SourceLuma = max(RainLuma(Source), 0.0);
+    float OverlayLuma = max(RainLuma(OverlayColor), 1.0e-5);
+    // v9: safety remains Rain-only, but no longer cancels the visible Gamma/Exposure controls.
+    float MinOverlayLuma = SourceLuma * 0.28;
+    float MaxOverlayLuma = max(SourceLuma * 2.10, SourceLuma + 0.140);
+    float SafeOverlayLuma = clamp(OverlayLuma, MinOverlayLuma, MaxOverlayLuma);
+    float3 RainBase = SourceLuma > 1.0e-5
+        ? OverlayColor * (SafeOverlayLuma / OverlayLuma)
+        : min(max(OverlayColor, 0.0), 0.08.xxx);
+
+    // Honor the authored intrinsic splat-size fade in every receiver path.
+    // Use the center coverage: the neighborhood filter must not re-admit a
+    // rejected large splat just because eligible small splats surround it.
+    float CenterEligibleCoverage = saturate(WetNormalTexture.Load(int3(P, 0)).a);
+    float CenterSizeEligibility = WetProxySurfaceTest > 0 ? 1.0 : CenterEligibleCoverage;
+    if (CenterSizeEligibility <= 0.0)
+        return float4(RainBase * Accum.a, Accum.a);
+
+    // GlobalFirst base wet: every rendered GS receives the same camera-independent
+    // wet base before any auxiliary surface texture is consulted.
+    float DarkControl = clamp(WetSettings2.z, 0.0, 3.0);
+    float DarkFirst = saturate(DarkControl);
+    float DarkExtra = saturate((DarkControl - 1.0) * 0.5);
+    // Make the camera-independent base wet response readable at the shipped Rain
+    // defaults. The old coefficients produced less than 2% darkening at 0.48/0.28,
+    // which was visually indistinguishable from the dry grade.
+    float UniformDarkening = Strength * (0.30 * DarkFirst + 0.24 * DarkExtra);
+    float3 BaseWetColor = max(RainBase, 0.0) * (1.0 - UniformDarkening);
+
+    // NoWhiteWet: tint changes hue, not scene luminance. This replaces the historical
+    // unbounded additive sky/direct wet sheen that made bright splats look snowy.
+    float3 LumaWeights = float3(0.2126, 0.7152, 0.0722);
+    float CoatControl = saturate(WetSettings1.w);
+    float3 WetTint = max(WetSettings1.rgb, 0.0);
+    float WetTintLuma = max(dot(WetTint, LumaWeights), 1.0e-4);
+    float3 StableWetTint = WetTint / WetTintLuma;
+    float TintMix = Strength * max(CoatControl, 0.35) * 0.075;
+    float BaseBeforeTintLuma = max(dot(BaseWetColor, LumaWeights), 0.0);
+    float3 TintedBase = lerp(BaseWetColor, BaseWetColor * StableWetTint, TintMix);
+    float TintedBaseLuma = max(dot(TintedBase, LumaWeights), 1.0e-5);
+    BaseWetColor = BaseBeforeTintLuma > 1.0e-5
+        ? TintedBase * (BaseBeforeTintLuma / TintedBaseLuma)
+        : TintedBase;
+    BaseWetColor = max(BaseWetColor, 0.0);
+    float BaseWetLuma = max(RainLuma(BaseWetColor), 0.0);
+
+    // Full-coverage detail rule from NoWhiteWet: missing depth/normal data never causes
+    // an early return. Fallback data only aims the ripple/reflection, so water treatment
+    // still reaches every rendered GS pixel.
+    float Depth = WetDepthTexture.Load(int3(P, 0)).r;
+    float SafeDepth = (Depth > 0.0 && Depth < 60000.0) ? Depth : 1000.0;
+
+    float3 WorldPos = ReconstructWorld(P, MaxPixel, SafeDepth);
+
+    // v36 primary receiver = continuous collider/proxy surface. The GS point must
+    // depth-match that surface and the reconstructed proxy normal must be sufficiently
+    // horizontal. Intrinsic size eligibility still limits water independently.
+    float ProxyReceiverConfidence = 0.0;
+    float ProxyWaterReceiver = 0.0;
+    if (WetProxySurfaceTest >= 3)
+    {
+        // This texture is rasterized from baked mesh triangles, not GS normals.
+        float4 MeshSurface = WetNormalTexture.Load(int3(P, 0));
+        if (MeshSurface.w <= 0.0)
+            return float4((WetProxySurfaceTest == 4 ? 0.0.xxx : RainBase) * Accum.a, Accum.a);
+        WorldPos = MeshSurface.xyz + WetCameraTime.xyz;
+        SafeDepth = length(MeshSurface.xyz);
+        ProxyWaterReceiver = 1.0;
+    }
+    else
+        ProxyWaterReceiver = ResolveProxyWaterReceiver(WorldPos, ProxyReceiverConfidence);
+    if (WetProxySurfaceTest > 0 && WetProxySurfaceTest < 3)
+    {
+        // Prototype: anchor optical coordinates to the captured proxy surface.
+        // Keep GS/proxy depth agreement for occlusion, but never fall back to
+        // whichever splat last wrote the normal/eligibility render target.
+        float2 ProxyUV;
+        float GSForwardDepth;
+        float ProxyDepth;
+        if (ProxyWaterReceiver <= 0.0 ||
+            !ProjectWorldToWetProxy(WorldPos, ProxyUV, GSForwardDepth) ||
+            !SampleWetProxySurfaceDepth(ProxyUV, ProxyDepth))
+            return float4((WetProxySurfaceTest == 2 ? 0.0.xxx : RainBase) * Accum.a, Accum.a);
+        WorldPos = ReconstructWetProxySurfaceWorld(ProxyUV, ProxyDepth);
+    }
+
+    // Safe fallback for scenes without a published collider depth capture. This path is
+    // intentionally secondary; when proxy depth is valid it has no authority.
+    float SizeQualityFallback = ResolveWaterReceiver(P, MaxPixel, SafeDepth);
+    float3 FallbackN = normalize(WetNormalTexture.Load(int3(P, 0)).rgb * 2.0 - 1.0);
+    float FallbackHorizontal = smoothstep(0.55, 0.80, abs(FallbackN.z));
+    float FallbackReceiver = saturate(SizeQualityFallback * FallbackHorizontal);
+    float HasProxyReceiver = step(0.5, WetProxySurfaceRightEnabled.w);
+    // v37: a published proxy no longer hard-kills water when the capture is locally
+    // uncertain.  Strong proxy matches remain authoritative; low-confidence gaps blend
+    // at most 28% of the GS fallback so small collider/GS offsets do not erase wetness.
+    float ProxyFallback = FallbackReceiver * (1.0 - ProxyReceiverConfidence) * 0.28;
+    float ProxyBlendedReceiver = saturate(max(ProxyWaterReceiver, ProxyFallback));
+    float WaterReceiverMask = lerp(FallbackReceiver, ProxyBlendedReceiver, HasProxyReceiver);
+    WaterReceiverMask *= CenterSizeEligibility;
+    if (WetProxySurfaceTest > 0)
+        WaterReceiverMask = ProxyWaterReceiver;
+    if (WetProxySurfaceTest == 2 || WetProxySurfaceTest == 4)
+        return float4(WaterReceiverMask.xxx * Accum.a, Accum.a);
+
+    // Preserve one world-up optical water normal. Receiver geometry never becomes a
+    // per-Gaussian optical normal.
+    float3 N = float3(0.0, 0.0, 1.0);
+    float PuddleAmount = saturate(WetSettings2.w);
+    float PatternScale = max(WetSettings0.w, 0.001);
+    float2 LowUV = WorldPos.xy * PatternScale * 0.008;
+    float PuddleNoise = 0.5
+        + 0.25 * sin(LowUV.x + sin(LowUV.y * 0.71))
+        + 0.25 * sin(LowUV.y * 1.31 - LowUV.x * 0.37);
+
+    // v35 two-layer wet model.  Ordinary rain produces a broad thin wet film;
+    // coherent world-space low areas receive a stronger puddle layer.  After the rain stops,
+    // the thin film disappears and only standing puddles remain.
+    float PuddleThreshold = lerp(0.76, 0.28, PuddleAmount);
+    float PuddleShape = smoothstep(PuddleThreshold - 0.12, PuddleThreshold + 0.12, PuddleNoise);
+
+    // v38: active rain is a FULL water/puddle presentation across every admitted
+    // horizontal receiver.  World-space PuddleShape is reserved for the post-rain
+    // residual state only; it must not carve holes in the active-rain water layer.
+    float FullRainWaterMask = saturate(Strength * WaterReceiverMask);
+    float ResidualPuddleMask = saturate(
+        Strength * PuddleAmount * PuddleShape * WaterReceiverMask);
+
+    // Keep a small thin-film term for material response, but active-rain optical water
+    // coverage is driven by FullRainWaterMask.  Once rain stops, only residual islands remain.
+    float ThinFilmMask = bResidualPuddleMode
+        ? 0.0
+        : saturate(Strength * 0.22 * WaterReceiverMask);
+    float PuddleWaterMask = bResidualPuddleMode
+        ? ResidualPuddleMask
+        : FullRainWaterMask;
+    float WaterOpticalMask = saturate(
+        ThinFilmMask + PuddleWaterMask * (1.0 - ThinFilmMask));
+    float PuddleClarity = bResidualPuddleMode
+        ? saturate(PuddleAmount * PuddleShape)
+        : saturate(0.68 + 0.32 * PuddleAmount);
+
+    // v14: TRUE GLOBAL wet/water must not brighten itself and must never use the
+    // Gaussian alpha footprint as an optical-strength mask.  The legacy GroundWetFix
+    // look stayed smooth because the source alpha only validated SSR hits; it did not
+    // modulate reflection/ripple strength per splat.
+    float3 GlobalWetFilmColor = BaseWetColor;
+    float GlobalWetLuma = BaseWetLuma;
+
+    float2 Ripple = RippleGradient(
+        WorldPos.xy,
+        WetCameraTime.w,
+        WetSettings3.y,
+        WetSettings3.z,
+        WetSettings3.w);
+    // Rain stopped = standing puddles. Do not keep animated raindrop rings after
+    // the precipitation Niagara has been disabled.
+    float RippleStrength = bResidualPuddleMode ? 0.0 : max(WetSettings3.x, 0.0);
+    // Ripple follows the global rain amount only on horizontal-enough splats.
+    float RippleMask = WaterOpticalMask;
+    float3 WetNRaw = N + float3(
+        Ripple * RippleStrength * RippleMask * (0.055 + 0.145 * WaterOpticalMask),
+        0.0);
+    float3 WetN = WetNRaw * rsqrt(max(dot(WetNRaw, WetNRaw), 1.0e-6));
+
+    float3 ReflectionTint = max(WetSettings1.rgb, 0.0);
+    float ReflectionTintLuma = max(RainLuma(ReflectionTint), 1.0e-4);
+    float3 NeutralReflectionTint = ReflectionTint / ReflectionTintLuma;
+
+    // v33 HYBRID REFLECTION: fixed admission, camera-correct presentation.
+    // Wet eligibility above remains camera-independent (horizontal mask + intrinsic size +
+    // world-space puddle pattern). Camera/view vectors are used ONLY after admission to
+    // calculate Fresnel, reflected scene direction and the restrained highlight, matching
+    // the stable principle of the first supplied Rain implementation.
+    float RippleMagnitude = saturate(length(Ripple) * max(RippleStrength, 0.0));
+    float2 RippleBands = RippleRingBands(
+        WorldPos.xy,
+        WetCameraTime.w,
+        WetSettings3.y,
+        WetSettings3.z,
+        WetSettings3.w);
+    float RippleBrightBand = RippleBands.x * saturate(max(RippleStrength, 0.0)) * WaterOpticalMask;
+    float RippleDarkBand = RippleBands.y * saturate(max(RippleStrength, 0.0)) * WaterOpticalMask;
+
+    // Stable water film is always present for admitted water, even when SSR misses.
+    float FilmTintMix = saturate(0.12 + 0.24 * WaterOpticalMask + 0.07 * RippleMagnitude);
+    float3 WaterFilmTinted = lerp(
+        GlobalWetFilmColor,
+        GlobalWetFilmColor * NeutralReflectionTint,
+        FilmTintMix);
+    float WaterFilmTintLuma = max(RainLuma(WaterFilmTinted), 1.0e-5);
+    float3 HorizontalWaterFilmColor = GlobalWetLuma > 1.0e-5
+        ? WaterFilmTinted * (GlobalWetLuma / WaterFilmTintLuma)
+        : min(max(WaterFilmTinted, 0.0), 0.04.xxx);
+    float3 WaterFilmColor = lerp(GlobalWetFilmColor, HorizontalWaterFilmColor, WaterOpticalMask);
+
+    // Camera is allowed here only for physically expected reflection presentation. It does
+    // not feed the v35 receiver field, intrinsic-size rejection or world-space puddle placement.
+    float3 VRaw = WetCameraTime.xyz - WorldPos;
+    float VLenSq = dot(VRaw, VRaw);
+    float3 V = VLenSq > 1.0e-6 ? VRaw * rsqrt(VLenSq) : float3(0.0, 0.0, 1.0);
+    float Fresnel = 0.025 + 0.975 * pow(1.0 - saturate(dot(WetN, V)), 5.0);
+    float3 ReflectionDir = reflect(-V, WetN);
+    // v37 TWO-LAYER REAL REFLECTION -------------------------------------------
+    // Camera affects only the reflected presentation.  Admission remains proxy/fallback,
+    // world-space puddle placement and fixed water-normal based.
+    float ThinReflectionMask = saturate(ThinFilmMask * (0.72 + 0.28 * WaterReceiverMask));
+    // Active rain: reflection covers the full admitted water receiver.  Post-rain:
+    // reflection returns to deterministic world-space residual puddle islands.
+    float ActiveRainReflectionMask = saturate(
+        WaterReceiverMask * sqrt(max(Strength, 0.0)) * lerp(0.82, 1.0, PuddleAmount));
+    float ResidualReflectionMask = saturate(
+        WaterReceiverMask * PuddleShape * sqrt(max(Strength * PuddleAmount, 0.0)));
+    float PuddleReflectionMask = bResidualPuddleMode
+        ? ResidualReflectionMask
+        : ActiveRainReflectionMask;
+
+    float ThinReflectionHit = 0.0;
+    float PuddleReflectionHit = 0.0;
+    float3 ThinReflection = WaterFilmColor;
+    float3 PuddleReflection = WaterFilmColor;
+
+    // Puddles supersede thin film.  Avoid tracing both layers for the same pixel.
+    if (PuddleReflectionMask > 0.01)
+    {
+        PuddleReflection = TraceGSPuddleReflection(
+            WorldPos + WetN * 2.0,
+            ReflectionDir,
+            MaxPixel,
+            WaterFilmColor,
+            PuddleReflectionHit);
+    }
+    else if (ThinReflectionMask > 0.015)
+    {
+        ThinReflection = TraceGSThinReflection(
+            WorldPos + WetN * 2.0,
+            ReflectionDir,
+            MaxPixel,
+            WaterFilmColor,
+            ThinReflectionHit);
+    }
+
+    float3 ThinReflectionColor = max(ThinReflection, 0.0) * NeutralReflectionTint;
+    float ThinRawLuma = max(RainLuma(ThinReflectionColor), 1.0e-5);
+    // Wet stone: preserve material readability.  Reflection is broad and low-contrast.
+    float ThinMinLuma = GlobalWetLuma * 0.74;
+    float ThinMaxLuma = max(GlobalWetLuma * 1.42, GlobalWetLuma + 0.085);
+    float ThinSafeLuma = clamp(ThinRawLuma, ThinMinLuma, ThinMaxLuma);
+    float3 SafeThinReflection = ThinReflectionColor * (ThinSafeLuma / ThinRawLuma);
+    float ThinReflectionWeight = saturate(
+        ThinReflectionMask * ThinReflectionHit *
+        (0.15 + 0.15 * sqrt(saturate(Fresnel))));
+
+    float3 PuddleReflectionColor = max(PuddleReflection, 0.0) * NeutralReflectionTint;
+    float PuddleRawLuma = max(RainLuma(PuddleReflectionColor), 1.0e-5);
+    // Standing water: allow a much wider luminance range so reflected structures read.
+    float PuddleMinLuma = GlobalWetLuma * 0.44;
+    float PuddleMaxLuma = max(GlobalWetLuma * 1.95, GlobalWetLuma + 0.215);
+    float PuddleSafeLuma = clamp(PuddleRawLuma, PuddleMinLuma, PuddleMaxLuma);
+    float3 SafePuddleReflection = PuddleReflectionColor * (PuddleSafeLuma / PuddleRawLuma);
+    float PuddleReflectionWeight = saturate(
+        PuddleReflectionMask * PuddleReflectionHit *
+        (0.60 + 0.35 * sqrt(saturate(Fresnel))));
+
+    float3 WetCandidate = WaterFilmColor;
+    WetCandidate = lerp(WetCandidate, SafeThinReflection, ThinReflectionWeight);
+    WetCandidate = lerp(WetCandidate, SafePuddleReflection, PuddleReflectionWeight);
+
+    // Reflection miss fallback remains stable and non-geometric.  It is weaker now that
+    // thin-film GS reflection exists, but keeps wet material readable in sparse GS regions.
+    float StaticSkyCue = saturate(
+        ThinFilmMask * 0.09 * (1.0 - ThinReflectionHit) +
+        PuddleReflectionMask * (0.10 + 0.14 * PuddleShape) * (1.0 - PuddleReflectionHit));
+    float3 StaticSkyColor = NeutralReflectionTint * max(GlobalWetLuma, 0.015);
+    WetCandidate = lerp(WetCandidate, StaticSkyColor, StaticSkyCue);
+
+    // World-space ripple relief remains fixed; it modulates the reflected film rather than
+    // determining whether the surface is wet.
+    WetCandidate *= (1.0 - 0.11 * RippleDarkBand);
+    WetCandidate += NeutralReflectionTint * (GlobalWetLuma * 0.18 * RippleBrightBand);
+
+    // Restore the original view-dependent water highlight only after fixed water admission.
+    float LightLenSq = dot(WetLightDirectionValid.xyz, WetLightDirectionValid.xyz);
+    float LightValid = step(1.0e-6, LightLenSq);
+    float3 L = LightValid > 0.5
+        ? -WetLightDirectionValid.xyz * rsqrt(LightLenSq)
+        : float3(0.0, 0.0, 1.0);
+    float3 HRaw = L + V;
+    float HLenSq = dot(HRaw, HRaw);
+    float3 H = HLenSq > 1.0e-6 ? HRaw * rsqrt(HLenSq) : WetN;
+    float NdotH = saturate(dot(WetN, H));
+    float NdotL = saturate(dot(WetN, L));
+    float Specular = pow(NdotH, lerp(42.0, 120.0, WaterOpticalMask)) * NdotL * LightValid;
+    float SpecularWeight = CoatControl * WaterOpticalMask * 0.12;
+    float3 SpecularTint = lerp(1.0.xxx, saturate(WetLightColorIntensity.rgb), 0.08);
+    WetCandidate += SpecularTint * min(Specular * SpecularWeight, 0.075);
+
+    // v31 CAMERA-INDEPENDENT MOON WET CUE ------------------------------------
+    // Use the existing Day/Night moon direction/color, but DO NOT reflect the camera
+    // vector and DO NOT sample SceneColor. The moon contribution is fixed by world-space
+    // puddle/ripple data + moon elevation, so rotating the camera cannot move/erase it.
+    float MoonDirLenSq = dot(WetMoonDirectionSize.xyz, WetMoonDirectionSize.xyz);
+    float3 MoonDir = MoonDirLenSq > 1.0e-6
+        ? WetMoonDirectionSize.xyz * rsqrt(MoonDirLenSq)
+        : float3(0.0, 0.0, 1.0);
+    float MoonRuntimeStrength = saturate(WetMoonColorStrength.w);
+    float MoonAboveHorizon = smoothstep(0.015, 0.18, MoonDir.z);
+    float MoonValid = step(1.0e-6, MoonDirLenSq) * MoonRuntimeStrength * MoonAboveHorizon;
+
+    float3 MoonColor = max(WetMoonColorStrength.rgb, 0.0);
+    float MoonColorLuma = max(RainLuma(MoonColor), 1.0e-4);
+    float3 AuthoredMoonNeutral = MoonColor / MoonColorLuma;
+    float3 CoolMoonWhite = float3(0.92, 0.97, 1.04);
+    CoolMoonWhite /= max(RainLuma(CoolMoonWhite), 1.0e-4);
+    float3 MoonTint = lerp(CoolMoonWhite, AuthoredMoonNeutral, 0.22);
+
+    // Apparent source angle controls how concentrated the cue is, but the footprint is
+    // world-space and repeated only at a very broad scale so arbitrary GS/collider scenes
+    // do not require an authored anchor. It is deliberately a lighting cue, not SSR.
+    float MoonAngularNorm = saturate((clamp(WetMoonDirectionSize.w, 0.10, 8.0) - 0.10) / 7.90);
+    float2 MoonAxisXY = MoonDir.xy;
+    float MoonAxisLenSq = dot(MoonAxisXY, MoonAxisXY);
+    MoonAxisXY = MoonAxisLenSq > 1.0e-6 ? MoonAxisXY * rsqrt(MoonAxisLenSq) : float2(1.0, 0.0);
+    float2 MoonPerpXY = float2(-MoonAxisXY.y, MoonAxisXY.x);
+    float MoonAlong = dot(WorldPos.xy, MoonAxisXY) * 0.00085;
+    float MoonAcross = dot(WorldPos.xy, MoonPerpXY) * 0.00115;
+    float BroadLane = 0.5 + 0.5 * sin(MoonAlong + 0.55 * sin(MoonAcross * 0.73));
+    float CoreLane = pow(saturate(BroadLane), lerp(8.0, 4.5, MoonAngularNorm));
+    float HaloLane = pow(saturate(BroadLane), lerp(3.5, 2.2, MoonAngularNorm));
+    float MoonCoverage = bResidualPuddleMode ? (0.35 + 0.65 * PuddleShape) : 1.0;
+    float MoonPuddleMask = WaterOpticalMask * MoonValid * MoonCoverage;
+    float MoonCore = CoreLane * MoonPuddleMask;
+    float MoonHalo = HaloLane * MoonPuddleMask;
+    float MoonRippleSpark = RippleBrightBand * MoonPuddleMask;
+    float MoonCue = saturate(MoonCore * 0.95 + MoonHalo * 0.38 + MoonRippleSpark * 0.32);
+    float MoonRelativeEnergy = GlobalWetLuma * (0.26 * MoonCore + 0.12 * MoonHalo + 0.10 * MoonRippleSpark);
+    float MoonAbsoluteFloor = 0.018 * MoonCue * MoonRuntimeStrength;
+    WetCandidate += MoonTint * (MoonRelativeEnergy + MoonAbsoluteFloor);
+
+    // v37 bounded energy guard. Thin film carries blurred low-energy reflection; puddles
+    // carry stronger reflection. Receiver geometry remains proxy/collider-owned.
+    float CandidateLuma = max(RainLuma(WetCandidate), 1.0e-5);
+    float ReflectionContrast = saturate(max(ThinReflectionWeight, PuddleReflectionWeight));
+    float ReflectionFloor = lerp(0.88, lerp(0.62, 0.46, PuddleClarity), ReflectionContrast);
+    float MinWetLuma = GlobalWetLuma * lerp(1.0, ReflectionFloor, WaterOpticalMask);
+    float MaxWetLuma = max(
+        GlobalWetLuma * (1.0 + 0.30 * WaterOpticalMask + 0.66 * ReflectionContrast + 0.22 * MoonCue),
+        GlobalWetLuma + 0.085 * WaterOpticalMask + 0.190 * ReflectionContrast + 0.055 * MoonCue);
+    float SafeWetLuma = clamp(CandidateLuma, MinWetLuma, MaxWetLuma);
+    float3 WetColor = GlobalWetLuma > 1.0e-5
+        ? WetCandidate * (SafeWetLuma / CandidateLuma)
+        : min(max(WetCandidate, 0.0), 0.08.xxx);
+
+    // Keep only an absolute HDR safety ceiling.  The previous base-relative per-channel
+    // ceiling removed most reflected color/contrast and made the surface look matte.
+    WetColor = min(max(WetColor, 0.0), 1.25.xxx);
+
+    if (bResidualPuddleMode)
+    {
+        // Outside the residual islands return to the Rain-graded dry surface; only the
+        // stationary puddles retain wet darkening/reflection/moon cues. Camera affects only
+        // the visible reflection direction, never which pixels belong to the puddle.
+        float ResidualVisible = saturate(WaterOpticalMask * 1.35);
+        float3 ResidualPoolColor = WetColor * (1.0 - 0.10 * ResidualVisible);
+        WetColor = lerp(RainBase, ResidualPoolColor, ResidualVisible);
+    }
+
+    // Also gate terms such as uniform wet darkening and moon highlights that
+    // are not entirely driven by WaterReceiverMask. Preserve the Rain grade.
+    WetColor = lerp(RainBase, WetColor, CenterSizeEligibility);
+    if (WetProxySurfaceTest == 1 || WetProxySurfaceTest == 3)
+        WetColor = lerp(RainBase, WetColor, WaterReceiverMask);
+    return float4(WetColor * Accum.a, Accum.a);
+}

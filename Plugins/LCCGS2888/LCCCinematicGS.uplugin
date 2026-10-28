@@ -1,0 +1,36 @@
+﻿{
+  "FileVersion": 3,
+  "Version": 2888,
+  "VersionName": "2.8.88 Patch50 Matched Fog Scattering / Dense Overcast Fog",
+  "FriendlyName": "LCC Cinematic GS",
+  "Description": "Default verified pre-tonemap GS PreExposure isolation; full-extent HDR grade/wet clear elimination; opt-in bounded scheduling/memory diagnostics; previous lighting, shadows, snow, fog and UI retained.",
+  "Category": "Rendering",
+  "CreatedBy": "LCC",
+  "CreatedByURL": "",
+  "DocsURL": "",
+  "MarketplaceURL": "",
+  "SupportURL": "",
+  "CanContainContent": true,
+  "IsBetaVersion": true,
+  "IsExperimentalVersion": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "LCCCinematicGS",
+      "Type": "Runtime",
+      "LoadingPhase": "PostConfigInit"
+    },
+    {
+      "Name": "LCCCinematicGSEditor",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "EngineVersion": "5.8.0",
+  "Plugins": [
+    {
+      "Name": "Niagara",
+      "Enabled": true
+    }
+  ]
+}

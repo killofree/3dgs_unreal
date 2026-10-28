@@ -1,0 +1,73 @@
+// v2892: cheap conservative pre-ViewData cull for rain panorama.
+// Full covariance-aware CalcViewData culling still runs after this pass.
+#include "/Plugin/LCCCinematicGS/Private/GaussianSplatting.ush"
+
+ByteAddressBuffer PackedSplatBuffer;
+ByteAddressBuffer Float32PositionBuffer;
+uint UseFloat32Position;
+RWStructuredBuffer<uint> CompactedSplatIndices;
+RWStructuredBuffer<uint> VisibleSplatCount;
+float4x4 LocalToWorld;
+float4x4 WorldToClip;
+float4x4 WorldToView;
+float2 ProjectionScale;
+float LocalToWorldMaxScale;
+float SplatScale;
+float GuardBand;
+uint TotalSplatCount;
+uint OutputCapacity;
+
+[numthreads(1,1,1)]
+void ResetCounterCS(uint3 DTid : SV_DispatchThreadID)
+{
+    VisibleSplatCount[0] = 0u;
+}
+
+[numthreads(256,1,1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    uint splatIndex = DTid.x;
+    if (splatIndex >= TotalSplatCount || OutputCapacity == 0u)
+        return;
+
+    FUnpackedSplat splat = UnpackSplat(PackedSplatBuffer, splatIndex);
+    float3 localPos = (UseFloat32Position != 0u)
+        ? LoadPositionFloat32(Float32PositionBuffer, splatIndex)
+        : splat.Position;
+
+    float4 worldPos = mul(float4(localPos, 1.0), LocalToWorld);
+    float4 clipPos = mul(worldPos, WorldToClip);
+    if (clipPos.w <= 0.0f)
+        return;
+
+    float2 ndcCenter = clipPos.xy / max(abs(clipPos.w), 1.0e-6f);
+    float4 viewPos = mul(worldPos, WorldToView);
+    float viewDepth = max(abs(viewPos.z), 1.0e-3f);
+
+    float sigmaWorld = max(max(abs(splat.Scale.x), abs(splat.Scale.y)), abs(splat.Scale.z));
+    float radiusWorld = sigmaWorld * max(SplatScale, 0.0f) * max(LocalToWorldMaxScale, 1.0e-4f) * 3.0f;
+    float2 radiusNDC = radiusWorld * abs(ProjectionScale) / viewDepth;
+    radiusNDC = min(radiusNDC, float2(4.0f, 4.0f));
+    float2 extent = radiusNDC + float2(max(GuardBand, 0.0f), max(GuardBand, 0.0f));
+
+    bool overlaps = !(
+        ndcCenter.x - extent.x > 1.0f || ndcCenter.x + extent.x < -1.0f ||
+        ndcCenter.y - extent.y > 1.0f || ndcCenter.y + extent.y < -1.0f);
+    if (!overlaps)
+        return;
+
+    uint expectedCount;
+    InterlockedAdd(VisibleSplatCount[0], 0u, expectedCount);
+    [loop]
+    while (expectedCount < OutputCapacity)
+    {
+        uint previousCount;
+        InterlockedCompareExchange(VisibleSplatCount[0], expectedCount, expectedCount + 1u, previousCount);
+        if (previousCount == expectedCount)
+        {
+            CompactedSplatIndices[expectedCount] = splatIndex;
+            break;
+        }
+        expectedCount = previousCount;
+    }
+}

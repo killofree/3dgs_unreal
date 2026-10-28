@@ -1,0 +1,816 @@
+uint BaselineRenderQualityMode;
+float4 BaselineRasterClipParams;
+#ifndef GS_VR_RASTER_CLIP
+#define GS_VR_RASTER_CLIP 0
+#endif
+// Copyright Epic Games, Inc. All Rights Reserved.
+// Shader version: 6 (Nanite-style velocity: use clip positions for both current/previous, no SV_Position conversion)
+
+//RASTERIZATION, Vertex Shader + Pixel Shader
+
+// NOTE: We intentionally do NOT include Common.ush here to avoid bringing in
+// InstancedStereo.ush which declares InstancedView uniform buffer that we don't bind.
+// Instead, we include only what we need.
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/LCCCinematicGS/Private/GaussianDataTypes.ush"
+
+// Velocity encoding matching UE5's Common.ush EncodeVelocityToTexture
+// Velocity is in NDC space [-2, 2] range, encoded to [0, 1] for texture
+// Uses 0.499f to avoid using the full range so that (0,0) clear color is special
+float4 EncodeVelocityToTexture(float3 V)
+{
+	// Gamma encoding for better precision in low velocity ranges (matches VELOCITY_ENCODE_GAMMA)
+	V.xy = sign(V.xy) * sqrt(abs(V.xy)) * (2.0 / sqrt(2.0));
+
+	// 0.499f is a value smaller than 0.5f to avoid using the full range
+	// 0.5f to allow for a range of -2..2 instead of -1..1
+	float4 EncodedV;
+	EncodedV.xy = V.xy * (0.499f * 0.5f) + 32767.0f / 65535.0f;
+
+	// Depth velocity encoding (not used for TAA/TSR, but included for completeness)
+	EncodedV.z = V.z * (0.499f * 0.5f) + 32767.0f / 65535.0f;
+	EncodedV.w = 0.0f;  // No pixel animation flag
+
+	return EncodedV;
+}
+
+// Final lighting inputs are identical for all four vertices of a GS.
+#if GS_PCVR_COLOR_CACHE
+StructuredBuffer<float4> PCVRFinalColors;
+#endif
+uint PerSplatLightingEnabled;
+// V17: 0 retains original per-pixel GS centre radial depth; 1 reuses a
+// centre depth calculated by VS in the unused fourth lane of TEXCOORD3.
+uint PCVRReuseRadialDepth;
+float DayNightBlend;
+float4 RegionalColorGradeParams0;
+float4 RegionalColorGradeParams1;
+float StableShadowColorRetention;
+float4 ProxyShadowDetailSettings;
+float4 ProxyReflectedLightSettings;
+float4 ProxyReflectedColorSettings;
+float4 ProxyShadowBaseSettings;
+float3 ProxyShadowBaseTint;
+float4 ProxyLightDepthForwardEnabled;
+
+// Vertex shader parameters
+#if VERTEXSHADER
+StructuredBuffer<FGaussianSplatViewData> ViewDataBuffer;
+StructuredBuffer<uint> SortKeysBuffer;
+uint SplatCount;
+uint DebugMode;  // 0=off, 1=cluster colors (Nanite-style debug view)
+uint EnableNanite;  // 1=Nanite enabled, 0=disabled (non-Nanite assets hidden in debug mode)
+// v2785 dedicated snow overlay draw.
+float4x4 SnowTranslatedWorldToClip;
+float4 SnowOverlayParams; // x max thickness cm, y footprint expansion, z weight cutoff, w alpha scale
+float4 SnowOverlayColor;  // rgb base snow tint, w reserved
+float4 SnowTuningParams; // x ground fill, y structure removal, z structure slope threshold
+#endif
+
+// Pixel shader parameters for velocity calculation
+// NOTE: All matrices are UN-JITTERED to ensure stable velocity when camera is static
+#if PIXELSHADER
+float4x4 PrevTranslatedWorldToClip;  // Previous frame's un-jittered matrix for velocity
+float3 PreViewTranslation;           // Current frame's pre-view translation
+float3 PrevPreViewTranslation;       // Previous frame's pre-view translation
+float4x4 PuddleClipToWorld;
+float4 PuddleViewport;
+// Patch39: world-space oriented removal volumes, updated only when boxes move.
+uint GSRemovalBoxCount;
+float4 GSRemovalBoxCenters[8];
+float4 GSRemovalBoxAxisX[8];
+float4 GSRemovalBoxAxisY[8];
+float4 GSRemovalBoxAxisZ[8];
+
+float4 PuddleWaterParams; // alpha, ripple strength, drop spacing cm, speed multiplier
+float PuddleWaterRippleSizeCm;
+float PuddleWaterReflectionStrength;
+float PuddleRoofRasterCellCm;
+float4 PuddleRoofFXParams; // use flow, opaque debug, flow strength, flow speed
+float PuddleWaterTimeSeconds;
+uint LightingPreviewMode;            // Existing 0..39 plus isolated stable-debug pixel modes 40..47
+uint StableShadowDebugMode;          // Exact numbered actor selector; includes LIVE render and stable A/B diagnostics
+uint RenderQualityMode;              // 0=normal resolve, 3=high quality sharper resolve, 4=original unlit
+uint PCVREarlyAlphaEnabled;           // V15-A: skip invisible GS fragments before expensive lighting (pixel shader only)
+uint UseProxyLightingMaskAsMain;      // 1=proxy/composite mask owns final light and shadow grade
+float ProxyLightingIntensityScale;    // Directional-light lux/intensity scalar, 0=unlit
+Texture2D ProxyShadowedCapture;
+Texture2D ProxyUnshadowedCapture;
+SamplerState ProxyCaptureSampler;
+float4 ProxyCaptureViewRect;
+float4 ProxyScreenCaptureSettings;
+float4 ProxyCaptureOriginTanFOV;
+float4 ProxyCaptureForwardAspect;
+float4 ProxyCaptureRightEnabled;
+float4 ProxyCaptureUp;
+float4 ProxyCaptureSettings;
+float4 ProxyShadowCameraDistanceSettings;
+Texture2D ProxySurfaceDepthTexture;
+SamplerState ProxySurfaceDepthSampler;
+float ProxySurfaceDepthEnabled;
+Texture2D ProxyHistoryShadowedCapture;
+Texture2D ProxyHistoryUnshadowedCapture;
+Texture2D ProxyHistorySurfaceDepthTexture;
+float4 ProxyHistoryOriginTanFOV;
+float4 ProxyHistoryForwardAspect;
+float4 ProxyHistoryRightEnabled;
+float4 ProxyHistoryUp;
+float4 ProxyShadowTemporalSettings;
+float4 ProxyShadowEvidenceSettings; // x full-black receiver level, y closure strength, z area scale, w edge softness
+float4 ProxyShadowShapingSettings; // x direct white point, y direct gamma, z closed max darkness, w closed-shadow start receiver level
+float ProxyShadowOcclusionBoost;
+float2 ProxyShadowColorSettings;
+Texture2D ProxyLightDepthCapture;
+SamplerState ProxyLightDepthSampler;
+float4 ProxyLightDepthOriginWidth;
+float4 ProxyLightDepthRightRange;
+float4 ProxyLightDepthUpSettings;
+float4 ProxyVolumetricShaftSettings;
+float3 ProxyVolumetricShaftTint;
+#endif
+
+// Convert HSV to RGB (Nanite-style saturated colors)
+float3 HSVToRGB(float3 hsv)
+{
+	float h = hsv.x;
+	float s = hsv.y;
+	float v = hsv.z;
+
+	float c = v * s;
+	float x = c * (1.0 - abs(fmod(h * 6.0, 2.0) - 1.0));
+	float m = v - c;
+
+	float3 rgb;
+	if (h < 1.0/6.0)      rgb = float3(c, x, 0);
+	else if (h < 2.0/6.0) rgb = float3(x, c, 0);
+	else if (h < 3.0/6.0) rgb = float3(0, c, x);
+	else if (h < 4.0/6.0) rgb = float3(0, x, c);
+	else if (h < 5.0/6.0) rgb = float3(x, 0, c);
+	else                  rgb = float3(c, 0, x);
+
+	return rgb + m;
+}
+
+// Hash function to generate pseudo-random color from cluster ID
+// Uses Nanite-style approach: saturated colors via HSV
+float3 HashToColor(uint id)
+{
+	// Use multiple primes for better distribution
+	uint h = id;
+	h = h * 2654435761u;  // Knuth multiplicative hash
+	h ^= h >> 16;
+	h *= 0x85ebca6b;
+	h ^= h >> 13;
+
+	// Generate HSV with pastel colors similar to Nanite debug visualization
+	// Debug colors are emitted directly into the linear HDR intermediate.
+	float hue = float(h & 0xFFFF) / 65535.0;  // Full hue range
+	float sat = 0.25 + 0.35 * float((h >> 16) & 0xFF) / 255.0;  // 0.25-0.60 saturation (pastel)
+	float val = 0.75 + 0.25 * float((h >> 24) & 0xFF) / 255.0;  // 0.75-1.0 value (bright)
+
+	return HSVToRGB(float3(hue, sat, val));
+}
+
+// Vertex shader output / Pixel shader input
+struct FVertexOutput
+{
+	float4 Position : SV_POSITION;
+	float2 LocalPos : TEXCOORD0;
+	float4 Color : TEXCOORD1;         // Base+Indirect, scene-linear
+	float3 DirectColor : TEXCOORD8; // Gaussian-native sun accent, scene-linear
+	float3 PlantTransmissionColor : TEXCOORD9; // Gaussian-native thin-leaf transmission, scene-linear
+	uint DebugFlag : TEXCOORD2;  // 0=normal, 1=debug mode (skip Gaussian)
+	float4 TranslatedWorldPos : TEXCOORD3;  // xyz=original translated centre, w=optional VS-calculated radial depth
+	float4 CenterClipPos : TEXCOORD4;       // Splat center clip position for velocity (Nanite-style)
+	float PostLightMask : TEXCOORD5;        // 0=shadow grade, 1=lit grade
+	float ProxyShadowMask : TEXCOORD6;      // 0=no proxy occlusion, 1=proxy occluded
+	float SplatRadiusNDC : TEXCOORD7;       // Approximate projected radius for depth matching
+	float StableBindingDebug : TEXCOORD10;  // legacy scalar diagnostic transport
+	nointerpolation uint StableTriangleID : TEXCOORD11; // exact 32-bit TriangleID or sentinel
+	nointerpolation float3 SurfaceNormal : TEXCOORD12;
+	nointerpolation float SurfaceMembership : TEXCOORD13; // Wet Weather Surface membership
+	nointerpolation float SurfacePuddleMembership : TEXCOORD14; // legacy/debug transport; not used by v29 Rain Wet
+	nointerpolation float SurfaceWorldSizeCm : TEXCOORD15; // v29 intrinsic camera-independent splat size
+#if GS_VR_RASTER_CLIP && VERTEXSHADER
+    float4 CornerClipDistance : SV_ClipDistance0;
+#endif
+
+};
+
+// GS is accumulated into a scene-linear HDR intermediate and composited before
+// Unreal tonemapping. It must not write shared scene depth/stencil.
+struct FPixelOutput
+{
+	float4 Color : SV_Target0;
+	float Depth : SV_Target1;
+};
+
+#if GS_PCVR_LEAN_OUTPUTS
+struct FMainPixelOutput
+{
+    float4 Color : SV_Target0;
+    float Depth : SV_Target1;
+#if !GS_PCVR_NO_FOG_OUTPUT
+    float4 FogDepthAccum : SV_Target2;
+#endif
+};
+struct FPCVRPixelPayload
+{
+    float4 Color;
+    float Depth;
+    float4 Normal;
+    float SnowOcclusionDepth;
+    float4 FogDepthAccum;
+};
+// Compile the identical production equations into an internal payload. Only
+// unconsumed outputs disappear through normal shader dead-code elimination.
+#define FMainPixelOutput FPCVRPixelPayload
+#define MainPS MainPSPayload
+#else
+struct FMainPixelOutput
+{
+	float4 Color : SV_Target0;
+	#if GS_VR_DIAGNOSTIC_MODE != 3
+	float Depth : SV_Target1;
+	#endif
+	#if GS_VR_DIAGNOSTIC_MODE < 2
+	float4 Normal : SV_Target2;
+	// Snow-only coverage-aware occlusion depth. This does NOT replace the base
+	// GS depth target; it is consumed only by the snow continuity resolve.
+	float SnowOcclusionDepth : SV_Target3;
+	// Fog-only visibility-weighted radial depth. RT4 uses the same premultiplied
+	// over blend as GS colour: R accumulates depth(m)*alpha and A accumulates coverage.
+	// This removes MIN-depth Gaussian-disc silhouettes without any helper camera.
+	float4 FogDepthAccum : SV_Target4;
+	#endif
+};
+
+#endif // GS_PCVR_LEAN_OUTPUTS output layout
+
+float3 DecodeWeatherOctNormal10(uint packedNormal)
+{
+	float2 f = float2(
+		float(packedNormal & 0x3FFu) / 1023.0,
+		float((packedNormal >> 10) & 0x3FFu) / 1023.0);
+	f = f * 2.0 - 1.0;
+	float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+	if (n.z < 0.0)
+	{
+		float2 oldXY = n.xy;
+		n.x = (1.0 - abs(oldXY.y)) * (oldXY.x >= 0.0 ? 1.0 : -1.0);
+		n.y = (1.0 - abs(oldXY.x)) * (oldXY.y >= 0.0 ? 1.0 : -1.0);
+	}
+	return normalize(n);
+}
+
+struct FSnowVertexOutput
+{
+	float4 Position : SV_POSITION;
+	float2 LocalPos : TEXCOORD0;
+	float4 Color : TEXCOORD1;
+	float3 TranslatedWorldPos : TEXCOORD2;
+	// Radius of the visible fixed snow core divided by the soft bridge radius.
+	float CoreToBridgeRatio : TEXCOORD3;
+};
+
+// SnowContinuousSurface v5 ----------------------------------------------------
+// The snow draw is now a COVERAGE SEED pass, not the final visible snow shell.
+// Each admitted source splat writes a snow mask/color sample on the ORIGINAL GS
+// surface.  GaussianSplatComposite.usf then performs the snow-only continuity
+// resolve and attaches the final snow layer to the base GS depth.  This removes
+// the visible 1:1 cloned-splat / pancake / cauliflower geometry while leaving
+// the base GS, Rain/Wet, Niagara and Stable Self-Cast paths untouched.
+FSnowVertexOutput SnowOverlayVS(
+	uint VertexId : SV_VertexID,
+	uint InstanceId : SV_InstanceID)
+{
+	FSnowVertexOutput Output;
+	float2 corner;
+	corner.x = (VertexId & 1) ? 1.0 : -1.0;
+	corner.y = (VertexId & 2) ? 1.0 : -1.0;
+
+	uint splatIndex = SortKeysBuffer[InstanceId];
+	FGaussianSplatViewData viewData = ViewDataBuffer[splatIndex];
+
+	uint packedWeather = asuint(viewData.TranslatedWorldPosPad);
+	// v2791H payload: bits 20..25 accumulation, bits 26..31 pure live NdotL.
+	float snowWeight = float((packedWeather >> 20) & 0x3Fu) / 63.0;
+	float snowLightFacing = float((packedWeather >> 26) & 0x3Fu) / 63.0;
+	float cutoff = max(SnowOverlayParams.z, 0.0);
+	if (viewData.ClipPosition.w <= 0.0 || snowWeight <= cutoff)
+	{
+		Output.Position = float4(0, 0, 0, 1);
+		Output.LocalPos = float2(2, 2);
+		Output.Color = 0.0.xxxx;
+		Output.TranslatedWorldPos = 0.0.xxx;
+		Output.CoreToBridgeRatio = 1.0;
+		return Output;
+	}
+
+	// V5 IMPORTANT: do NOT physically offset the snow seed.  The old shell moved
+	// one copied Gaussian per source splat and therefore exposed every source
+	// covariance as a separate white blob.  The final visual thickness is handled
+	// by the continuous snow coverage resolve instead of cloned geometry.
+	float4 seedCenterClip = mul(
+		float4(viewData.TranslatedWorldPos, 1.0),
+		SnowTranslatedWorldToClip);
+	if (seedCenterClip.w <= 0.0)
+	{
+		Output.Position = float4(0, 0, 0, 1);
+		Output.LocalPos = float2(2, 2);
+		Output.Color = 0.0.xxxx;
+		Output.TranslatedWorldPos = 0.0.xxx;
+		Output.CoreToBridgeRatio = 1.0;
+		return Output;
+	}
+
+	float2 ndc = seedCenterClip.xy / seedCenterClip.w;
+
+	// SnowUniformAxis v17 -------------------------------------------------------
+	// Preserve the V5 snow admission, light/cast authority and GS depth, but STOP
+	// inheriting source-Gaussian axis lengths/aspect ratio.  Axis1/Axis2 are used
+	// only for a stable screen orientation.  The actual footprint is a fixed
+	// world-space radius projected at this seed's depth, so large/elongated source
+	// Gaussians can no longer turn into large/elongated snow blobs.
+	float2 axisDir1 = viewData.Axis1;
+	float axisLen1 = length(axisDir1);
+	if (axisLen1 > 1.0e-6)
+	{
+		axisDir1 /= axisLen1;
+	}
+	else
+	{
+		axisDir1 = float2(1.0, 0.0);
+	}
+	float2 axisDir2 = float2(-axisDir1.y, axisDir1.x);
+	if (dot(axisDir2, viewData.Axis2) < 0.0)
+	{
+		axisDir2 = -axisDir2;
+	}
+
+	// Exact first-order world->NDC Jacobian at the seed center.  Using all three
+	// translated-world basis directions makes the apparent radius follow camera
+	// depth/FOV while remaining independent of source splat covariance.
+	float4 dClipX = mul(float4(1.0, 0.0, 0.0, 0.0), SnowTranslatedWorldToClip);
+	float4 dClipY = mul(float4(0.0, 1.0, 0.0, 0.0), SnowTranslatedWorldToClip);
+	float4 dClipZ = mul(float4(0.0, 0.0, 1.0, 0.0), SnowTranslatedWorldToClip);
+	float invW2 = rcp(max(seedCenterClip.w * seedCenterClip.w, 1.0e-8));
+	float2 dNdcX = (dClipX.xy * seedCenterClip.w - seedCenterClip.xy * dClipX.w) * invW2;
+	float2 dNdcY = (dClipY.xy * seedCenterClip.w - seedCenterClip.xy * dClipY.w) * invW2;
+	float2 dNdcZ = (dClipZ.xy * seedCenterClip.w - seedCenterClip.xy * dClipZ.w) * invW2;
+	float ndcPerWorldUnit = sqrt(max(
+		(dot(dNdcX, dNdcX) + dot(dNdcY, dNdcY) + dot(dNdcZ, dNdcZ)) * 0.5,
+		1.0e-12));
+
+	// SnowCoreBridge v2803 --------------------------------------------------------
+	// Keep the visible snow basis small and uniform, but give it a separate, low-
+	// opacity bridge support that can span sparse source-GS coverage.  The bridge
+	// is NOT the visible snow particle: it only lets neighboring snow seeds meet.
+	// This prevents source splat size from cutting holes in the final snow sheet.
+	float sourceNdcRadius = max(length(viewData.Axis1), length(viewData.Axis2));
+	float sourceWorldRadiusCm = sourceNdcRadius / max(ndcPerWorldUnit, 1.0e-6);
+	const float CoreSnowRadiusCm = 5.5;
+	const float MaxSnowBridgeRadiusCm = 13.5;
+	float adaptiveBridgeRadiusCm = clamp(
+		sourceWorldRadiusCm, CoreSnowRadiusCm, MaxSnowBridgeRadiusCm);
+
+	// SnowStructureCap v2803: only broad upward-facing surfaces are allowed to
+	// use the wide gap-closing bridge. Structure slopes keep the small fixed core
+	// so their snow remains a cap on top-facing patches instead of whitening sides.
+	float3 snowSurfaceNormal = DecodeWeatherOctNormal10(packedWeather & 0xFFFFFu);
+	float snowSurfaceUp = saturate(snowSurfaceNormal.z);
+	float groundFillStrength = saturate(SnowTuningParams.x);
+	float structureRemoval = saturate(SnowTuningParams.y);
+	float structureSlopeThreshold = saturate(SnowTuningParams.z);
+	float slopeStart = lerp(0.48, 0.90, structureSlopeThreshold);
+	float slopeEnd = min(slopeStart + lerp(0.30, 0.075, structureSlopeThreshold), 0.999);
+	float structureBridgeCap = smoothstep(slopeStart, slopeEnd, snowSurfaceUp);
+	structureBridgeCap *= structureBridgeCap;
+	float structureBridgeGate = lerp(1.0, structureBridgeCap, structureRemoval);
+	float bridgeSurfaceSupport = saturate(groundFillStrength * structureBridgeGate);
+	float bridgeSnowRadiusCm = lerp(
+		CoreSnowRadiusCm, adaptiveBridgeRadiusCm, bridgeSurfaceSupport);
+
+	// Preserve the existing authored accumulation controls.  The core remains
+	// tightly bounded; only the weak bridge receives the wider coverage growth.
+	float userExpansion = lerp(1.0, clamp(SnowOverlayParams.y, 1.0, 1.20), snowWeight);
+	float thicknessCoverage = saturate(max(SnowOverlayParams.x, 0.0) / 20.0);
+	float coreExpansion = min(userExpansion * lerp(1.0, 1.035, thicknessCoverage * snowWeight), 1.14);
+	float bridgeGrowth = lerp(1.0, 1.045, thicknessCoverage * snowWeight);
+	float bridgeExpansion = min(userExpansion * bridgeGrowth * 1.01, 1.12);
+
+	float coreNdcRadius = CoreSnowRadiusCm * ndcPerWorldUnit * coreExpansion;
+	float bridgeNdcRadius = max(
+		coreNdcRadius,
+		bridgeSnowRadiusCm * ndcPerWorldUnit * bridgeExpansion);
+	float2 offset = (corner.x * axisDir1 + corner.y * axisDir2) * bridgeNdcRadius;
+	Output.Position = float4(
+		(ndc + offset) * seedCenterClip.w,
+		seedCenterClip.z,
+		seedCenterClip.w);
+
+	// Keep the existing snow-only lighting authority exactly as before.
+	float2 packedDirectBA = UnpackHalf2x16(viewData.PackedDirectBA);
+	float stableCastRaw = packedDirectBA.y;
+	float castVisibility = stableCastRaw >= 0.0 ? saturate(stableCastRaw) : 1.0;
+	float lightSignal = saturate(snowLightFacing * castVisibility);
+
+	float3 baseSnow = max(SnowOverlayColor.rgb, float3(0.01, 0.01, 0.01));
+	float3 shadowSnow = baseSnow * float3(0.34, 0.40, 0.50);
+	float3 litSnow = baseSnow * 1.10;
+	float3 snowColor = lerp(
+		shadowSnow,
+		litSnow,
+		smoothstep(0.02, 0.92, lightSignal));
+
+	float sparkleStrength = max(SnowOverlayColor.w, 0.0);
+	float litSquared = lightSignal * lightSignal;
+	snowColor += baseSnow * (sparkleStrength * litSquared * 0.34);
+
+	// Seed opacity carries accumulation only.  It is intentionally not multiplied
+	// by source GS alpha/color; final attachment to actual GS coverage happens in
+	// the composite resolve.
+	float alpha = saturate(snowWeight * max(SnowOverlayParams.w, 0.0));
+
+	Output.LocalPos = corner;
+	Output.Color = float4(snowColor, alpha);
+	Output.TranslatedWorldPos = viewData.TranslatedWorldPos;
+	Output.CoreToBridgeRatio = saturate(coreNdcRadius / max(bridgeNdcRadius, 1.0e-6));
+	return Output;
+}
+
+#if PIXELSHADER
+// Clip at the projected splat plane, not at its center. Camera orientation is
+// used only for reconstruction; the removal volume stays fixed in world space.
+bool IsInsideAnyGSRemovalBox(float4 ScreenPos, float3 TranslatedCenter)
+{
+    if (GSRemovalBoxCount == 0u) return false;
+    const float3 Center = TranslatedCenter - PreViewTranslation;
+    float2 ndc = float2(
+        (ScreenPos.x - PuddleViewport.x) / max(PuddleViewport.z, 1.0) * 2.0 - 1.0,
+        1.0 - (ScreenPos.y - PuddleViewport.y) / max(PuddleViewport.w, 1.0) * 2.0);
+    float4 NearH = mul(float4(ndc, 1.0, 1.0), PuddleClipToWorld);
+    float4 FarH = mul(float4(ndc, 0.5, 1.0), PuddleClipToWorld);
+    if (abs(NearH.w) < 1.0e-7 || abs(FarH.w) < 1.0e-7) return false;
+    float3 NearPos = NearH.xyz / NearH.w;
+    float3 RayDir = normalize(FarH.xyz / FarH.w - NearPos);
+    float3 PlaneNormal = normalize(Center + PreViewTranslation); // camera-to-splat
+    float Div = dot(RayDir, PlaneNormal);
+    if (Div <= 1.0e-5) return false;
+    float T = dot(Center - NearPos, PlaneNormal) / Div;
+    if (T < 0.0) return false;
+    const float3 WorldSample = NearPos + T * RayDir;
+    [loop] for (uint i = 0u; i < min(GSRemovalBoxCount, 8u); ++i)
+    {
+        const float3 Delta = WorldSample - GSRemovalBoxCenters[i].xyz;
+        if (abs(dot(Delta, GSRemovalBoxAxisX[i].xyz)) <= GSRemovalBoxAxisX[i].w &&
+            abs(dot(Delta, GSRemovalBoxAxisY[i].xyz)) <= GSRemovalBoxAxisY[i].w &&
+            abs(dot(Delta, GSRemovalBoxAxisZ[i].xyz)) <= GSRemovalBoxAxisZ[i].w)
+            return true;
+    }
+    return false;
+}
+#endif
+
+FPixelOutput SnowOverlayPS(FSnowVertexOutput Input)
+{
+    if (IsInsideAnyGSRemovalBox(Input.Position, Input.TranslatedWorldPos)) discard;
+	FPixelOutput Output;
+	float r2 = dot(Input.LocalPos, Input.LocalPos);
+	if (r2 > 1.0 || Input.Color.a <= (1.0 / 4096.0))
+	{
+		discard;
+	}
+
+	// Fixed visible core + weak adaptive bridge. The core is the actual snow basis.
+	// The bridge is deliberately low energy and exists only to close sparse source-
+	// GS gaps before the existing depth-aware 3x3 continuity resolve.
+	float coreRatio = clamp(Input.CoreToBridgeRatio, 0.05, 1.0);
+	float coreR2 = r2 / max(coreRatio * coreRatio, 1.0e-5);
+	const float coreK = 4.0;
+	float coreEdge = exp(-coreK);
+	float coreWeight = 0.0;
+	if (coreR2 <= 1.0)
+	{
+		coreWeight =
+			(exp(-coreK * coreR2) - coreEdge) / max(1.0 - coreEdge, 0.0001);
+	}
+
+	const float bridgeK = 2.0;
+	float bridgeEdge = exp(-bridgeK);
+	float bridgeGaussian =
+		(exp(-bridgeK * r2) - bridgeEdge) / max(1.0 - bridgeEdge, 0.0001);
+	float radial = sqrt(max(r2, 0.0));
+	float bridgeOutsideCore = smoothstep(coreRatio * 0.90, max(coreRatio, 0.001), radial);
+	float bridgeWeight = saturate(bridgeGaussian) * bridgeOutsideCore;
+
+	const float BridgeAlphaScale = 0.10;
+	float combinedWeight = saturate(coreWeight + bridgeWeight * BridgeAlphaScale);
+	float alpha = saturate(Input.Color.a * combinedWeight);
+	if (alpha <= (1.0 / 255.0))
+	{
+		discard;
+	}
+
+	Output.Color = float4(max(Input.Color.rgb, 0.0) * alpha, alpha);
+	// Seed depth is the ORIGINAL GS surface depth.  It is used only to prevent the
+	// screen-space continuity filter from crossing unrelated foreground/background
+	// surfaces; final weather depth remains the base GS depth.
+	Output.Depth = length(Input.TranslatedWorldPos);
+	return Output;
+}
+
+// Vertex shader: generate quad from instance data
+
+// Shared exact Final math; no additional half packing or buffer writes.
+float GetProxySunHorizonGate()
+{
+	if (ProxyLightDepthForwardEnabled.w < 0.0)
+	{
+		return 0.0;
+	}
+	// v2797: shadow ANGLE still follows the active Sun/Moon LightDepth direction, but
+	// carrier ENERGY must never use that mirrored direction as an elevation gate. The old
+	// angleGate produced a V-shaped dip: it fell as the sun approached the horizon then rose
+	// again as the mirrored moon climbed. Drive only the carrier energy from the broad, smooth
+	// day/night phase so sunset/sunrise brightness is continuous through Z=0.
+	float nightPhase = saturate(DayNightBlend);
+	float smoothNight = nightPhase * nightPhase * (3.0 - 2.0 * nightPhase);
+	return lerp(1.0, 0.55, smoothNight);
+}
+
+float3 ApplyDetailPreservingShadow(float3 sourceColor, float visibility)
+{
+	float3 source = max(sourceColor, 0.0);
+	float sourceLuma = dot(source, float3(0.2126, 0.7152, 0.0722));
+	if (sourceLuma <= 1.0e-5 || visibility <= 0.0)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+
+	float detailPreservation = saturate(ProxyShadowDetailSettings.z);
+	// Split only the luminance response: the compressed carrier receives the full
+	// shadow, while highlight/micro-contrast is allowed to fade more slowly through
+	// partial shade. Both terms still become exactly zero in a fully closed core.
+	float lowLuma = sourceLuma / (1.0 + sourceLuma * 0.65);
+	float detailLuma = max(sourceLuma - lowLuma, 0.0);
+	float detailVisibility = lerp(
+		saturate(visibility),
+		pow(saturate(visibility), 0.62),
+		detailPreservation);
+	float shadedLuma = lowLuma * saturate(visibility) + detailLuma * detailVisibility;
+	return source * (shadedLuma / sourceLuma);
+}
+
+float3 ApplyRegionalColorGrade(float3 sourceColor, float regionMask, float4 gradeParams)
+{
+	float blendWeight = saturate(regionMask) * saturate(gradeParams.w);
+	if (blendWeight <= 0.0001)
+	{
+		return max(sourceColor, 0.0);
+	}
+
+	float3 source = max(sourceColor, 0.0);
+	float sourceLuma = max(dot(source, float3(0.2126, 0.7152, 0.0722)), 1.0e-5);
+	float gammaValue = clamp(gradeParams.x, 0.25, 4.0);
+	// Apply gamma in a bounded Reinhard domain so values above 1 darken both
+	// LDR midtones and HDR highlights without causing high-energy expansion.
+	float unitLuma = sourceLuma / (1.0 + sourceLuma);
+	float gammaUnit = pow(saturate(unitLuma), gammaValue);
+	float targetLuma = gammaUnit / max(1.0 - gammaUnit, 1.0e-4);
+	float3 luminanceAdjusted = source * (targetLuma / sourceLuma);
+	float adjustedLuma = max(dot(luminanceAdjusted, float3(0.2126, 0.7152, 0.0722)), 1.0e-5);
+	float saturationValue = clamp(gradeParams.y, 0.0, 3.0);
+	float3 graded = adjustedLuma.xxx + (luminanceAdjusted - adjustedLuma.xxx) * saturationValue;
+	graded = max(graded, 0.0) * clamp(gradeParams.z, 0.0, 3.0);
+	return max(lerp(source, graded, blendWeight), 0.0);
+}
+
+float3 ApplyAuthoredShadowTintLift(float3 sourceColor, float shadowMask)
+{
+	float weight = saturate(shadowMask);
+	if (weight <= 0.0001)
+	{
+		return max(sourceColor, 0.0);
+	}
+
+	const float3 lumaWeights = float3(0.2126, 0.7152, 0.0722);
+	float3 source = max(sourceColor, 0.0);
+	float sourceLuma = max(dot(source, lumaWeights), 1.0e-5);
+
+	// ProxyShadowBaseTint combines the original reflected-shadow tint with the
+	// visible "Indirect Light Tint" control. Normalize it so changing hue does
+	// not silently change the authored shadow exposure.
+	float3 requestedTint = max(ProxyShadowBaseTint, 0.001);
+	float tintLuma = max(dot(requestedTint, lumaWeights), 0.001);
+	float3 chromaOnlyTint = requestedTint / tintLuma;
+	float3 tinted = source * lerp(float3(1.0, 1.0, 1.0), chromaOnlyTint, weight);
+	float tintedLuma = max(dot(tinted, lumaWeights), 1.0e-5);
+	tinted *= sourceLuma / tintedLuma;
+
+	// Older actors supplied exactly 1.0 in W. Encoding lift as 1+value makes the
+	// shader hot-reload safe and keeps old assets neutral until the C++ module is
+	// rebuilt. Lift remains shadow-mask gated and fades on already bright pixels.
+	float authoredLift = max(ProxyShadowBaseSettings.w - 1.0, 0.0);
+	float liftEnergy = authoredLift * weight * (1.0 - saturate(sourceLuma));
+	return max(tinted + chromaOnlyTint * liftEnergy, 0.0);
+}
+
+float3 ComputeProxyReflectedFill(
+	float3 sourceColor,
+	float directVisibility,
+	float receiverVisibility)
+{
+	float strength = saturate(ProxyReflectedLightSettings.x);
+	if (strength <= 0.0001)
+	{
+		return float3(0.0, 0.0, 0.0);
+	}
+
+	// Reflected light fills energy that the direct term lost. It never changes the
+	// direction of the sun and therefore cannot recreate the former false N.L lobe.
+	float shadowAmount = saturate(1.0 - directVisibility);
+	float responseGamma = clamp(ProxyReflectedLightSettings.z, 0.25, 4.0);
+	float shadowFillMask = pow(shadowAmount, responseGamma);
+
+	// Receiver closure may attenuate bounce, but it no longer multiplies the whole
+	// final image. With the default 0.35 occlusion, a sealed receiver retains 65%
+	// of the authored reflected fill, preserving form in deep architectural shade.
+	float closureOcclusion = saturate(ProxyReflectedLightSettings.y);
+	float closureTransmission = lerp(1.0, saturate(receiverVisibility), closureOcclusion);
+	// The authored full-closure core must be able to reach true black. Reflected
+	// fill remains available through the gradient, but fades to zero only as the
+	// receiver visibility itself reaches zero. This preserves bounce in ordinary
+	// shade without washing out the deepest sealed region.
+	float fullClosureCore = 1.0 - smoothstep(0.0, 0.055, saturate(receiverVisibility));
+	closureTransmission *= (1.0 - fullClosureCore);
+
+	// v2818 environment fill is not allowed to collapse with the solar horizon.
+	// The source scan already contains skylight / broad bounce, so removing all fill
+	// at low sun angles makes cast regions unnaturally black against the background.
+	// Keep a conservative ambient floor and let the true direct layer own day/night.
+	float solarEnvironmentGate = GetProxySunHorizonGate();
+	float environmentGate = lerp(0.42, 1.0, solarEnvironmentGate);
+
+	const float3 lumaWeights = float3(0.2126, 0.7152, 0.0722);
+	float3 source = max(sourceColor, 0.0);
+	float sourceLuma = max(dot(source, lumaWeights), 1.0e-5);
+
+	// Compress only the reflected carrier's HDR luminance. This prevents bright stone,
+	// pale foliage, and railings from turning milky when bounce is added, while the
+	// original direct carrier remains untouched.
+	float highlightCompression = clamp(ProxyReflectedColorSettings.z, 0.0, 2.0);
+	float compressedLuma = sourceLuma / (1.0 + sourceLuma * highlightCompression);
+	float3 sourceHueAtCompressedLuma = source * (compressedLuma / sourceLuma);
+
+	// Preserve material color rather than replacing it with a fixed shadow color.
+	// Deep shade can use a separate retention value so warm wood and foliage remain
+	// readable without forcing the same saturation behavior onto penumbrae.
+	float deepShadowMask = smoothstep(0.58, 0.98, shadowAmount);
+	float baseColorRetention = saturate(ProxyShadowBaseSettings.z);
+	float deepColorRetention = saturate(ProxyReflectedColorSettings.y);
+	float effectiveColorRetention = lerp(baseColorRetention, deepColorRetention, deepShadowMask);
+	float3 reflectedCarrier = lerp(compressedLuma.xxx, sourceHueAtCompressedLuma, effectiveColorRetention);
+
+	// Apply the authored reflected-light tint as a luminance-neutral chroma shift.
+	// Tint is strongest through the penumbra, then fades toward neutral in the deepest
+	// shadow so blue or colored blacks do not accumulate.
+	float3 requestedTint = max(ProxyShadowBaseTint, 0.001);
+	float tintLuma = max(dot(requestedTint, lumaWeights), 0.001);
+	float3 chromaOnlyTint = requestedTint / tintLuma;
+	float tintStrength = saturate(ProxyReflectedLightSettings.w);
+	float tintSoftness = clamp(ProxyReflectedColorSettings.w, 0.05, 1.0);
+	float tintOnset = smoothstep(0.0, tintSoftness, shadowAmount);
+	float deepTintNeutralization = saturate(ProxyReflectedColorSettings.x);
+	float effectiveTintStrength = tintStrength * tintOnset * (1.0 - deepTintNeutralization * deepShadowMask);
+	float3 softenedTint = lerp(float3(1.0, 1.0, 1.0), chromaOnlyTint, effectiveTintStrength);
+	float3 tintedCarrier = reflectedCarrier * softenedTint;
+
+	// Re-normalize luminance after tinting. The color control changes temperature/hue,
+	// not reflected-light energy, avoiding the former blue-black crush or white lift.
+	float tintedLuma = max(dot(tintedCarrier, lumaWeights), 1.0e-5);
+	tintedCarrier *= compressedLuma / tintedLuma;
+
+	// v2826 unified reflected fill. Time-of-day energy is already represented by the
+	// unified environment gate. Do not apply a second twilight bell curve here; doing so
+	// created a narrow interval where indirect fill disappeared while cast/closure were
+	// still active, visually resembling a doubled shadow.
+	float reflectedEnergy = strength * shadowFillMask * closureTransmission * environmentGate;
+	return max(tintedCarrier * reflectedEnergy, 0.0);
+}
+
+float3 ApplyStableShadowSourceColorRetention(
+	float3 GradedColor, float3 SourceColor, float StableShadowMask, float Retention)
+{
+	float Weight = saturate(StableShadowMask) * saturate(Retention);
+	if (Weight <= 0.0001)
+	{
+		return GradedColor;
+	}
+	const float3 LumaWeights = float3(0.2126, 0.7152, 0.0722);
+	float GradedLuma = max(dot(max(GradedColor, 0.0), LumaWeights), 0.0);
+	float SourceLuma = max(dot(max(SourceColor, 0.0), LumaWeights), 1.0e-5);
+	float3 SourceAtGradedLuma = max(SourceColor, 0.0) * (GradedLuma / SourceLuma);
+	return max(lerp(GradedColor, SourceAtGradedLuma, Weight), 0.0);
+}
+float3 EvaluateFinalSplatLighting(FVertexOutput Input)
+{
+	float4 color=Input.Color;
+		// v2778 FINAL STABLE SHADOW AUTHORITY. The former Final path sampled the
+		// camera-aligned Shadowed/Unshadowed capture pair (or its LightDepth fallback)
+		// here. That production branch is removed. Final now consumes exactly the same
+		// camera-independent Stable Field + continuous cast shaping + light-responsive
+		// closure that mode 02 validates in CalcViewData.
+		float stableCastVisibility = Input.StableBindingDebug;
+		float stableClosureVisibility = saturate(Input.ProxyShadowMask);
+		bool stableShadowReady = stableCastVisibility >= 0.0;
+		float castVisibility = stableShadowReady ? saturate(stableCastVisibility) : 1.0;
+		float closureVisibility = stableShadowReady ? stableClosureVisibility : 1.0;
+		float authoredVisibility = saturate(castVisibility * closureVisibility);
+		// The photographed carrier and indirect layers must follow only the uniform
+		// sun/horizon state. Input.PostLightMask also contains per-splat proxy N.L;
+		// multiplying the complete carrier by it stamps proxy-normal irregularities
+		// into the image as geometry-locked dark blotches. Surface N.L remains owned
+		// by the direct layer generated in CalcViewData.
+		float sunHorizonVisibility = GetProxySunHorizonGate();
+
+		// v2818 FINAL ENERGY SPLIT. The photographed GS carrier is no longer multiplied
+		// directly by cast*closure all the way to black. Cast owns directional darkening,
+		// closure owns only local contact/AO, and the original scan keeps a stable midtone
+		// anchor so rotating the light cannot pump the complete exposure.
+		// Time-flow shadow-depth fix: keep the v2818 energy split, but let fully
+		// occluded regions retain less photographed carrier light. Closure/contact
+		// shaping is intentionally unchanged.
+		float carrierCastVisibility = lerp(0.50, 1.0, saturate(castVisibility));
+		float carrierClosureVisibility = lerp(0.58, 1.0, saturate(closureVisibility));
+
+		// v2826 bounded Cast + Closure composition. Cast owns the main directional shadow.
+		// Closure may add local depth, but it must not multiply the complete cast carrier
+		// again. Blend the dominant darkness plus only 25% of their overlap. This preserves
+		// a visible closure distinction without producing a narrow double-shadow dip.
+		float castDarkening = 1.0 - carrierCastVisibility;
+		float closureDarkening = (1.0 - carrierClosureVisibility) * 0.70;
+		float dominantDarkening = max(castDarkening, closureDarkening);
+		float overlapDarkening = min(castDarkening, closureDarkening) * 0.25;
+		float carrierVisibility = max(1.0 - saturate(dominantDarkening + overlapDarkening), 0.44);
+
+		// Regional grading follows the bounded carrier visibility rather than the raw
+		// cast*closure product. This prevents the shadow grade from becoming a second
+		// full-strength exposure multiplier in deep shade.
+		float sunlitGradeMask = smoothstep(0.46, 0.94, carrierVisibility);
+		float shadowGradeMask = 1.0 - sunlitGradeMask;
+		float3 regionGradedColor = ApplyRegionalColorGrade(
+			max(color.rgb, 0.0), sunlitGradeMask, RegionalColorGradeParams0);
+		regionGradedColor = ApplyRegionalColorGrade(
+			regionGradedColor, shadowGradeMask, RegionalColorGradeParams1);
+		regionGradedColor = ApplyAuthoredShadowTintLift(
+			regionGradedColor, shadowGradeMask);
+		regionGradedColor = ApplyStableShadowSourceColorRetention(
+			regionGradedColor, max(color.rgb, 0.0), shadowGradeMask, StableShadowColorRetention);
+
+		float3 reflectedFill = ComputeProxyReflectedFill(
+			regionGradedColor, castVisibility, closureVisibility);
+		float3 directCarrier = ApplyDetailPreservingShadow(
+			regionGradedColor, carrierVisibility);
+
+		// Stable direct is an additive illumination layer, not an exposure control.
+		// Compress only its HDR core with a soft shoulder. The remaining bright local
+		// pixels still cross the post-grade bloom threshold, but broad surfaces cannot
+		// drive the complete GS image toward white at a specific light angle.
+		float3 stableDirectSunRaw = max(Input.DirectColor, 0.0);
+		float stableDirectLuma = dot(stableDirectSunRaw, float3(0.2126, 0.7152, 0.0722));
+		float carrierLuma = dot(max(directCarrier + reflectedFill, 0.0), float3(0.2126, 0.7152, 0.0722));
+
+		// v2819 BASE-LUMINANCE HEADROOM. A scan that is already bright contains the
+		// photographed sunlight in its carrier, so broad Stable direct must shrink as
+		// carrier luminance rises instead of acting as a second exposure control.
+		float directHeadroom = 1.0 / (1.0 + carrierLuma * 2.35);
+		float stableDirectShoulderLuma = stableDirectLuma / (1.0 + stableDirectLuma * 0.95);
+		float broadScale = stableDirectLuma > 1.0e-5
+			? stableDirectShoulderLuma / stableDirectLuma
+			: 1.0;
+		float3 broadDirect = stableDirectSunRaw * broadScale * directHeadroom * 0.48;
+
+		// Preserve only a compact HDR highlight core. This is intentionally small in
+		// the base image, but remains above the post-grade bloom threshold so perceived
+		// brightness expands spatially as bloom rather than whitening an entire wall.
+		float highlightGate = smoothstep(0.52, 1.28, stableDirectLuma);
+		float highlightExcess = max(stableDirectLuma - 0.48, 0.0);
+		float3 directHue = stableDirectLuma > 1.0e-5 ? stableDirectSunRaw / stableDirectLuma : 0.0.xxx;
+		float3 highlightCore = directHue * highlightExcess * highlightGate * (0.12 + 0.16 * directHeadroom);
+		float3 stableDirectSun = broadDirect + highlightCore;
+
+		// Thin-leaf transmission is a separate physical layer: projected blockers should
+		// attenuate it, but an opaque-surface closure rule must not kill the very backlit
+		// leaf response the effect is designed to show. Retain a small blocked component
+		// and let geometry closure attenuate rather than hard-zero it.
+		float transmissionCastGate = lerp(0.18, 1.0, castVisibility);
+		float transmissionClosureGate = lerp(0.25, 1.0, closureVisibility);
+		float3 gaussianPlantTransmission = max(Input.PlantTransmissionColor, 0.0)
+			* transmissionCastGate * transmissionClosureGate
+			* sunHorizonVisibility;
+
+		color.rgb = directCarrier + reflectedFill + stableDirectSun + gaussianPlantTransmission;
+	return color.rgb;
+}
+
