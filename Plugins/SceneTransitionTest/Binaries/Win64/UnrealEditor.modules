@@ -1,0 +1,8 @@
+{
+	"BuildId": "55116800",
+	"Modules": 
+	{
+		"SceneTransitionTest": "UnrealEditor-SceneTransitionTest.dll",
+		"SceneTransitionTestEditor": "UnrealEditor-SceneTransitionTestEditor.dll"
+	}
+}

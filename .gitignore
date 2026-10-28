@@ -1,5 +1,6 @@
 # Unreal generated data and build output
-Binaries/
+# Share compiled binaries; exclude debugging symbols.
+*.pdb
 Intermediate/
 Saved/
 DerivedDataCache/

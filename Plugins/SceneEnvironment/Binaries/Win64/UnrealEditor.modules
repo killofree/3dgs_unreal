@@ -1,0 +1,8 @@
+{
+	"BuildId": "55116800",
+	"Modules": 
+	{
+		"SceneEnvironment": "UnrealEditor-SceneEnvironment.dll",
+		"SceneEnvironmentEditor": "UnrealEditor-SceneEnvironmentEditor.dll"
+	}
+}
