@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/PrimitiveComponent.h"
+#include "Engine/Scene.h"
 #include "GaussianDataTypes.h"
 #include "GaussianSplatComponent.generated.h"
 
@@ -2615,6 +2616,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "03 색상 및 후처리",
 		meta = (GSGroup = "02 전체 색감", DisplayName = "전체 감마", ClampMin = "0.25", ClampMax = "4.0", UIMin = "0.5", UIMax = "3.0", ToolTip = "1보다 크면 중간톤이 어두워지고, 1보다 작으면 중간톤이 밝아집니다."))
 	float TargetMidtoneContrast = 1.35f;
+
+	/** One UE post-process grade after GS/mesh composition; only the primary scene owner publishes it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "03 색상 및 후처리", meta = (GSGroup = "00 전체 씬 공통", DisplayName = "3DGS + 일반 에셋 공통 후처리", ToolTip = "전체 씬에 UE 후처리를 적용합니다. 기존 GS 전용 보정은 유지됩니다. 공통 후처리는 톤매핑 이전 GS 합성 모드 0을 사용합니다."))
+	bool bEnableWholeScenePostProcess = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "03 색상 및 후처리", meta = (GSGroup = "00 전체 씬 공통", DisplayName = "전체 씬 후처리 설정", EditCondition = "bEnableWholeScenePostProcess"))
+	FPostProcessSettings WholeScenePostProcessSettings;
 
 	/** Color grade applied only where the authoritative proxy direct-light capture is bright. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "03 색상 및 후처리",

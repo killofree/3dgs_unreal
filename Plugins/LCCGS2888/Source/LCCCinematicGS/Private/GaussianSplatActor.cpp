@@ -2939,21 +2939,37 @@ void AGaussianSplatActor::SyncCinematicPostProcess()
 	}
 
 	const bool bOwnsWorldDayNight = FindPrimaryDayNightOwner(GetWorld(), this) == this;
+	const bool bWholeScene = bOwnsWorldDayNight && GaussianSplatComponent->bEnableWholeScenePostProcess;
 	const bool bEnableFixedExposure = bOwnsWorldDayNight &&
 		GaussianSplatComponent->bEnableAutomaticDayNightCycle &&
-		GaussianSplatComponent->bLockSceneExposureForDayNight;
+		GaussianSplatComponent->bLockSceneExposureForDayNight &&
+		!(bWholeScene && GaussianSplatComponent->WholeScenePostProcessSettings.bOverride_AutoExposureMethod);
 	// P44: the experimental P42 DOF path is retired. Keep the original
 	// day/night fixed-exposure post process but never force camera blur.
 	CinematicPostProcessComponent->bUnbound = true;
-	CinematicPostProcessComponent->Priority = 1000.0f;
-	CinematicPostProcessComponent->bEnabled = bEnableFixedExposure;
-	CinematicPostProcessComponent->BlendWeight = bEnableFixedExposure ? 1.0f : 0.0f;
+	CinematicPostProcessComponent->Priority = bWholeScene ? 1200.0f : 1000.0f;
+	CinematicPostProcessComponent->bEnabled = bEnableFixedExposure || bWholeScene;
+	CinematicPostProcessComponent->BlendWeight = (bEnableFixedExposure || bWholeScene) ? 1.0f : 0.0f;
 	FPostProcessSettings& Settings = CinematicPostProcessComponent->Settings;
-	Settings.bOverride_DepthOfFieldFocalDistance = false;
-	Settings.bOverride_DepthOfFieldFstop = false;
-	Settings.bOverride_DepthOfFieldSensorWidth = false;
+	// Rebuild overrides each sync, so disabling the common grade cannot leave stale overrides.
+	Settings = bWholeScene ? GaussianSplatComponent->WholeScenePostProcessSettings : FPostProcessSettings();
+	if (bWholeScene)
+	{
+		// Both mesh SceneColor and GS must enter the same UE exposure/tonemap pass.
+		if (IConsoleVariable* Mode = IConsoleManager::Get().FindConsoleVariable(TEXT("gs.PanoramaGSCompositeMode")))
+		{
+			if (Mode->GetInt() != 0) Mode->Set(0, ECVF_SetByCode);
+		}
+	}
+	if (!bWholeScene)
+	{
+		Settings.bOverride_DepthOfFieldFocalDistance = false;
+		Settings.bOverride_DepthOfFieldFstop = false;
+		Settings.bOverride_DepthOfFieldSensorWidth = false;
+	}
 	if (!bEnableFixedExposure)
 	{
+		if (bWholeScene) return; // Common grade also works with the time-of-day system disabled.
 		// Do not retain overrides after disabling the owning day/night actor.
 		Settings.bOverride_BloomIntensity = false;
 		Settings.bOverride_AutoExposureMethod = false;
@@ -2965,8 +2981,9 @@ void AGaussianSplatActor::SyncCinematicPostProcess()
 	// P23: this is the actor-owned PP only, NOT the project PPVolume. Light shaft
 	// bloom is disabled on each celestial light separately by SyncDayNightCycle.
 	FPostProcessSettings& P23Settings = CinematicPostProcessComponent->Settings;
-	P23Settings.bOverride_BloomIntensity = GaussianSplatComponent->bP23OverridePostProcessBloom;
-	if (GaussianSplatComponent->bP23OverridePostProcessBloom)
+	const bool bCommonBloom = bWholeScene && Settings.bOverride_BloomIntensity;
+	P23Settings.bOverride_BloomIntensity = bCommonBloom || GaussianSplatComponent->bP23OverridePostProcessBloom;
+	if (!bCommonBloom && GaussianSplatComponent->bP23OverridePostProcessBloom)
 	{
 		P23Settings.BloomIntensity = FMath::Clamp(GaussianSplatComponent->P23PostProcessBloomIntensity, 0.0f, 3.0f);
 	}

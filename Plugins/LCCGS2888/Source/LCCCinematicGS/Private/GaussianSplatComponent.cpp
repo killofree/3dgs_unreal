@@ -4481,6 +4481,16 @@ void UGaussianSplatComponent::PostEditChangeProperty(FPropertyChangedEvent& Prop
 	const FProperty* ChangedProperty = PropertyChangedEvent.MemberProperty
 		? PropertyChangedEvent.MemberProperty
 		: PropertyChangedEvent.Property;
+	// Publish nested shared-grade edits immediately even when editor viewport ticking is paused.
+	if (ChangedProperty &&
+		(ChangedProperty->GetFName() == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, WholeScenePostProcessSettings) ||
+		 ChangedProperty->GetFName() == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, bEnableWholeScenePostProcess)))
+	{
+		if (AGaussianSplatActor* Owner = Cast<AGaussianSplatActor>(GetOwner()))
+		{
+			Owner->SyncCinematicPostProcess();
+		}
+	}
 	// Snow Gaussian is a BAKED, camera-independent asset. Parameter edits must
 	// never silently leave an old snow shape looking as if it used the new UI
 	// values. Flag only the snow-specific bake as stale; no other effects change.

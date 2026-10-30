@@ -2640,27 +2640,53 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	float3 viewDirForLighting = normalize(CameraPosition - worldPos.xyz);
 	float proxyNormalConfidence = 0.0;
 	float3 lightingNormal = SelectLightingNormal(rotation, scale, localToWorldRot, viewDirForLighting, localPos, proxyNormalConfidence);
-	// J02 restoration: the surveyed tiled annex of jg_g_021 only. This asset
-	// signature and local-space envelope exclude neighboring thatch and timber.
-	// Keep original covariance/silhouette and source SH data unchanged.
+	// J02 roof restoration, scoped to the surveyed jg_g_021 roof envelopes.
+	// Preserve covariance and SH detail; remove chromatic scan stains only above eaves.
 	float j02RoofMask = 0.0;
-	if (SplatCount == 1653047u && localPos.x > -3050.0 && localPos.x < -1795.0 &&
-		localPos.y > 280.0 && localPos.y < 2250.0)
+	if (SplatCount == 1653047u)
 	{
-		j02RoofMask = smoothstep(265.0, 288.0, localPos.z);
-		float roofLuma = SceneLinearLuminance(baseLinear);
-		float maintainedLuma = 0.018 + 0.64 * roofLuma;
-		float3 maintainedTile = maintainedLuma * float3(0.91, 0.98, 1.06);
-		baseLinear = lerp(baseLinear, maintainedTile, j02RoofMask * 0.96);
-		float roofU = localPos.x * 0.97698 + localPos.y * 0.21335;
-		float roofV = -localPos.x * 0.21335 + localPos.y * 0.97698;
-		float3 roofSlope = localPos.y < 1100.0 ?
-			float3(-0.21335, 0.97698, 0.0) * clamp((roofV - 1240.0) * 0.004, -0.70, 0.70) :
-			float3(0.97698, 0.21335, 0.0) * clamp((roofU + 2300.0) * 0.005, -0.85, 0.85);
-		float3 roofAxis = SelectRawSplatAxisNormal(rotation, scale, localToWorldRot);
-		if (roofAxis.z < 0.0) roofAxis = -roofAxis;
-		float3 roofNormal = normalize(lerp(normalize(roofSlope + float3(0,0,1)), roofAxis, 0.30));
-		lightingNormal = normalize(lerp(lightingNormal, roofNormal, j02RoofMask));
+		bool annexRoof = localPos.x > -3050.0 && localPos.x < -1795.0 && localPos.y > 280.0 && localPos.y < 2250.0;
+		bool longRoof = localPos.x > -820.0 && localPos.x < -360.0 && localPos.y > 150.0 && localPos.y < 3020.0;
+		if (annexRoof || longRoof)
+		{
+			j02RoofMask = smoothstep(260.0, 288.0, localPos.z);
+			float roofLuma = SceneLinearLuminance(baseLinear);
+			float maintainedLuma = 0.026 + 0.70 * roofLuma;
+			float3 maintainedTile = maintainedLuma * float3(0.94, 0.99, 1.055);
+			baseLinear = lerp(baseLinear, maintainedTile, j02RoofMask * 0.98);
+			float roofU = localPos.x * 0.97698 + localPos.y * 0.21335;
+			float roofV = -localPos.x * 0.21335 + localPos.y * 0.97698;
+			float3 roofSlope = localPos.y < 1100.0 ?
+				float3(-0.21335, 0.97698, 0.0) * clamp((roofV - 1240.0) * 0.004, -0.70, 0.70) :
+				float3(0.97698, 0.21335, 0.0) * clamp((roofU + 2300.0) * 0.005, -0.85, 0.85);
+			if (longRoof) roofSlope = float3(clamp((localPos.x + 575.0) * 0.0045, -0.8, 0.8),
+				clamp((localPos.y - 450.0) * 0.004, -0.6, 0.0) + clamp((localPos.y - 2650.0) * 0.004, 0.0, 0.6), 0);
+			float3 roofAxis = SelectRawSplatAxisNormal(rotation, scale, localToWorldRot);
+			if (roofAxis.z < 0.0) roofAxis = -roofAxis;
+			float3 roofNormal = normalize(lerp(normalize(roofSlope + float3(0,0,1)), roofAxis, 0.22));
+			lightingNormal = normalize(lerp(lightingNormal, roofNormal, j02RoofMask));
+		}
+		// Adjacent thatch retains its straw identity and texture, with neutralized scan stains.
+		if (localPos.x > -1850.0 && localPos.x < -1220.0 && localPos.y > 600.0 && localPos.y < 1140.0)
+		{
+			float strawMask = smoothstep(260.0, 290.0, localPos.z);
+			float strawLuma = SceneLinearLuminance(baseLinear);
+			baseLinear = lerp(baseLinear, (0.025 + 0.91 * strawLuma) * float3(1.13, 1.0, 0.77), strawMask * 0.70);
+		}
+	}
+	// J02 masonry/plaster clarity: source-relative tonal separation only.
+	// No synthetic stone pattern, geometry changes, or per-frame noise.
+	if (SplatCount == 1653047u)
+	{
+		float stoneWall = (localPos.x > -760.0 && localPos.x < -350.0 && localPos.y > 160.0 && localPos.y < 2700.0) ?
+			smoothstep(-10.0, 15.0, localPos.z) * (1.0 - smoothstep(130.0, 155.0, localPos.z)) : 0.0;
+		float cottageWall = (localPos.x > -1860.0 && localPos.x < -1200.0 && localPos.y > 550.0 && localPos.y < 1140.0) ?
+			smoothstep(-5.0, 20.0, localPos.z) * (1.0 - smoothstep(235.0, 260.0, localPos.z)) : 0.0;
+		float wallLuma = max(SceneLinearLuminance(baseLinear), 0.008);
+		float stoneSeparation = clamp(pow(wallLuma / 0.28, 0.24), 0.72, 1.08);
+		float cottageSeparation = clamp(pow(wallLuma / 0.25, 0.14), 0.82, 1.05);
+		baseLinear *= lerp(1.0, stoneSeparation, stoneWall);
+		baseLinear *= lerp(1.0, cottageSeparation, cottageWall);
 	}
 	// Reduce proxy influence on strongly green foliage while preserving the cache fallback.
 	float baseLumaForNormal = max(SceneLinearLuminance(baseLinear), 0.02);
@@ -3040,7 +3066,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		GetStrongestDirectionalState(roofLightDirection, roofLightTint, roofLightWeight);
 		float roofFacing = saturate(dot(lightingNormal, roofLightDirection));
 		float roofDay = saturate(roofLightWeight) * smoothstep(-0.02, 0.15, roofLightDirection.z);
-		baseIndirectLinear *= lerp(1.0, 0.74 + 0.48 * roofFacing, j02RoofMask * roofDay);
+		baseIndirectLinear *= lerp(1.0, 0.78 + 0.52 * roofFacing, j02RoofMask * roofDay);
 	}
 	float3 directLinear = ComputeBoundedDirectionalLightContribution(
 		approximateAlbedo, lightingNormal, postLightMask);

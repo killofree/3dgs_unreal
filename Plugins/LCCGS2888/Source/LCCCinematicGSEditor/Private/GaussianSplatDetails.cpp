@@ -64,6 +64,7 @@ void FGaussianSplatDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBuilder
 		{ TEXT("02 조명 및 그림자"), TEXT("03 씬 라이트") },
 		{ TEXT("02 조명 및 그림자"), TEXT("04 리라이팅 및 촬영광 제거") },
 		{ TEXT("02 조명 및 그림자"), TEXT("05 식물 투과광") },
+		{ TEXT("03 색상 및 후처리"), TEXT("00 전체 씬 공통") },
 		{ TEXT("03 색상 및 후처리"), TEXT("01 노출 및 필름") },
 		{ TEXT("03 색상 및 후처리"), TEXT("02 전체 색감") },
 		{ TEXT("03 색상 및 후처리"), TEXT("03 빛받는 부분") },

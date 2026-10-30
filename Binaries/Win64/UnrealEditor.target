@@ -24,6 +24,78 @@
 	},
 	"BuildProducts": [
 		{
+			"Path": "$(ProjectDir)/Plugins/LCCGS2888/Binaries/Win64/UnrealEditor-LCCCinematicGS.dll",
+			"Type": "DynamicLibrary"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/LCCGS2888/Binaries/Win64/UnrealEditor-LCCCinematicGS.pdb",
+			"Type": "SymbolFile"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/LCCGS2888/Binaries/Win64/UnrealEditor-LCCCinematicGSEditor.dll",
+			"Type": "DynamicLibrary"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/LCCGS2888/Binaries/Win64/UnrealEditor-LCCCinematicGSEditor.pdb",
+			"Type": "SymbolFile"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/LCCGS2888/Binaries/Win64/UnrealEditor.modules",
+			"Type": "RequiredResource"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/Binaries/Win64/UnrealEditor-SceneEnvironment.dll",
+			"Type": "DynamicLibrary"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/Binaries/Win64/UnrealEditor-SceneEnvironment.pdb",
+			"Type": "SymbolFile"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/Binaries/Win64/UnrealEditor-SceneEnvironmentEditor.dll",
+			"Type": "DynamicLibrary"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/Binaries/Win64/UnrealEditor-SceneEnvironmentEditor.pdb",
+			"Type": "SymbolFile"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/Binaries/Win64/UnrealEditor.modules",
+			"Type": "RequiredResource"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/Binaries/Win64/UnrealEditor-SceneTransitionTest.dll",
+			"Type": "DynamicLibrary"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/Binaries/Win64/UnrealEditor-SceneTransitionTest.pdb",
+			"Type": "SymbolFile"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/Binaries/Win64/UnrealEditor-SceneTransitionTestEditor.dll",
+			"Type": "DynamicLibrary"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/Binaries/Win64/UnrealEditor-SceneTransitionTestEditor.pdb",
+			"Type": "SymbolFile"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/Binaries/Win64/UnrealEditor.modules",
+			"Type": "RequiredResource"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/VR360Skybox/Binaries/Win64/UnrealEditor-VR360Skybox.dll",
+			"Type": "DynamicLibrary"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/VR360Skybox/Binaries/Win64/UnrealEditor-VR360Skybox.pdb",
+			"Type": "SymbolFile"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/VR360Skybox/Binaries/Win64/UnrealEditor.modules",
+			"Type": "RequiredResource"
+		},
+		{
 			"Path": "$(EngineDir)/Binaries/ThirdParty/USD/UsdResources/Win64/X64/plugins/ar/resources/plugInfo.json",
 			"Type": "RequiredResource"
 		},
@@ -13650,81 +13722,29 @@
 		{
 			"Path": "$(EngineDir)/Plugins/XGEController/Binaries/Win64/UnrealEditor.modules",
 			"Type": "RequiredResource"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/LCCGS2888/Binaries/Win64/UnrealEditor-LCCCinematicGS.dll",
-			"Type": "DynamicLibrary"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/LCCGS2888/Binaries/Win64/UnrealEditor-LCCCinematicGS.pdb",
-			"Type": "SymbolFile"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/LCCGS2888/Binaries/Win64/UnrealEditor-LCCCinematicGSEditor.dll",
-			"Type": "DynamicLibrary"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/LCCGS2888/Binaries/Win64/UnrealEditor-LCCCinematicGSEditor.pdb",
-			"Type": "SymbolFile"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/LCCGS2888/Binaries/Win64/UnrealEditor.modules",
-			"Type": "RequiredResource"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/Binaries/Win64/UnrealEditor-SceneEnvironment.dll",
-			"Type": "DynamicLibrary"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/Binaries/Win64/UnrealEditor-SceneEnvironment.pdb",
-			"Type": "SymbolFile"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/Binaries/Win64/UnrealEditor-SceneEnvironmentEditor.dll",
-			"Type": "DynamicLibrary"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/Binaries/Win64/UnrealEditor-SceneEnvironmentEditor.pdb",
-			"Type": "SymbolFile"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/Binaries/Win64/UnrealEditor.modules",
-			"Type": "RequiredResource"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/Binaries/Win64/UnrealEditor-SceneTransitionTest.dll",
-			"Type": "DynamicLibrary"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/Binaries/Win64/UnrealEditor-SceneTransitionTest.pdb",
-			"Type": "SymbolFile"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/Binaries/Win64/UnrealEditor-SceneTransitionTestEditor.dll",
-			"Type": "DynamicLibrary"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/Binaries/Win64/UnrealEditor-SceneTransitionTestEditor.pdb",
-			"Type": "SymbolFile"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/Binaries/Win64/UnrealEditor.modules",
-			"Type": "RequiredResource"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/VR360Skybox/Binaries/Win64/UnrealEditor-VR360Skybox.dll",
-			"Type": "DynamicLibrary"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/VR360Skybox/Binaries/Win64/UnrealEditor-VR360Skybox.pdb",
-			"Type": "SymbolFile"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/VR360Skybox/Binaries/Win64/UnrealEditor.modules",
-			"Type": "RequiredResource"
 		}
 	],
 	"RuntimeDependencies": [
+		{
+			"Path": "$(ProjectDir)/Plugins/LCCGS2888/LCCCinematicGS.uplugin",
+			"Type": "UFS"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/SceneEnvironment.uplugin",
+			"Type": "UFS"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/SceneTransitionTest.uplugin",
+			"Type": "UFS"
+		},
+		{
+			"Path": "$(ProjectDir)/Plugins/VR360Skybox/VR360Skybox.uplugin",
+			"Type": "UFS"
+		},
+		{
+			"Path": "$(ProjectDir)/SDGS_VR_TEST_00.uproject",
+			"Type": "UFS"
+		},
 		{
 			"Path": "$(EngineDir)/Binaries/DotNET/Microsoft/PartnerCenterTool/PartnerCenterTool.exe",
 			"Type": "NonUFS"
@@ -40151,26 +40171,6 @@
 		},
 		{
 			"Path": "$(EngineDir)/Shaders/StandaloneRenderer/OpenGL/SplashVertexShader.glsl",
-			"Type": "UFS"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/LCCGS2888/LCCCinematicGS.uplugin",
-			"Type": "UFS"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneEnvironment/SceneEnvironment.uplugin",
-			"Type": "UFS"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/SceneTransitionTest/SceneTransitionTest.uplugin",
-			"Type": "UFS"
-		},
-		{
-			"Path": "$(ProjectDir)/Plugins/VR360Skybox/VR360Skybox.uplugin",
-			"Type": "UFS"
-		},
-		{
-			"Path": "$(ProjectDir)/SDGS_VR_TEST_00.uproject",
 			"Type": "UFS"
 		}
 	],
