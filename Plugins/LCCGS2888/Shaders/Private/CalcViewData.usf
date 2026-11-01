@@ -2202,6 +2202,34 @@ float ComputeUnrealPostProcessLightMask(float3 worldPos, float3 lightingNormal)
 	return hasDirectionalLight ? saturate(visibility) : 0.0;
 }
 
+// Maintained grey giwa is an authored surface correction, shared by render modes.
+float J02MaintainedGiwaMask(float3 localPos)
+{
+	// jg_g_021 and the live jg_g_022 reduction share identical surveyed coordinates.
+	if (SplatCount != 1653047u && OriginalSplatCount != 1653047u
+		&& SplatCount != 765511u && OriginalSplatCount != 765511u) return 0.0;
+	bool annexRoof = localPos.x > -3050.0 && localPos.x < -1795.0 && localPos.y > 280.0 && localPos.y < 2250.0;
+	bool longRoof = localPos.x > -820.0 && localPos.x < -280.0 && localPos.y > 150.0 && localPos.y < 3080.0;
+	bool crossRoof = localPos.x > -700.0 && localPos.x < 520.0 && localPos.y > 130.0 && localPos.y < 690.0;
+	bool northRoof = localPos.x > 480.0 && localPos.x < 1270.0 && localPos.y > -1400.0 && localPos.y < 240.0;
+	bool eastRoof = localPos.x > 360.0 && localPos.x < 1280.0 && localPos.y > 650.0 && localPos.y < 1260.0;
+	bool southRoof = localPos.x > -800.0 && localPos.x < 550.0 && localPos.y > 2460.0 && localPos.y < 3100.0;
+	bool westRoof = localPos.x > -1870.0 && localPos.x < -970.0 && localPos.y > 2480.0 && localPos.y < 2920.0;
+	bool gateRoof = localPos.x > -360.0 && localPos.x < 0.0 && localPos.y > -1760.0 && localPos.y < -1580.0;
+	bool smallRoof = localPos.x > -2200.0 && localPos.x < -1800.0 && localPos.y > 1800.0 && localPos.y < 2010.0;
+	bool thatchRoof = localPos.x > -1850.0 && localPos.x < -1220.0 && localPos.y > 600.0 && localPos.y < 1140.0;
+	if (!thatchRoof && (annexRoof || longRoof || crossRoof || northRoof || eastRoof || southRoof || westRoof || gateRoof || smallRoof))
+		return smoothstep(260.0, 288.0, localPos.z);
+	return 0.0;
+}
+
+float3 J02MaintainedGiwaColor(float3 sourceLinear, float mask)
+{
+	float luma = max(SceneLinearLuminance(sourceLinear), 0.0);
+	float maintainedLuma = 0.018 + 0.26 * luma / (luma + 0.22);
+	return lerp(sourceLinear, maintainedLuma.xxx, mask);
+}
+
 uint PackLODAndPostLightMask(
 	uint lodLevel,
 	float lightMask,
@@ -2503,7 +2531,8 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
     FGaussianSplatViewData baseline = (FGaussianSplatViewData)0;
     baseline.ClipPosition = clipPos;
     baseline.TranslatedWorldPos = translatedWorldPos;
-    float3 trainedLinear = SRGBToSceneLinearExact(decodedSrgb);
+    float3 trainedLinear = J02MaintainedGiwaColor(
+        SRGBToSceneLinearExact(decodedSrgb), J02MaintainedGiwaMask(localPos));
     baseline.PackedColorRG = PackHalf2x16(trainedLinear.rg);
     baseline.PackedColorBA = PackHalf2x16(float2(trainedLinear.b, opacity));
     baseline.Axis1 = axis1;
@@ -2641,19 +2670,18 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	float proxyNormalConfidence = 0.0;
 	float3 lightingNormal = SelectLightingNormal(rotation, scale, localToWorldRot, viewDirForLighting, localPos, proxyNormalConfidence);
 	// J02 roof restoration, scoped to the surveyed jg_g_021 roof envelopes.
-	// Preserve covariance and SH detail; remove chromatic scan stains only above eaves.
+	// Preserve geometry and luminance detail; remove chromatic scan stains above eaves.
+	// Include every detached roof and courtyard wing in Saved/roof_all_points.json.
 	float j02RoofMask = 0.0;
-	if (SplatCount == 1653047u)
+	if (SplatCount == 1653047u || OriginalSplatCount == 1653047u
+		|| SplatCount == 765511u || OriginalSplatCount == 765511u)
 	{
 		bool annexRoof = localPos.x > -3050.0 && localPos.x < -1795.0 && localPos.y > 280.0 && localPos.y < 2250.0;
-		bool longRoof = localPos.x > -820.0 && localPos.x < -360.0 && localPos.y > 150.0 && localPos.y < 3020.0;
-		if (annexRoof || longRoof)
+		bool longRoof = localPos.x > -820.0 && localPos.x < -280.0 && localPos.y > 150.0 && localPos.y < 3080.0;
+		j02RoofMask = J02MaintainedGiwaMask(localPos);
+		if (j02RoofMask > 0.0)
 		{
-			j02RoofMask = smoothstep(260.0, 288.0, localPos.z);
-			float roofLuma = SceneLinearLuminance(baseLinear);
-			float maintainedLuma = 0.026 + 0.70 * roofLuma;
-			float3 maintainedTile = maintainedLuma * float3(0.94, 0.99, 1.055);
-			baseLinear = lerp(baseLinear, maintainedTile, j02RoofMask * 0.98);
+			baseLinear = J02MaintainedGiwaColor(baseLinear, j02RoofMask);
 			float roofU = localPos.x * 0.97698 + localPos.y * 0.21335;
 			float roofV = -localPos.x * 0.21335 + localPos.y * 0.97698;
 			float3 roofSlope = localPos.y < 1100.0 ?
@@ -2663,7 +2691,8 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 				clamp((localPos.y - 450.0) * 0.004, -0.6, 0.0) + clamp((localPos.y - 2650.0) * 0.004, 0.0, 0.6), 0);
 			float3 roofAxis = SelectRawSplatAxisNormal(rotation, scale, localToWorldRot);
 			if (roofAxis.z < 0.0) roofAxis = -roofAxis;
-			float3 roofNormal = normalize(lerp(normalize(roofSlope + float3(0,0,1)), roofAxis, 0.22));
+			float3 roofSlopeWorld = normalize(mul(normalize(roofSlope + float3(0,0,1)), localToWorldRot));
+			float3 roofNormal = (annexRoof || longRoof) ? normalize(lerp(roofSlopeWorld, roofAxis, 0.22)) : roofAxis;
 			lightingNormal = normalize(lerp(lightingNormal, roofNormal, j02RoofMask));
 		}
 		// Adjacent thatch retains its straw identity and texture, with neutralized scan stains.
@@ -3265,6 +3294,16 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		viewData.TranslatedWorldPosPad =
 			asfloat(PackDirectSnowOverlayData(directWeatherNormal, 0.0, 0.0));
 	}
+	// Local material finish after atmosphere/time-of-day grading. Preserve energy,
+	// tile grooves and cast shading, but do not let the source roof read as rust.
+	// Snow/wet diagnostic colours remain untouched for renderer inspection.
+	bool j02NeutralGiwa = j02RoofMask > 0.0 && spatialDebugMode == 0u
+		&& PuddleSourceWetSettings.y < 0.5 && StableShadowDebugMode == 0u;
+	if (j02NeutralGiwa)
+	{
+		baseIndirectLinear = lerp(baseIndirectLinear,
+			SceneLinearLuminance(baseIndirectLinear).xxx, j02RoofMask);
+	}
 	viewData.PackedColorRG = PackHalf2x16(baseIndirectLinear.rg);
 	viewData.PackedColorBA = PackHalf2x16(float2(baseIndirectLinear.b, opacity));
 	// Production uses the camera-independent dense cast field. It stores a stable
@@ -3621,6 +3660,11 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 						: (stableLightingDiagnostic
 							? stableProxyLightingColor
 							: (stableProductionShadow ? stableFinalDirectLinear : gaussianSunAccentLinear)))))))));
+	if (j02NeutralGiwa)
+	{
+		packedDirectDebug = lerp(packedDirectDebug,
+			SceneLinearLuminance(packedDirectDebug).xxx, j02RoofMask);
+	}
 	viewData.PackedDirectRG = PackHalf2x16(packedDirectDebug.rg);
 	viewData.PackedDirectBA = PackHalf2x16(float2(packedDirectDebug.b, stableFinalCastVisibility));
 	viewData.Axis1 = axis1;
