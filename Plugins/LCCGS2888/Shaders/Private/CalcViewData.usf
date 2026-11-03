@@ -2226,8 +2226,8 @@ float J02MaintainedGiwaMask(float3 localPos)
 float3 J02MaintainedGiwaColor(float3 sourceLinear, float mask)
 {
 	float luma = max(SceneLinearLuminance(sourceLinear), 0.0);
-	float maintainedLuma = 0.018 + 0.26 * luma / (luma + 0.22);
-	return lerp(sourceLinear, maintainedLuma.xxx, mask);
+	float maintainedLuma = 0.009 + 0.15 * luma / (luma + 0.28);
+	return lerp(sourceLinear, maintainedLuma * float3(0.92, 0.98, 1.08), mask);
 }
 
 uint PackLODAndPostLightMask(
@@ -3302,7 +3302,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	if (j02NeutralGiwa)
 	{
 		baseIndirectLinear = lerp(baseIndirectLinear,
-			SceneLinearLuminance(baseIndirectLinear).xxx, j02RoofMask);
+			SceneLinearLuminance(baseIndirectLinear) * float3(0.92, 0.98, 1.08), j02RoofMask);
 	}
 	viewData.PackedColorRG = PackHalf2x16(baseIndirectLinear.rg);
 	viewData.PackedColorBA = PackHalf2x16(float2(baseIndirectLinear.b, opacity));
@@ -3663,7 +3663,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	if (j02NeutralGiwa)
 	{
 		packedDirectDebug = lerp(packedDirectDebug,
-			SceneLinearLuminance(packedDirectDebug).xxx, j02RoofMask);
+			SceneLinearLuminance(packedDirectDebug) * float3(0.92, 0.98, 1.08), j02RoofMask);
 	}
 	viewData.PackedDirectRG = PackHalf2x16(packedDirectDebug.rg);
 	viewData.PackedDirectBA = PackHalf2x16(float2(packedDirectDebug.b, stableFinalCastVisibility));
