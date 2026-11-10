@@ -16,6 +16,8 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     float alpha = f16tof32(d.PackedColorBA >> 16u);
     bool valid = d.ClipPosition.w > 0.0 && alpha > 0.0001;
     float debugLinear = f16tof32(d.PackedDirectRG & 65535u);
+    if (f16tof32(d.PackedDirectBA & 65535u) == -3.0)
+        debugLinear = UnpackGSPositiveHDR(d.PackedDirectRG).r;
     float castLinear = f16tof32(d.PackedDirectBA >> 16u);
     // This is per-splat source carrier before raster, NOT the final HDR pixel.
     float3 carrier = max(float3(

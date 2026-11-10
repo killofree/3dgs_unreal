@@ -179,6 +179,7 @@ struct FVertexOutput
 	float4 Color : TEXCOORD1;         // Base+Indirect, scene-linear
 	float3 DirectColor : TEXCOORD8; // Gaussian-native sun accent, scene-linear
 	float3 PlantTransmissionColor : TEXCOORD9; // Gaussian-native thin-leaf transmission, scene-linear
+	float3 LocalLightColor : TEXCOORD16; // independent point/spot/rect radiance
 	uint DebugFlag : TEXCOORD2;  // 0=normal, 1=debug mode (skip Gaussian)
 	float4 TranslatedWorldPos : TEXCOORD3;  // xyz=original translated centre, w=optional VS-calculated radial depth
 	float4 CenterClipPos : TEXCOORD4;       // Splat center clip position for velocity (Nanite-style)
@@ -810,7 +811,14 @@ float3 EvaluateFinalSplatLighting(FVertexOutput Input)
 			* transmissionCastGate * transmissionClosureGate
 			* sunHorizonVisibility;
 
-		color.rgb = directCarrier + reflectedFill + stableDirectSun + gaussianPlantTransmission;
+		// Local lights have their own spatial attenuation and surface incidence.
+		// The photographed-sun headroom and solar cast mask must not suppress them.
+		float3 localRadiance = max(Input.LocalLightColor, 0.0);
+		float localLuma = dot(localRadiance, float3(0.2126, 0.7152, 0.0722));
+		// Retain local illumination in captured shade while leaving headroom on
+		// sunlit stone, whose photographed carrier already contains direct sun.
+		localRadiance /= (1.0 + 0.15 * localLuma) * (1.0 + 4.0 * carrierLuma);
+		color.rgb = directCarrier + reflectedFill + stableDirectSun + gaussianPlantTransmission + localRadiance;
 	return color.rgb;
 }
 
