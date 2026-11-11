@@ -1590,8 +1590,8 @@ float3 ComputeLocalLightContribution(
 		attenuation *= attenuation;
 
 		// Spot type = 2. The CPU stores the emitted forward direction and
-		// cos(inner/outer) in LightConeAngles. Point and Rect use radial falloff;
-		// Rect remains a bounded approximation until area-light sampling is added.
+		// cos(inner/outer) in LightConeAngles. Rect is a bounded diffuse
+		// approximation, with emission restricted to its forward hemisphere.
 		if (type >= 1.5 && type < 2.5)
 		{
 			float3 emittedDirection = normalize(UnrealLightDirectionType[lightIndex].xyz);
@@ -1600,6 +1600,11 @@ float3 ComputeLocalLightContribution(
 			float outerCos = UnrealLightConeAngles[lightIndex].y;
 			attenuation *= smoothstep(outerCos, max(innerCos, outerCos + 0.0001), coneCos);
 		}
+		else if (type >= 2.5)
+		{
+			float3 emittedDirection = normalize(UnrealLightDirectionType[lightIndex].xyz);
+			attenuation *= saturate(dot(emittedDirection, -L));
+		}
 
 		float facing = saturate(dot(normalize(lightingNormal), L));
 		float energy = max(UnrealLightColorIntensity[lightIndex].w, 0.0)
@@ -1607,7 +1612,13 @@ float3 ComputeLocalLightContribution(
 		result += approximateAlbedo * max(UnrealLightColorIntensity[lightIndex].rgb, 0.0) * energy;
 	}
 
-	return max(result, 0.0);
+	// Captured shade is not reflectance. Let the public target shadow-lift
+	// control recover a bounded amount for LOCAL illumination, preserving hue
+	// and texture. Bright stone must not receive this recovery gain.
+	float localAlbedoLuma = max(SceneLinearLuminance(approximateAlbedo), 0.005);
+	float localRecovery = clamp(sqrt(0.80 / localAlbedoLuma), 1.0, 8.0);
+	localRecovery = lerp(1.0, localRecovery, saturate(UnrealRelightSkyTint.w / 0.3) * step(0.5, UnrealRelightParams.x));
+	return max(result * localRecovery, 0.0);
 }
 
 
@@ -2525,6 +2536,19 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	{
 		decodedSrgb = max(colorOpacity.rgb, 0.0);
 	}
+	if (OriginalSplatCount == 4791498u || SplatCount == 4791498u)
+	{
+		// Mai scan repair: reject broad sky reconstruction outliers, while
+		// retaining foliage colour support along the canopy silhouette. Use
+		// view-independent DC colour so both VR eyes share identical coverage.
+		float3 repairColor = max(colorOpacity.rgb, 0.0);
+		float upperRegion = smoothstep(1500.0, 2200.0, localPos.z);
+		float broadSplat = smoothstep(40.0, 100.0, max(scale.x, max(scale.y, scale.z)));
+		float foliageSupport = smoothstep(1.02, 1.16, repairColor.g / max(max(repairColor.r, repairColor.b), 0.002));
+		foliageSupport *= 1.0 - smoothstep(60.0, 90.0, max(scale.x, max(scale.y, scale.z)));
+		float skyResidual = smoothstep(1.08, 1.22, repairColor.b / max(max(repairColor.g, repairColor.r), 0.002));
+		opacity *= 1.0 - upperRegion * max(skyResidual, broadSplat * (1.0 - foliageSupport));
+	}
 
 #if GS_VR_BASELINE
     // No relighting, proxy sampling, vegetation, rain, fog or snow evaluation.
@@ -3099,8 +3123,11 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	}
 	float3 directLinear = ComputeBoundedDirectionalLightContribution(
 		approximateAlbedo, lightingNormal, postLightMask);
-	directLinear += ComputeLocalLightContribution(
-		worldPos.xyz, approximateAlbedo, lightingNormal);
+	// Keep local illumination separate: the production Stable path replaces
+	// directLinear with its sun payload below. Mixing locals into that temporary
+	// discarded them (apart from an unintended atmosphere/compression residue).
+	float3 localLightNormal = lightingNormal;
+	float localLightAtmosphereTransmission = 1.0;
 	directLinear *= (UnrealRelightParams.x >= 0.5) ? saturate(UnrealRelightParams.y) : 1.0;
 
 	// These are new Gaussian-native light payloads. They do not call the proxy shadow
@@ -3135,7 +3162,8 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		}
 		else if (spatialDebugMode == 16u)
 		{
-			diagnosticColor = directLinear * 3.0;
+			diagnosticColor = (directLinear + ComputeLocalLightContribution(
+				worldPos.xyz, approximateAlbedo, lightingNormal)) * 3.0;
 		}
 		else if (spatialDebugMode == 17u)
 		{
@@ -3143,7 +3171,8 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		}
 		else if (spatialDebugMode == 18u)
 		{
-			float3 approximateFinal = baseIndirectLinear + directLinear * postLightMask;
+			float3 approximateFinal = baseIndirectLinear + directLinear * postLightMask
+				+ ComputeLocalLightContribution(worldPos.xyz, approximateAlbedo, lightingNormal);
 			diagnosticColor = abs(approximateFinal - baseLinear) * SpatialDelightingParams2.z;
 		}
 		else if (spatialDebugMode == 19u)
@@ -3253,6 +3282,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		// the base/shadow payload whenever Bloom Strength was increased.
 		baseIndirectLinear = max(atmosphereTotalLinear - transmittedDirectLinear, 0.0);
 		directLinear = atmosphereDirectLinear;
+		localLightAtmosphereTransmission = atmosphereTransmission;
 		gaussianSunAccentLinear *= atmosphereTransmission;
 		gaussianPlantTransmissionLinear *= atmosphereTransmission;
 	}
@@ -3457,6 +3487,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 			// This is intentionally independent of light intensity and color so it can be
 			// compared directly against the UE-lit proxy's angular response.
 			stableProxyNdotLOnly = saturate(stableNdotL);
+			localLightNormal = angleNormal;
 
 			float skyFacing = saturate(angleNormal.z * 0.5 + 0.5);
 			float groundFacing = saturate(-angleNormal.z);
@@ -3660,6 +3691,19 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 						: (stableLightingDiagnostic
 							? stableProxyLightingColor
 							: (stableProductionShadow ? stableFinalDirectLinear : gaussianSunAccentLinear)))))))));
+	// Final must retain point/spot/rect illumination even without a valid Stable
+	// binding or an active sun. Do not multiply it by the SUN's cast mask/horizon:
+	// a lamp can illuminate a surface in sunlight's shadow. Local occlusion is
+	// not supplied by the directional Stable cache. Keep diagnostic masks pure.
+	float3 productionLocalLinear = 0.0.xxx;
+	if (StableShadowDebugMode == 0u && (spatialDebugMode < 11u || spatialDebugMode > 30u))
+	{
+		float localRelightStrength = UnrealRelightParams.x >= 0.5 ? saturate(UnrealRelightParams.y) : 1.0;
+		productionLocalLinear = ComputeLocalLightContribution(
+			worldPos.xyz, approximateAlbedo, localLightNormal)
+			* localRelightStrength * localLightAtmosphereTransmission;
+		productionLocalLinear = ApplyTimeOfDayHueGrade(productionLocalLinear);
+	}
 	if (j02NeutralGiwa)
 	{
 		packedDirectDebug = lerp(packedDirectDebug,
@@ -3690,6 +3734,16 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
     viewData.StructPadding1 = PackHalf2x16(float2(
         PuddleWaterLayer != 0u ? (bRoofPuddle ? colorOpacity.b : 0.0) : gaussianPlantTransmissionLinear.b,
         PuddleWaterLayer != 0u ? -2.0 : vegetationMaterialMask));
+	// -3 marks the independent-local-light payload. Preserve the high half's
+	// cast value for shadow/snow consumers, and retain legacy water/debug layouts.
+	if (PuddleWaterLayer == 0u && StableShadowDebugMode == 0u
+		&& (spatialDebugMode < 11u || spatialDebugMode > 30u))
+	{
+		viewData.PackedDirectRG = PackGSPositiveHDR(packedDirectDebug);
+		viewData.PackedDirectBA = PackHalf2x16(float2(-3.0, stableFinalCastVisibility));
+		viewData.StructPadding0 = PackGSPositiveHDR(productionLocalLinear);
+		viewData.StructPadding1 = PackGSPositiveHDR(gaussianPlantTransmissionLinear);
+	}
 	// Nonlinear target grading and sharpening run once on the fully accumulated
 	// scene-linear HDR intermediate. Keep the per-splat payload compact.
 	ViewDataBuffer[outputIndex] = viewData;
@@ -3808,3 +3862,4 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 	ProcessSplat(splatIndex, outputIndex, selectedClusterID, selectedLODLevel);
 }
+

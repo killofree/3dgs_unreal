@@ -10,6 +10,19 @@
 #define NUM_SH_TOTAL_COEFFICIENTS 16   // Including DC (band 0)
 #define SH_C0 0.28209479177387814f
 
+// Positive HDR RGB in 32 bits (11/11/10). Keeps the existing 80-byte buffer
+// while carrying sun, local lights and leaf transmission independently.
+uint PackGSPositiveHDR(float3 color)
+{
+    uint3 h = f32tof16(clamp(color, 0.0, 65000.0));
+    return (h.x >> 4u) | ((h.y >> 4u) << 11u) | ((h.z >> 5u) << 22u);
+}
+float3 UnpackGSPositiveHDR(uint packed)
+{
+    return f16tof32(uint3((packed & 2047u) << 4u,
+        ((packed >> 11u) & 2047u) << 4u, (packed >> 22u) << 5u));
+}
+
 // Per-frame view data structure (must match C++ FGaussianSplatViewData)
 // Total: 80 bytes per splat. Final nonlinear grading is applied once after
 // scene-linear HDR splat accumulation, not stored redundantly per splat.

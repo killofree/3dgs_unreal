@@ -17,7 +17,7 @@ FVertexOutput MainVS(
 	uint VertexId : SV_VertexID,
 	uint InstanceId : SV_InstanceID)
 {
-	FVertexOutput Output;
+	FVertexOutput Output = (FVertexOutput)0;
 #if GS_VR_RASTER_CLIP
     Output.CornerClipDistance=1.0.xxxx;
 #endif
@@ -78,6 +78,13 @@ FVertexOutput MainVS(
 	Output.ProxyShadowMask = float((viewData.Padding >> 16) & 0xFFFFu) / 65535.0;
 	Output.SplatRadiusNDC = 0.0;
 	float2 directBADebug = UnpackHalf2x16(viewData.PackedDirectBA);
+	bool independentLocalPayload = directBADebug.x == -3.0;
+	if (independentLocalPayload)
+	{
+		Output.LocalLightColor = UnpackGSPositiveHDR(viewData.StructPadding0);
+		Output.PlantTransmissionColor = UnpackGSPositiveHDR(viewData.StructPadding1);
+		transmissionBMask.y = 0.0;
+	}
 	Output.StableBindingDebug = directBADebug.y;
 	Output.StableTriangleID = 0xFFFFFFFFu;
 	uint packedWeatherSurface = asuint(viewData.TranslatedWorldPosPad);
@@ -139,7 +146,8 @@ FVertexOutput MainVS(
         rasterCorner*=cutoffRadius;
         offset=rasterCorner.x*viewData.Axis1+rasterCorner.y*viewData.Axis2;
     }
-	float3 directColor = float3(directRG.x, directRG.y, directBA.x);
+	float3 directColor = independentLocalPayload ? UnpackGSPositiveHDR(viewData.PackedDirectRG)
+		: float3(directRG.x, directRG.y, directBA.x);
 
 	// Debug mode: override color with cluster-based coloring (Nanite-style)
 	// Only show debug visualization for Nanite-enabled assets; non-Nanite assets are not rendered
@@ -1865,9 +1873,11 @@ FMainPixelOutput MainPS(FVertexOutput Input)
 			}
 			color.rgb = diagnostic;
 		}
-		// Show the diagnostic value independent of the source splat alpha.
-		// Gaussian support/coverage is still applied by the normal raster path.
-		color.a = 1.0;
+		// Cast diagnostics must retain production coverage: forcing faint, broad
+		// scan splats opaque invents large shadow patches absent from Final.
+		// Keep the legacy opaque presentation for the other proof views.
+		color.a = (StableShadowDebugMode >= 102u && StableShadowDebugMode <= 104u)
+			? Input.Color.a : 1.0;
 	}
 	else if (!originalUnlit && LightingPreviewMode > 0u && LightingPreviewMode <= 5u)
 	{

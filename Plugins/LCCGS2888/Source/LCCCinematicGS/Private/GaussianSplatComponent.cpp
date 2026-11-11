@@ -3615,6 +3615,11 @@ void UGaussianSplatComponent::ContinueStableProxyBindingBuild()
 
 void UGaussianSplatComponent::RequestStableProxyFieldBuild()
 {
+	// An explicit rebuild must also honour bias/filter edits at a fixed sun
+	// direction. The normal live path can still reuse a matching field.
+	LastStableRayLightDirection = FVector3f::ZeroVector;
+	LastStableRayBuildFrame = MAX_uint64;
+	UpdateCachedSceneLighting();
 	RequestStableProxyFieldBuildForCapture(0u);
 }
 
@@ -4046,7 +4051,9 @@ void UGaussianSplatComponent::RebuildStableProxyRayVisibilityInternal(bool bNoti
 		const FVector4f WorldDir4 = CachedLightingData.LightDirectionType[DirectionalIndex];
 		WorldDir = FVector(WorldDir4.X, WorldDir4.Y, WorldDir4.Z).GetSafeNormal();
 	}
-	const FVector LocalDirD = GetProxyShadowMeshWorldTransform().InverseTransformVectorNoScale(WorldDir).GetSafeNormal();
+	// BVH vertices already include ProxyToSplat (including the proxy rotation).
+	// Convert the ray into that same component-local space, not proxy-local space.
+	const FVector LocalDirD = GetComponentTransform().InverseTransformVector(WorldDir).GetSafeNormal();
 	const FVector3f LocalDir(LocalDirD);
 	if (LocalDir.IsNearlyZero())
 	{
@@ -4713,7 +4720,8 @@ void UGaussianSplatComponent::PostEditChangeProperty(FPropertyChangedEvent& Prop
 		MarkRenderStateDirty();
 		return;
 	}
-	else if (PropertyName == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, StableRayBoundarySoftening))
+	else if (PropertyName == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, StableRayBoundarySoftening) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(UGaussianSplatComponent, StableFieldDepthBiasCm))
 	{
 		StableRayBoundarySoftening = FMath::Clamp(StableRayBoundarySoftening, 0.0f, 1.0f);
 		// The light may not have moved, but changing the spatial filter must rebuild
