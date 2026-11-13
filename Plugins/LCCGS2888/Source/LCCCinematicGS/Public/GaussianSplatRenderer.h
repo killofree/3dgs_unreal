@@ -89,7 +89,7 @@ public:
 		const FVector3f& Right,
 		const FVector3f& Up,
 		const FVector4f& Settings,
-		uint32 CaptureRevision);
+		uint32 CaptureRevision, uint32 ExternalCasterCount = 0u);
 	static uint32 GetProxyLightDepthCaptureRevision_RenderThread();
 	static void SetProxySurfaceEffect(
 		FTextureRHIRef DepthTexture,

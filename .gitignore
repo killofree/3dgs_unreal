@@ -1,5 +1,17 @@
-# Only accept new files under Content during level/asset collaboration.
-/*
-!/Content/
-!/.gitignore
-!/.gitattributes
+# Project files and asset packs may be selected manually for commits.
+# Ignore only generated caches, local editor state, and debug/link artifacts.
+/Intermediate/
+/Saved/
+/DerivedDataCache/
+/.vs/
+/Config/Layouts/
+/Plugins/**/Intermediate/
+/Plugins/**/DerivedDataCache/
+/Plugins/**/Saved/
+/Plugins/**/.vs/
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk
+__pycache__/

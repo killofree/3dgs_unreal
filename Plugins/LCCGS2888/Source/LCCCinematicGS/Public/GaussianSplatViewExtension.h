@@ -63,7 +63,7 @@ public:
 	 *  to apply panorama GPU back-pressure before a heavy snow ViewFamily begins. */
 	static void SetBakedSnowGaussianVisible(bool bEnabled);
 	void SetPendingComposite_RenderThread(
-		const FRDGBuilder* OwningGraphBuilder,
+		FRDGBuilder* OwningGraphBuilder,
 		const FSceneView* View,
 		FRDGTexture* IntermediateTexture,
 		FRDGTexture* IntermediateDepthTexture,
@@ -81,7 +81,8 @@ public:
 		const FVector4f& CompositeBloomParams,
 		const FVector4f& CompositeColorBloomParams,
 		const FVector4f& CompositeBloomTint,
-		float CompositeBloomSoftKnee, int32 VRDiagnosticMode = 0);
+		float CompositeBloomSoftKnee, int32 VRDiagnosticMode = 0,
+        FRDGTexture* MSAAColorTarget = nullptr);
     FScreenPassTexture PostProcessPassBeforeTonemap_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs);
 	FScreenPassTexture PostProcessPassAfterTonemap_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs);
 	FScreenPassTexture CompositePending_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs, bool bAfterTonemap);

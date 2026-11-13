@@ -273,6 +273,9 @@ public:
 };
 
 bool DrawPCVRTileComposite(FRHICommandListImmediate& Cmd,const FSceneView& View,FGaussianGlobalAccumulator* A,FRHITexture* SceneDepth,int32 Quality,bool bTrim,FBufferRHIRef& RasterArgs) {
+ // The tiled compute resolve has no per-sample coverage output. Retain the
+ // raster path whenever the destination still owns MSAA depth samples.
+ if(SceneDepth && SceneDepth->GetDesc().NumSamples>1)return false;
  if(CVarTile.GetValueOnRenderThread()==0 || !SceneDepth || !A || !A->PCVRFinalColorSRV.IsValid() || !A->GlobalDrawIndirectArgsBufferSRV.IsValid())return false;
  const auto* Fog=IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("gs.PCVR.PackedFog"));
  if(!Fog || Fog->GetValueOnRenderThread()!=2 || (Quality!=0 && Quality!=3))return false;

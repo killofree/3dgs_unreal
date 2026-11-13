@@ -285,6 +285,10 @@ static FVector4f GProxyLightDepthUpSettings(0, 0, 1, 0);
 // v2772: revision belongs to the texture + projection packet above and changes only
 // when the LightDepth producer performs a new capture.
 static uint32 GProxyLightDepthCaptureRevision = 0u;
+static uint32 GExternalMeshShadowCasterCount = 0u;
+static TAutoConsoleVariable<int32> CVarExternalMeshShadows(
+	TEXT("gs.ExternalMeshShadows"), 1,
+	TEXT("Combine external mesh depth shadows with Stable proxy BVH visibility. 0 disables external casters only."), ECVF_RenderThreadSafe);
 static FVector4f GProxyVolumetricShaftSettings(0.18f, 0.65f, 12000.0f, 0.65f);
 static FVector3f GProxyVolumetricShaftTint(1.0f, 0.86f, 0.62f);
 // Fog-only late-composite bridge. x=strength, y=visibility cm, z=max opacity, w=proxy-light influence.
@@ -736,7 +740,7 @@ void FGaussianSplatRenderer::SetProxyLightDepthCapture(
 	const FVector3f& Right,
 	const FVector3f& Up,
 	const FVector4f& Settings,
-	uint32 CaptureRevision)
+	uint32 CaptureRevision, uint32 ExternalCasterCount)
 {
 	GProxyLightDepthCaptureTexture = DepthTexture;
 	GProxyReceiverLightDepthCaptureTexture = ReceiverDepthTexture;
@@ -749,6 +753,7 @@ void FGaussianSplatRenderer::SetProxyLightDepthCapture(
 	// companion channel by packing it into the enabled vector's w only when valid.
 	GProxyLightDepthForwardEnabled.W = DepthTexture.IsValid() ? Settings.W : -1.0f;
 	GProxyLightDepthCaptureRevision = DepthTexture.IsValid() ? CaptureRevision : 0u;
+	GExternalMeshShadowCasterCount = DepthTexture.IsValid() ? ExternalCasterCount : 0u;
 }
 
 uint32 FGaussianSplatRenderer::GetProxyLightDepthCaptureRevision_RenderThread()
@@ -1241,6 +1246,13 @@ static void SetSpatialDelightingResources(FGaussianSplatCalcViewDataCS::FParamet
 	Parameters.StableProxyCastGridForwardEnabled = GProxyLightDepthForwardEnabled;
 	Parameters.StableProxyCastGridRightRange = GProxyLightDepthRightRange;
 	Parameters.StableProxyCastGridUpSettings = GProxyLightDepthUpSettings;
+	Parameters.ExternalMeshShadowDepth = GProxyLightDepthCaptureTexture.IsValid()
+		? GProxyLightDepthCaptureTexture : GWhiteTexture->TextureRHI;
+	Parameters.ExternalMeshShadowSettings = FVector4f(
+		CVarExternalMeshShadows.GetValueOnRenderThread() != 0 && GExternalMeshShadowCasterCount > 0u &&
+		GProxyLightDepthCaptureRevision > 0u && GProxyLightDepthForwardEnabled.W >= 0.0f ? 1.0f : 0.0f,
+		FMath::Clamp(GProxyShadowDetailSettings.X, 0.5f, 40.0f),
+		FMath::Max(1.0f, FMath::Abs(GProxyLightDepthForwardEnabled.W) * 3.0f), 0.0f);
 	Parameters.StableProxyFieldValid = GPUResources->StableProxyFieldValid;
 	Parameters.StableShadowDebugMode = static_cast<uint32>(FMath::Max(0, GStableShadowDebugMode));
 }
@@ -3984,7 +3996,9 @@ void FGaussianSplatRenderer::GradeToTexture(
 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatPostGradeHDR);
 
 	TShaderMapRef<FGaussianSplatCompositeVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-	TShaderMapRef<FGaussianSplatCompositePS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FGaussianSplatCompositePS::FPermutationDomain GradePermutation;
+	GradePermutation.Set<FGaussianSplatCompositePS::FMSAAComposite>(IntermediateTexture->GetDesc().NumSamples > 1);
+	TShaderMapRef<FGaussianSplatCompositePS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), GradePermutation);
 
 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
 	{
@@ -4101,6 +4115,7 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 	TShaderMapRef<FGaussianSplatCompositeVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 	FGaussianSplatBloomCompositePS::FPermutationDomain BloomPermutation;
     BloomPermutation.Set<FGaussianSplatBloomCompositePS::FExtractCache>(BloomExtractTexture!=nullptr);
+	BloomPermutation.Set<FGaussianSplatBloomCompositePS::FMSAAComposite>(GradedTexture->GetDesc().NumSamples > 1);
     TShaderMapRef<FGaussianSplatBloomCompositePS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel),BloomPermutation);
 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
 	{

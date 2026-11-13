@@ -7,19 +7,30 @@
 Texture2D PCVRBloomExtractTexture;
 RWTexture2D<float4> PCVRBloomExtractOut;
 int2 PCVRBloomExtractExtent;
-Texture2D IntermediateTexture;
-Texture2D IntermediateDepthTexture;
-Texture2D IntermediateFogDepthTexture;
+#ifndef GS_MSAA_COMPOSITE
+#define GS_MSAA_COMPOSITE 0
+#endif
+#if GS_MSAA_COMPOSITE
+#define GS_SURFACE_TEXTURE Texture2DMS<float4>
+static uint GSCompositeSampleIndex = 0;
+#define GS_SURFACE_LOAD(T, P) T.Load(P, GSCompositeSampleIndex)
+#else
+#define GS_SURFACE_TEXTURE Texture2D
+#define GS_SURFACE_LOAD(T, P) T.Load(int3(P, 0))
+#endif
+GS_SURFACE_TEXTURE IntermediateTexture;
+GS_SURFACE_TEXTURE IntermediateDepthTexture;
+GS_SURFACE_TEXTURE IntermediateFogDepthTexture;
 // Raw accumulation alpha has the identical blend, order, FP16 precision and clear
 // as fog coverage. Do not use graded alpha: viewport remapping can resample it.
-Texture2D PCVRFogCoverageTexture;
+GS_SURFACE_TEXTURE PCVRFogCoverageTexture;
 // Snow-only coverage/depth seed accumulation. These remain separate from the
 // untouched base GS and are resolved into a continuous surface in this shader.
-Texture2D SnowIntermediateTexture;
-Texture2D SnowIntermediateDepthTexture;
+GS_SURFACE_TEXTURE SnowIntermediateTexture;
+GS_SURFACE_TEXTURE SnowIntermediateDepthTexture;
 // Snow-only coverage-aware occlusion depth from the base GS pass. Unlike the
 // normal MIN-depth target, transparent Gaussian fringes do not write here.
-Texture2D SnowOcclusionDepthTexture;
+GS_SURFACE_TEXTURE SnowOcclusionDepthTexture;
 // x enabled, y depth tolerance cm, z occlusion-depth clear sentinel, w reserved.
 float4 SnowCompositeParams;
 float4 SnowTuningParams; // x ground fill, y structure removal, z structure slope threshold
@@ -94,9 +105,19 @@ float CompositeLuminance(float3 Color)
     return max(dot(max(Color, 0.0), float3(0.2126, 0.7152, 0.0722)), 0.0);
 }
 
+void GetGSIntermediateDimensions(out uint Width, out uint Height)
+{
+#if GS_MSAA_COMPOSITE
+    uint Samples;
+    IntermediateTexture.GetDimensions(Width, Height, Samples);
+#else
+    IntermediateTexture.GetDimensions(Width, Height);
+#endif
+}
+
 float4 LoadAccumulated(int2 PixelPos, int2 MaxPixel)
 {
-    return IntermediateTexture.Load(int3(clamp(PixelPos, int2(0, 0), MaxPixel), 0));
+    return GS_SURFACE_LOAD(IntermediateTexture, clamp(PixelPos, int2(0, 0), MaxPixel));
 }
 
 
@@ -135,7 +156,7 @@ void ResolveContinuousSnowSurface(
 
 	float depthTolerance = max(SnowCompositeParams.y, 4.0);
 	float groundFillStrength = saturate(SnowTuningParams.x);
-	float snowOcclusionDepth = SnowOcclusionDepthTexture.Load(int3(PixelPos, 0)).r;
+	float snowOcclusionDepth = GS_SURFACE_LOAD(SnowOcclusionDepthTexture, PixelPos).r;
 	float occlusionClearDepth = max(SnowCompositeParams.z, 1.0);
 	bool hasMaterialSnowOccluder =
 		snowOcclusionDepth > 0.0 &&
@@ -152,9 +173,9 @@ void ResolveContinuousSnowSurface(
 	for (int i = 0; i < 9; ++i)
 	{
 		int2 Q = clamp(PixelPos + Offsets[i], int2(0, 0), MaxPixel);
-		float4 Seed = SnowIntermediateTexture.Load(int3(Q, 0));
+		float4 Seed = GS_SURFACE_LOAD(SnowIntermediateTexture, Q);
 		float seedAlpha = saturate(Seed.a);
-		float seedDepth = SnowIntermediateDepthTexture.Load(int3(Q, 0)).r;
+		float seedDepth = GS_SURFACE_LOAD(SnowIntermediateDepthTexture, Q).r;
 
 		// Compare snow against the dedicated coverage-aware GS occlusion depth.
 		// Faint foreground Gaussian tails no longer behave as absolute MIN-depth
@@ -213,7 +234,7 @@ void ResolveContinuousSnowSurface(
 	for (int dp = 0; dp < 4; ++dp)
 	{
 		int2 DQ = clamp(PixelPos + DepthProbeOffsets[dp], int2(0, 0), MaxPixel);
-		float neighborBaseDepth = IntermediateDepthTexture.Load(int3(DQ, 0)).r;
+		float neighborBaseDepth = GS_SURFACE_LOAD(IntermediateDepthTexture, DQ).r;
 		if (neighborBaseDepth > 0.0)
 		{
 			localDepthSpread = max(localDepthSpread, abs(neighborBaseDepth - BaseDepth));
@@ -249,14 +270,14 @@ void ResolveContinuousSnowSurface(
 		for (int r = 0; r < 24; ++r)
 		{
 			int2 Q = clamp(PixelPos + RingOffsets[r], int2(0, 0), MaxPixel);
-			float4 Seed = SnowIntermediateTexture.Load(int3(Q, 0));
+			float4 Seed = GS_SURFACE_LOAD(SnowIntermediateTexture, Q);
 			float seedAlpha = saturate(Seed.a);
 			if (seedAlpha <= (1.0 / 255.0))
 			{
 				continue;
 			}
 
-			float seedDepth = SnowIntermediateDepthTexture.Load(int3(Q, 0)).r;
+			float seedDepth = GS_SURFACE_LOAD(SnowIntermediateDepthTexture, Q).r;
 			if (seedDepth <= 0.0)
 			{
 				continue;
@@ -375,13 +396,13 @@ void ResolveContinuousSnowSurface(
 float4 LoadWeatherAccumulated(int2 PixelPos, int2 MaxPixel)
 {
 	int2 P = clamp(PixelPos, int2(0, 0), MaxPixel);
-	float4 baseAccum = IntermediateTexture.Load(int3(P, 0));
+	float4 baseAccum = GS_SURFACE_LOAD(IntermediateTexture, P);
 	if (SnowCompositeParams.x < 0.5)
 	{
 		return baseAccum;
 	}
 
-	float baseDepth = IntermediateDepthTexture.Load(int3(P, 0)).r;
+	float baseDepth = GS_SURFACE_LOAD(IntermediateDepthTexture, P).r;
 	float4 snowAccum;
 	ResolveContinuousSnowSurface(P, MaxPixel, baseAccum, baseDepth, snowAccum);
 	float snowAlpha = saturate(snowAccum.a);
@@ -393,7 +414,7 @@ float LoadWeatherDepth(int2 PixelPos, int2 MaxPixel)
 	int2 P = clamp(PixelPos, int2(0, 0), MaxPixel);
 	// V5 final snow is a coating resolved ON the base GS surface.  Keeping base
 	// depth here is intentional: cloned snow quad depth is no longer visible.
-	return IntermediateDepthTexture.Load(int3(P, 0)).r;
+	return GS_SURFACE_LOAD(IntermediateDepthTexture, P).r;
 }
 
 float3 AccumToStraight(float4 Accum)
@@ -834,11 +855,11 @@ float TonalLogForNeighbor(
 // accumulation as the rendered colour. No auxiliary camera or SceneCapture is used.
 float ResolvePanoramaSafeFogDepth(int2 PixelPos, float FallbackDepth)
 {
-    const float4 FogDepthAccum = IntermediateFogDepthTexture.Load(int3(PixelPos, 0));
+    const float4 FogDepthAccum = GS_SURFACE_LOAD(IntermediateFogDepthTexture, PixelPos);
     // Bloom-only Params0.z identifies RG16F. Grade uses its own params and
     // never calls this function. Nearest depth and fallback rules are unchanged.
     const float Coverage = saturate(GaussianCompositeParams0.z > 1.5
-        ? PCVRFogCoverageTexture.Load(int3(PixelPos,0)).a
+        ? GS_SURFACE_LOAD(PCVRFogCoverageTexture, PixelPos).a
         : (GaussianCompositeParams0.z > 0.5 ? FogDepthAccum.g : FogDepthAccum.a));
     if (Coverage <= 1.0e-4 || FogDepthAccum.r <= 0.0)
     {
@@ -890,9 +911,9 @@ float ResolveNativeFogSurfaceDepth(
     for (int i = 0; i < 16; ++i)
     {
         const int2 Q = clamp(PixelPos + Offsets[i], int2(0, 0), MaxPixel);
-        const float4 NeighborAccum = IntermediateTexture.Load(int3(Q, 0));
+        const float4 NeighborAccum = GS_SURFACE_LOAD(IntermediateTexture, Q);
         const float NeighborAlpha = saturate(NeighborAccum.a);
-        const float NeighborDepth = IntermediateDepthTexture.Load(int3(Q, 0)).r;
+        const float NeighborDepth = GS_SURFACE_LOAD(IntermediateDepthTexture, Q).r;
         if (NeighborDepth <= 0.0 || NeighborAlpha <= 0.035)
         {
             continue;
@@ -990,16 +1011,34 @@ float3 ApplyNativeFogBridgeToGS(
         0.0);
 }
 
-float4 MainGradePS(FScreenVertexOutput Input) : SV_Target0
+float4 MainGradePS(FScreenVertexOutput Input
+#if GS_MSAA_COMPOSITE
+    , uint SampleIndex : SV_SampleIndex
+#endif
+) : SV_Target0
 {
+#if GS_MSAA_COMPOSITE
+    GSCompositeSampleIndex = SampleIndex;
+#endif
     const float2 OutputSize = max(GaussianCompositeOutputRect.zw, 1.0.xx);
+#if GS_MSAA_COMPOSITE
+    // SV_Position can be evaluated at a sample location. All samples of a
+    // pixel must address that same pixel, then select only their sample index.
+    const float2 ViewUV = saturate(
+        (floor(Input.Position.xy) + 0.5 - GaussianCompositeOutputRect.xy) / OutputSize);
+#else
     const float2 ViewUV = saturate(
         (Input.Position.xy - GaussianCompositeOutputRect.xy + 0.5) / OutputSize);
+#endif
+#if GS_MSAA_COMPOSITE
+    const int2 PixelPos = int2(GaussianCompositeSourceRect.xy + ViewUV * GaussianCompositeSourceRect.zw);
+#else
     const int2 PixelPos = int2(
         GaussianCompositeSourceRect.xy +
         ViewUV * max(GaussianCompositeSourceRect.zw - 1.0.xx, 0.0.xx));
+#endif
     uint TextureWidth, TextureHeight;
-    IntermediateTexture.GetDimensions(TextureWidth, TextureHeight);
+    GetGSIntermediateDimensions(TextureWidth, TextureHeight);
     const int2 MaxPixel = int2(max(int(TextureWidth) - 1, 0), max(int(TextureHeight) - 1, 0));
 
     const float4 Accum = LoadWeatherAccumulated(PixelPos, MaxPixel);
@@ -1157,11 +1196,25 @@ float3 ToneMapIsolatedGS(float3 HDRLinear)
     return saturate((X * (2.51 * X + 0.03)) / max(X * (2.43 * X + 0.59) + 0.14, 1.0e-5.xxx));
 }
 
-float4 MainBloomCompositePS(FScreenVertexOutput Input) : SV_Target0
+float4 MainBloomCompositePS(FScreenVertexOutput Input
+#if GS_MSAA_COMPOSITE
+    , uint SampleIndex : SV_SampleIndex
+#endif
+) : SV_Target0
 {
+#if GS_MSAA_COMPOSITE
+    GSCompositeSampleIndex = SampleIndex;
+#endif
     const float2 OutputSize = max(GaussianCompositeOutputRect.zw, 1.0.xx);
+#if GS_MSAA_COMPOSITE
+    // SV_Position can be evaluated at a sample location. All samples of a
+    // pixel must address that same pixel, then select only their sample index.
+    const float2 ViewUV = saturate(
+        (floor(Input.Position.xy) + 0.5 - GaussianCompositeOutputRect.xy) / OutputSize);
+#else
     const float2 ViewUV = saturate(
         (Input.Position.xy - GaussianCompositeOutputRect.xy + 0.5) / OutputSize);
+#endif
 
     // Phase 0A-C: show the fixed directional LightDepth texture in a separate
     // upper-right inset. Outside this rectangle the normal Final composite runs
@@ -1216,11 +1269,15 @@ float4 MainBloomCompositePS(FScreenVertexOutput Input) : SV_Target0
         }
     }
 
+#if GS_MSAA_COMPOSITE
+    const int2 PixelPos = int2(GaussianCompositeSourceRect.xy + ViewUV * GaussianCompositeSourceRect.zw);
+#else
     const int2 PixelPos = int2(
         GaussianCompositeSourceRect.xy +
         ViewUV * max(GaussianCompositeSourceRect.zw - 1.0.xx, 0.0.xx));
+#endif
     uint TextureWidth, TextureHeight;
-    IntermediateTexture.GetDimensions(TextureWidth, TextureHeight);
+    GetGSIntermediateDimensions(TextureWidth, TextureHeight);
     const int2 MaxPixel = int2(max(int(TextureWidth) - 1, 0), max(int(TextureHeight) - 1, 0));
 
     const float4 GradedAccum = LoadAccumulated(PixelPos, MaxPixel);
@@ -1242,7 +1299,7 @@ float4 MainBloomCompositePS(FScreenVertexOutput Input) : SV_Target0
         if (Alpha <= (1.0 / 255.0)) discard;
         return float4(saturate(GradedAccum.rgb), Alpha);
     }
-    const float GSDepth = IntermediateDepthTexture.Load(int3(PixelPos, 0)).r;
+    const float GSDepth = GS_SURFACE_LOAD(IntermediateDepthTexture, PixelPos).r;
     const float CompositeAlpha = ComputeProductionAccumulatedAlphaSeal(Alpha);
     const float3 PluginSpatialBloom = ComputePluginSpatialBloom(PixelPos, MaxPixel);
     if (Alpha <= (1.0 / 255.0) && CompositeLuminance(PluginSpatialBloom) <= 1.0e-6) discard;

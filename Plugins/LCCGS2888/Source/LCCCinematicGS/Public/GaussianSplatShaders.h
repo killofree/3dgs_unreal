@@ -87,6 +87,8 @@ class FGaussianSplatCalcViewDataCS : public FGlobalShader
 		SHADER_PARAMETER(FVector4f, StableProxyCastGridForwardEnabled)
 		SHADER_PARAMETER(FVector4f, StableProxyCastGridRightRange)
 		SHADER_PARAMETER(FVector4f, StableProxyCastGridUpSettings)
+		SHADER_PARAMETER_TEXTURE(Texture2D, ExternalMeshShadowDepth)
+		SHADER_PARAMETER(FVector4f, ExternalMeshShadowSettings) // enabled, bias cm, softness cm, reserved
 		SHADER_PARAMETER(uint32, StableProxyFieldValid)
 		SHADER_PARAMETER(uint32, StableShadowDebugMode)
 		SHADER_PARAMETER(uint32, UseClusterCulling)
@@ -671,6 +673,8 @@ class FGaussianSplatCompositePS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FGaussianSplatCompositePS);
 	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatCompositePS, FGlobalShader);
+	class FMSAAComposite : SHADER_PERMUTATION_BOOL("GS_MSAA_COMPOSITE");
+	using FPermutationDomain = TShaderPermutationDomain<FMSAAComposite>;
 
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
         SHADER_PARAMETER_TEXTURE(Texture2D, IntermediateTexture)
@@ -736,7 +740,8 @@ class FGaussianSplatBloomCompositePS : public FGlobalShader
 
  public:
  class FExtractCache:SHADER_PERMUTATION_BOOL("GS_PCVR_BLOOM_CACHE");
- using FPermutationDomain=TShaderPermutationDomain<FExtractCache>;
+ class FMSAAComposite:SHADER_PERMUTATION_BOOL("GS_MSAA_COMPOSITE");
+ using FPermutationDomain=TShaderPermutationDomain<FExtractCache,FMSAAComposite>;
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		
 		SHADER_PARAMETER_TEXTURE(Texture2D, IntermediateTexture)

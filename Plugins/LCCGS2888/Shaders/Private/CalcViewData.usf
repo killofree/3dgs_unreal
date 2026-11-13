@@ -85,6 +85,8 @@ float4 StableProxyCastGridOriginWidth;
 float4 StableProxyCastGridForwardEnabled;
 float4 StableProxyCastGridRightRange;
 float4 StableProxyCastGridUpSettings;
+Texture2D<float> ExternalMeshShadowDepth;
+float4 ExternalMeshShadowSettings; // enabled, bias cm, softness cm, reserved
 uint StableProxyFieldValid;
 uint StableShadowDebugMode;
 uint UseClusterCulling;  // 1 = check visibility, 0 = process all splats
@@ -850,18 +852,70 @@ float3 EncodeStableProxyDepthDiagnostic(uint splatIndex, uint mode)
 		: float3(0.0, magnitude, 0.0);
 }
 
-// Dense light-space visibility is spatially stable, but its equal-depth rejection
-// deliberately removes receiver self-depth. Recover only well-supported self-cast
-// from the welded proxy field. The wide dead zone prevents small per-frame depth
-// differences around fully lit vertices from turning back into MRQ sparkle.
+// External-only light-space depth complements the deterministic proxy self-cast.
+// Keep the two sources independent; no legacy grid or vertex-proof writes are used.
+float LoadExternalMeshCastVisibility(uint splatIndex)
+{
+	if (ExternalMeshShadowSettings.x < 0.5 || splatIndex >= StableSplatBindingCount)
+		return 1.0;
+	uint4 binding = StableSplatBindingBuffer[splatIndex];
+	if (binding.x == 0xFFFFFFFFu || binding.x >= StableProxyTriangleCount)
+		return 1.0;
+	uint4 tri = StableProxyTriangleBuffer[binding.x];
+	if (tri.w == 0u || any(tri.xyz >= StableProxyVertexCount))
+		return 1.0;
+	float2 bc = saturate(UnpackHalf2x16(binding.y));
+	float3 bary = float3(max(1.0 - bc.x - bc.y, 0.0), bc);
+	bary /= max(dot(bary, 1.0.xxx), 1.e-6);
+	// Sample at the bound receiver surface, not the displaced GS shell or camera.
+	float3 localP = StableProxyVertexBuffer[tri.x].xyz * bary.x
+		+ StableProxyVertexBuffer[tri.y].xyz * bary.y
+		+ StableProxyVertexBuffer[tri.z].xyz * bary.z;
+	float3 relative = mul(float4(localP, 1.0), LocalToWorld).xyz - StableProxyCastGridOriginWidth.xyz;
+	float widthCm = max(StableProxyCastGridOriginWidth.w, 1.0);
+	float2 uv = float2(0.5 + dot(relative, StableProxyCastGridRightRange.xyz) / widthCm,
+		0.5 - dot(relative, StableProxyCastGridUpSettings.xyz) / widthCm);
+	float receiverDepth = dot(relative, StableProxyCastGridForwardEnabled.xyz);
+	if (receiverDepth <= 0.0 || any(uv < 0.0) || any(uv > 1.0))
+		return 1.0;
+	uint width, height;
+	ExternalMeshShadowDepth.GetDimensions(width, height);
+	float texelCm = widthCm / max(float(width), 1.0);
+	float bias = max(ExternalMeshShadowSettings.y, texelCm * 0.22);
+	float transition = max(ExternalMeshShadowSettings.z, texelCm * 0.55);
+	float2 pixel = uv * float2(width, height) - 0.5;
+	int2 basePixel = int2(floor(pixel));
+	float2 fraction = frac(pixel);
+	float visibility = 0.0;
+	// Bilinear 3x3 PCF: interpolate visibility, never unrelated blocker depths.
+	[unroll] for (int y = 0; y < 4; ++y)
+	{
+		[unroll] for (int x = 0; x < 4; ++x)
+		{
+			int2 p = basePixel + int2(x - 1, y - 1);
+			float wx = x == 0 ? 1.0 - fraction.x : (x == 3 ? fraction.x : 1.0);
+			float wy = y == 0 ? 1.0 - fraction.y : (y == 3 ? fraction.y : 1.0);
+			float v = 1.0;
+			if (all(p >= 0) && all(p < int2(width, height)))
+			{
+				float blocker = ExternalMeshShadowDepth.Load(int3(p, 0)).r;
+				if (blocker > 0.01 && blocker < 60000.0)
+					v = 1.0 - smoothstep(bias, bias + transition, receiverDepth - blocker);
+			}
+			visibility += v * wx * wy;
+		}
+	}
+	return saturate(visibility / 9.0);
+}
+
 float LoadStableProxyHybridCastVisibility(uint splatIndex)
 {
 	float currentVertexVisibility = LoadStableProxyVisibility(splatIndex, true);
-	// The deterministic proxy-BVH ray result is the only self-cast authority.
-	// Never mix the rotating 2D LightDepth grid back into the final render.
-	// Current is already the persistent, frame-rate-independent CPU temporal EMA.
-	// Blending the retained GPU A/B pair here would filter it twice and add ghosting.
-	return currentVertexVisibility >= 0.0 ? saturate(currentVertexVisibility) : currentVertexVisibility;
+	// BVH remains the self-cast authority. The depth capture contains ONLY external
+	// meshes, so it cannot reintroduce receiver self-depth acne or overwrite proofs.
+	return currentVertexVisibility >= 0.0
+		? min(saturate(currentVertexVisibility), LoadExternalMeshCastVisibility(splatIndex))
+		: currentVertexVisibility;
 }
 
 // Check if a leaf cluster is visible using the visibility bitmap
@@ -3370,6 +3424,8 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		{
 			stableProxyVisibility = LoadStableProxyVisibility(splatIndex, true);
 			stableSmoothedRayVisibilityOnly = stableProxyVisibility >= 0.0 ? saturate(stableProxyVisibility) : 1.0;
+			if (stableFinalCastVisibilityDiagnostic)
+				stableProxyVisibility = LoadStableProxyHybridCastVisibility(splatIndex);
 		}
 		else
 		{

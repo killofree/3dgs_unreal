@@ -32,6 +32,8 @@
     static TAutoConsoleVariable<int32> PackedFog(TEXT("gs.PCVR.PackedFog"),0,
         TEXT("PCVR lean path: 0 RGBA16F reference, 1 RG16F depth/coverage, 2 R16F depth with identical raw color alpha as coverage."),ECVF_RenderThreadSafe);
 #define LOCTEXT_NAMESPACE "FLCCCinematicGSModule"
+static TAutoConsoleVariable<int32> CVarGSSampleComposite(TEXT("gs.MSAASampleComposite"), 1,
+    TEXT("Composite clear GS per MSAA sample before scene-color resolve. 0 retains the legacy resolved-depth path."), ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<int32> CVarPCInputCacheFix(TEXT("gs.PC.CacheFix"),1,
     TEXT("Keep exact geometry caching while refreshing colour-only effects without re-sorting. Mode 3 ignores unused lighting inputs. 0 reference, 1 enabled."),ECVF_RenderThreadSafe);
 
@@ -404,9 +406,16 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 
     FGSPCVRDrawCaptureScope DrawCaptureScope(GraphBuilder,*SceneView);
 	const int32 VRDiagnosticMode = FGaussianSplatRenderer::GetVRDiagnosticMode_RenderThread();
-    // The GS intermediate is single-sampled. PostOpaque supplies the MSAA TARGET,
-    // which cannot be attached as its DSV. Use UE's already-resolved scene depth.
-    if (DepthTexture && DepthTexture->Desc.NumSamples > 1)
+    const bool bSampleComposite = CVarGSSampleComposite.GetValueOnRenderThread() != 0 &&
+        ColorTexture->Desc.NumSamples > 1 && DepthTexture &&
+        DepthTexture->Desc.NumSamples == ColorTexture->Desc.NumSamples &&
+        VRDiagnosticMode == 0 && FGaussianSplatRenderer::GetStableShadowDebugMode() == 0 &&
+        FGaussianSplatRenderer::IsPCVRClearSurface_RenderThread() &&
+        CVarGSPanoramaGSCompositeMode.GetValueOnRenderThread() != 2 &&
+        Proxies[0]->GetLightingData().RelightDetailParams2.Z >= 0.5f;
+    // Legacy/specialized paths retain single-sample MRTs and resolved depth.
+    // The clear MSAA path keeps the original depth samples through blending.
+    if (!bSampleComposite && DepthTexture && DepthTexture->Desc.NumSamples > 1)
     {
         FRDGTexture* ResolvedDepth = Parameters.SceneTexturesUniformParams
             ? Parameters.SceneTexturesUniformParams->GetParameters()->SceneDepthTexture : nullptr;
@@ -461,11 +470,13 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 		PF_FloatRGBA,  // Need alpha channel for accumulation tracking
 		FClearValueBinding(FLinearColor::Transparent),
 		TexCreate_RenderTargetable | TexCreate_ShaderResource);
+	IntermediateDesc.NumSamples = bSampleComposite ? ColorTexture->Desc.NumSamples : 1;
 	FRDGTexture* IntermediateTexture = bReuseTargets ? Shared.Color : GraphBuilder.CreateTexture(IntermediateDesc, TEXT("GaussianSplatIntermediateRT"));
 	FRDGTextureDesc IntermediateDepthDesc = FRDGTextureDesc::Create2D(
 		ColorTexture->Desc.Extent, PF_R32_FLOAT,
 		FClearValueBinding(FLinearColor(HALF_WORLD_MAX, HALF_WORLD_MAX, HALF_WORLD_MAX, 1.0f)),
 		TexCreate_RenderTargetable | TexCreate_ShaderResource);
+	IntermediateDepthDesc.NumSamples = IntermediateDesc.NumSamples;
 	FRDGTexture* IntermediateDepthTexture = VRDiagnosticMode == 3 ? nullptr : (bReuseTargets ? Shared.Depth : GraphBuilder.CreateTexture(
 		IntermediateDepthDesc, TEXT("GaussianSplatIntermediateDepthRT")));
 
@@ -479,6 +490,7 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 			FogPackingMode==2 ? PF_R16F : (bPackedFog ? PF_G16R16F : PF_FloatRGBA),
 			FClearValueBinding(FLinearColor::Transparent),
 			TexCreate_RenderTargetable | TexCreate_ShaderResource);
+		IntermediateFogDepthDesc.NumSamples = IntermediateDesc.NumSamples;
 		IntermediateFogDepthTexture = bReuseTargets ? Shared.FogDepth : GraphBuilder.CreateTexture(
 			IntermediateFogDepthDesc, TEXT("GaussianSplatFogVisibleDepthRT"));
 	}
@@ -487,6 +499,7 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 		ColorTexture->Desc.Extent, PF_FloatRGBA,
 		FClearValueBinding(FLinearColor(0.5f, 0.5f, 1.0f, 0.0f)),
 		TexCreate_RenderTargetable | TexCreate_ShaderResource);
+	IntermediateNormalDesc.NumSamples = IntermediateDesc.NumSamples;
 	FRDGTexture* IntermediateNormalTexture = (VRDiagnosticMode >= 2 || bPCVRLeanOutputs) ? nullptr : (bReuseTargets ? Shared.Normal : GraphBuilder.CreateTexture(
 		IntermediateNormalDesc, TEXT("GaussianSplatStableNormalRT")));
 	// Snow-only occlusion depth. It is written by the normal GS pass with an
@@ -702,6 +715,13 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 		// 70 <-> 71 refresh the packed stable visibility channel without touching geometry or sort.
 		CurrentLightingHash = HashCombine(CurrentLightingHash,
 			GetTypeHash(FGaussianSplatRenderer::GetStableShadowDebugMode()));
+		// External casters can move while the camera and proxy BVH remain unchanged.
+		CurrentLightingHash = HashCombine(CurrentLightingHash,
+			GetTypeHash(FGaussianSplatRenderer::GetProxyLightDepthCaptureRevision_RenderThread()));
+		if (const IConsoleVariable* ExternalShadows = IConsoleManager::Get().FindConsoleVariable(TEXT("gs.ExternalMeshShadows")))
+		{
+			CurrentLightingHash = HashCombine(CurrentLightingHash, GetTypeHash(ExternalShadows->GetInt()));
+		}
 		uint32 CurrentProxySetHash = HashCombine(GetTypeHash(VRDiagnosticMode), GSPCVR::CacheKey(*SceneView)); // Changing alpha culling requires a fresh sort.
         if(GSPCVR::IsActive(*SceneView))
         {
@@ -1733,7 +1753,8 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 				CompositeLookParams0, CompositeLookParams1, CompositeLookParams2,
 				CompositeLookParams3, CompositeLookParams4,
 				CompositeBloomParams, CompositeColorBloomParams,
-				CompositeBloomTint, CompositeBloomSoftKnee, VRDiagnosticMode);
+				CompositeBloomTint, CompositeBloomSoftKnee, VRDiagnosticMode,
+                bSampleComposite ? ColorTexture : nullptr);
 }
 
 void FLCCCinematicGSModule::ShutdownModule()

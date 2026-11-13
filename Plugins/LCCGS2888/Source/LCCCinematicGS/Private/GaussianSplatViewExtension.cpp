@@ -372,7 +372,7 @@ void FGaussianSplatViewExtension::PrePostProcessPass_RenderThread(FRDGBuilder& G
 }
 
 void FGaussianSplatViewExtension::SetPendingComposite_RenderThread(
-	const FRDGBuilder* OwningGraphBuilder,
+	FRDGBuilder* OwningGraphBuilder,
 	const FSceneView* View,
 	FRDGTexture* IntermediateTexture,
 	FRDGTexture* IntermediateDepthTexture,
@@ -390,8 +390,63 @@ void FGaussianSplatViewExtension::SetPendingComposite_RenderThread(
 	const FVector4f& CompositeBloomParams,
 	const FVector4f& CompositeColorBloomParams,
 	const FVector4f& CompositeBloomTint,
-	float CompositeBloomSoftKnee, int32 VRDiagnosticMode)
+	float CompositeBloomSoftKnee, int32 VRDiagnosticMode, FRDGTexture* MSAAColorTarget)
 {
+	if (View && IntermediateTexture && MSAAColorTarget)
+	{
+        FRDGBuilder& GraphBuilder = *OwningGraphBuilder;
+        // Preserve each mesh depth/coverage sample until GS grade, alpha sealing
+        // and blending have completed. UE resolves the shared scene afterwards.
+        FRDGTextureDesc GradedDesc = IntermediateTexture->Desc;
+        FRDGTexture* Graded = GraphBuilder.CreateTexture(GradedDesc, TEXT("GaussianSplatMSAAGraded"));
+        auto* Grade = GraphBuilder.AllocParameters<FGaussianPostGradePassParameters>();
+        Grade->IntermediateTexture = IntermediateTexture;
+        Grade->IntermediateDepthTexture = IntermediateDepthTexture;
+        Grade->SnowIntermediateTexture = IntermediateTexture;
+        Grade->SnowIntermediateDepthTexture = IntermediateDepthTexture;
+        Grade->SnowOcclusionDepthTexture = IntermediateDepthTexture;
+        Grade->RenderTargets[0] = FRenderTargetBinding(Graded, ERenderTargetLoadAction::EClear);
+        GraphBuilder.AddPass(RDG_EVENT_NAME("GaussianSplat_MSAA_SampleGrade"), Grade, ERDGPassFlags::Raster,
+            [Grade, View, ViewRect, CompositeLookParams0, CompositeLookParams1,
+             CompositeLookParams2, CompositeLookParams3, CompositeLookParams4](FRHICommandListImmediate& RHICmdList)
+            {
+                FGaussianSplatRenderer::GradeToTexture(RHICmdList, *View,
+                    Grade->IntermediateTexture->GetRHI(), Grade->IntermediateDepthTexture->GetRHI(),
+                    nullptr, nullptr, nullptr, false, ViewRect, ViewRect,
+                    CompositeLookParams0, CompositeLookParams1, CompositeLookParams2,
+                    CompositeLookParams3, CompositeLookParams4);
+            });
+        auto* Blend = GraphBuilder.AllocParameters<FGaussianBloomCompositePassParameters>();
+        Blend->GradedTexture = Graded;
+        Blend->RawFogCoverageTexture = IntermediateTexture;
+        Blend->IntermediateDepthTexture = IntermediateDepthTexture;
+        Blend->IntermediateFogDepthTexture = IntermediateFogDepthTexture ? IntermediateFogDepthTexture : IntermediateDepthTexture;
+        Blend->BloomExtractTexture = Graded;
+        Blend->RenderTargets[0] = FRenderTargetBinding(MSAAColorTarget, ERenderTargetLoadAction::ELoad);
+        FVector4f Bloom = CompositeBloomParams;
+        FVector4f Tint = CompositeBloomTint;
+        if (CVarPCVRDisableAllBloom.GetValueOnRenderThread() != 0 && GSPCVR::IsActive(*View))
+        {
+            Bloom.X = 0.0f; Bloom.Y = 0.0f; Tint.W = 0.0f;
+        }
+        const uint32 Mode = uint32(FMath::Clamp(CVarGSPanoramaGSCompositeMode.GetValueOnRenderThread(), 0, 1));
+        GraphBuilder.AddPass(RDG_EVENT_NAME("GaussianSplat_MSAA_SampleComposite"), Blend, ERDGPassFlags::Raster,
+            [Blend, View, ViewRect, Bloom, CompositeColorBloomParams, Tint, CompositeBloomSoftKnee, Mode](FRHICommandListImmediate& RHICmdList)
+            {
+                FGaussianSplatRenderer::CompositeToSceneColor(RHICmdList, *View,
+                    Blend->GradedTexture->GetRHI(), Blend->RawFogCoverageTexture->GetRHI(),
+                    Blend->IntermediateDepthTexture->GetRHI(), Blend->IntermediateFogDepthTexture->GetRHI(),
+                    ViewRect, ViewRect, Bloom, CompositeColorBloomParams, Tint, CompositeBloomSoftKnee, Mode, 0.0f, nullptr);
+            });
+        PendingComposites.Remove(View);
+        static uint32 LastSamples = 0;
+        if (LastSamples != MSAAColorTarget->Desc.NumSamples)
+        {
+            LastSamples = MSAAColorTarget->Desc.NumSamples;
+            UE_LOG(LogTemp, Display, TEXT("[GSMSAAComposite] Active=1 Samples=%u PerSampleDepth=1 PerSampleAlpha=1 BeforeSceneResolve=1"), LastSamples);
+        }
+        return;
+	}
 	if (View && IntermediateTexture)
 	{
 		FPendingComposite& Pending = PendingComposites.FindOrAdd(View);

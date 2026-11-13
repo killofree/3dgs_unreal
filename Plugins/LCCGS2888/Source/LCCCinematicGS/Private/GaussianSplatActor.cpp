@@ -1107,6 +1107,14 @@ void AGaussianSplatActor::Tick(float DeltaSeconds)
 			CurrentLightDepthCasterHash, FCrc::MemCrc32(&CasterBounds.Min, sizeof(CasterBounds.Min)));
 		CurrentLightDepthCasterHash = HashCombine(
 			CurrentLightDepthCasterHash, FCrc::MemCrc32(&CasterBounds.Max, sizeof(CasterBounds.Max)));
+		TInlineComponentArray<UPrimitiveComponent*> CasterPrimitives(CasterActor);
+		for (const UPrimitiveComponent* Primitive : CasterPrimitives)
+		{
+			if (!IsValid(Primitive)) continue;
+			CurrentLightDepthCasterHash = HashCombine(CurrentLightDepthCasterHash, GetTypeHash(Primitive));
+			CurrentLightDepthCasterHash = HashCombine(CurrentLightDepthCasterHash,
+				GetTypeHash(Primitive->CastShadow && Primitive->IsVisible()));
+		}
 	}
 
 	const FTransform ReceiverTransform = ProxyShadowReceiverComponent->GetComponentTransform();
@@ -1129,6 +1137,21 @@ void AGaussianSplatActor::Tick(float DeltaSeconds)
 		!LastProxyLightDepthLightRotation.Equals(LightRotation, LightRotationToleranceDegrees);
 	const bool bLightDepthDirectionalChanged = LastProxyLightDepthDirectional.Get() != MainDirectional;
 	const bool bLightDepthCasterChanged = LastProxyLightDepthCasterHash != CurrentLightDepthCasterHash;
+	if (bLightDepthCasterChanged && ProxyLightDepthCapture)
+	{
+		// CastShadow may be toggled on a mesh without editing the GS actor's list.
+		ProxyLightDepthCapture->ShowOnlyComponents.Empty();
+		for (AActor* CasterActor : GaussianSplatComponent->ExternalShadowCasters)
+		{
+			if (!IsValid(CasterActor) || CasterActor == this || CasterActor->GetWorld() != GetWorld()) continue;
+			TInlineComponentArray<UPrimitiveComponent*> Primitives(CasterActor);
+			for (UPrimitiveComponent* Primitive : Primitives)
+			{
+				if (IsValid(Primitive) && Primitive->IsRegistered() && Primitive->CastShadow && Primitive->IsVisible())
+					ProxyLightDepthCapture->ShowOnlyComponent(Primitive);
+			}
+		}
+	}
 	const bool bLightDepthStateChanged =
 		!bHasProxyLightDepthState ||
 		bLightDepthReceiverTransformChanged || bLightDepthReceiverMinChanged ||
@@ -1463,6 +1486,7 @@ void AGaussianSplatActor::Tick(float DeltaSeconds)
 		GaussianSplatComponent->ProxyWetDarkening,
 		GaussianSplatComponent->ProxyPuddleAmount);
 	const uint32 LightDepthCaptureRevisionForRender = ProxyLightDepthCaptureRevision;
+	const uint32 ExternalCasterCountForRender = ProxyLightDepthCapture->ShowOnlyComponents.Num();
 	ENQUEUE_RENDER_COMMAND(UpdateGaussianProxyShadowCaptures)(
 		[LightDepthTexture, ReceiverLightDepthTexture, SurfaceDepthTexture,
 		 SurfaceEffectSettings0, SurfaceEffectSettings1, SurfaceEffectSettings2, CaptureSettings,
@@ -1478,7 +1502,7 @@ void AGaussianSplatActor::Tick(float DeltaSeconds)
 	 ProxyLightingMatchStrength = UnifiedClosureStrength,
 	 ShadowSaturation = GaussianSplatComponent->CapturedShadowBounceStrength,
 	 ReflectedLightSettings, ReflectedColorSettings, FinalCompositeSettings, FinalCompositeTint, VolumetricShaftSettings, VolumetricShaftTint,
-	 LightDepthCaptureRevisionForRender,
+	 LightDepthCaptureRevisionForRender, ExternalCasterCountForRender,
     bEnableShadowLighting = true](FRHICommandListImmediate&)
 		{
 			FGaussianSplatRenderer::SetProxyShadowCaptureSettings(CaptureSettings);
@@ -1503,7 +1527,7 @@ void AGaussianSplatActor::Tick(float DeltaSeconds)
 				CaptureProjectionUp, CaptureProjectionFOV, CaptureProjectionAspect);
 			FGaussianSplatRenderer::SetProxyLightDepthCapture(
 				LightDepthTexture, ReceiverLightDepthTexture, LightCaptureOrigin, LightCaptureForward, LightCaptureRight, LightCaptureUp, LightDepthSettings,
-				LightDepthCaptureRevisionForRender);
+				LightDepthCaptureRevisionForRender, ExternalCasterCountForRender);
 		});
 }
 
