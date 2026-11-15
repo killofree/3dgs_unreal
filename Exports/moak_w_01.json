@@ -1,0 +1,21 @@
+{
+  "source": "D:\\unreal\\3dgs\\Content\\ply\\moak\\moak_w_01.uasset",
+  "output": "D:\\unreal\\3dgs\\Exports\\moak_w_01.ply",
+  "vertices": 5296354,
+  "bytes": 1313497405,
+  "source_bounds_cm": [
+    [
+      -46589.8515625,
+      -47038.109375,
+      -51282.91015625
+    ],
+    [
+      43046.07421875,
+      62007.26171875,
+      4231.25146484375
+    ]
+  ],
+  "round_trip_samples": 6,
+  "elapsed_seconds": 34.3,
+  "note": "All asset points exported; SH/color opacity limited to imported float16 precision. Alpha endpoints clamped to 1e-7 for finite logits."
+}

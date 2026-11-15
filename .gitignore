@@ -15,3 +15,6 @@
 *.exp
 *.ilk
 __pycache__/
+
+# Local inspection and one-off editor scripts.
+/Tools/

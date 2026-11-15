@@ -1,0 +1,33 @@
+{
+  "source": "D:\\unreal\\3dgs\\Content\\ply\\moak\\moak_w_02.uasset",
+  "source_splats": 5215056,
+  "surface_points": 4895076,
+  "voxel_cm": 25.0,
+  "vertices": 88160,
+  "triangles": 180000,
+  "initial_triangles": 1515088,
+  "local_bounds_cm": [
+    [
+      -4330.975952348862,
+      -3370.5811878628697,
+      -757.1367993751452
+    ],
+    [
+      12150.349712825056,
+      2346.535764334272,
+      2741.207032413987
+    ]
+  ],
+  "distance_to_vertex_cm_quantiles": [
+    45.49666052879925,
+    74.01589988681239,
+    101.60723736976425,
+    503.0874946075045
+  ],
+  "coverage_within_100cm": 0.9489708867338034,
+  "method": "opacity-filtered dense voxel surface, closing, connected-island cleanup, smoothed isosurface, quadric simplification",
+  "usage": "shadow receiver; no player collision generated",
+  "coordinates": "UE local centimeters; import without axis or scale conversion",
+  "obj": "D:\\unreal\\3dgs\\Exports\\Mai02_Proxy\\SM_Mai02_ShadowSurface.obj",
+  "seconds": 6.39
+}
