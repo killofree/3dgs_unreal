@@ -16,6 +16,11 @@
 #include "GaussianSplatAssetTypeActions.h"
 #include "Editor.h"
 #include "GSPreviewRecorderSettings.h"
+#include "Widgets/Input/SComboButton.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "HAL/IConsoleManager.h"
+#include "Misc/ConfigCacheIni.h"
+#include "Misc/Paths.h"
 
 TSharedRef<IDetailCustomization> FGaussianSplatDetails::MakeInstance()
 {
@@ -174,6 +179,65 @@ void FGaussianSplatDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBuilder
 		}
 		return nullptr;
 	};
+
+    // This is a renderer-wide setting, not a per-component override. Keep the
+    // shared ownership visible and persist only this project's console variable.
+    // Switching profiles does not modify serialized actor or asset properties.
+    DetailBuilder.EditCategory(TEXT("01 기본 설정"))
+        .AddCustomRow(FText::FromString(TEXT("렌더링 모드 SuperSplat 슈퍼스플랫")))
+        .NameContent()
+        [ SNew(STextBlock).Text(FText::FromString(TEXT("렌더링 모드 (전체 3DGS)"))) ]
+        .ValueContent().MinDesiredWidth(250.0f)
+        [
+            SNew(SComboButton)
+            .ToolTipText(FText::FromString(TEXT("전체 3DGS 공통 설정입니다. 선택 즉시 적용하고 프로젝트 기본값으로 저장합니다. 원본 모드는 플러그인 재조명·날씨·후처리를 우회합니다.")))
+            .ButtonContent()
+            [
+                SNew(STextBlock).Text_Lambda([]()
+                {
+                    const IConsoleVariable* Mode = IConsoleManager::Get().FindConsoleVariable(TEXT("gs.SuperSplatCompare"));
+                    const int32 Value = Mode ? Mode->GetInt() : 0;
+                    return FText::FromString(Value >= 2 ? TEXT("슈퍼스플랫 원본") :
+                        Value == 1 ? TEXT("알파 보강 해제") : TEXT("기존 렌더링"));
+                })
+            ]
+            .OnGetMenuContent_Lambda([]() -> TSharedRef<SWidget>
+            {
+                FMenuBuilder Menu(true, nullptr);
+                const TCHAR* Labels[] = { TEXT("기존 렌더링"), TEXT("알파 보강 해제"), TEXT("슈퍼스플랫 원본") };
+                const TCHAR* Tips[] = {
+                    TEXT("플러그인 조명·그림자·날씨·색상 효과를 적용합니다."),
+                    TEXT("누적 알파 보강만 해제합니다. 나머지 효과는 유지합니다."),
+                    TEXT("원본 SH 색상·불투명도로 렌더링하고 언리얼 톤매핑 뒤에 합성합니다. 추가 조명·날씨·색상 효과는 우회합니다.") };
+                for (int32 Index = 0; Index < 3; ++Index)
+                {
+                    Menu.AddMenuEntry(FText::FromString(Labels[Index]), FText::FromString(Tips[Index]), FSlateIcon(),
+                        FUIAction(FExecuteAction::CreateLambda([Index]()
+                        {
+                            if (IConsoleVariable* Mode = IConsoleManager::Get().FindConsoleVariable(TEXT("gs.SuperSplatCompare")))
+                            {
+                                Mode->Set(Index, ECVF_SetByConsole);
+                                const FString ConfigFile = FPaths::ConvertRelativePathToFull(FPaths::ProjectConfigDir() / TEXT("DefaultEngine.ini"));
+                                FConfigFile ModeConfig;
+                                ModeConfig.Read(ConfigFile);
+                                if (ModeConfig.Num() > 0)
+                                {
+                                    ModeConfig.SetString(TEXT("ConsoleVariables"), TEXT("gs.SuperSplatCompare"), *FString::FromInt(Index));
+                                    if (!ModeConfig.Write(ConfigFile))
+                                        UE_LOG(LogTemp, Warning, TEXT("GS rendering mode applied, but could not save %s"), *ConfigFile);
+                                }
+                                else UE_LOG(LogTemp, Warning, TEXT("GS rendering mode applied, but could not read %s"), *ConfigFile);
+                                if (GEditor) GEditor->RedrawAllViewports();
+                            }
+                        }), FCanExecuteAction(), FIsActionChecked::CreateLambda([Index]()
+                        {
+                            const IConsoleVariable* Mode = IConsoleManager::Get().FindConsoleVariable(TEXT("gs.SuperSplatCompare"));
+                            return Mode && Mode->GetInt() == Index;
+                        })), NAME_None, EUserInterfaceActionType::RadioButton);
+                }
+                return Menu.MakeWidget();
+            })
+        ];
 
     // Actor and embedded component both use this customization. Emit the action
     // only for the direct actor layout, or it appears twice in the same Details view.

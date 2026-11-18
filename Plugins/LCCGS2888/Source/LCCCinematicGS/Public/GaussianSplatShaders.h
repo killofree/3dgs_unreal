@@ -25,6 +25,7 @@ class FGaussianSplatCalcViewDataCS : public FGlobalShader
 	using FPermutationDomain = TShaderPermutationDomain<FVRBaseline>;
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(uint32, SourceReferenceMode)
 		SHADER_PARAMETER_SRV(ByteAddressBuffer, PackedSplatBuffer)  // 16 bytes/splat packed data
 		SHADER_PARAMETER_SRV(ByteAddressBuffer, Float32PositionBuffer) // tightly packed float3 (12 bytes/splat)
 		SHADER_PARAMETER(uint32, UseFloat32Position)
@@ -419,6 +420,7 @@ class FGaussianSplatVS : public FGlobalShader
     using FPermutationDomain = TShaderPermutationDomain<FVRBaseline,FVRRasterClip,FPCVRColorCache>;
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(uint32, SourceReferenceMode)
 		SHADER_PARAMETER_SRV(StructuredBuffer<FGaussianSplatViewData>, ViewDataBuffer)
         SHADER_PARAMETER_SRV(StructuredBuffer<float4>, PCVRFinalColors)
 		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, SortKeysBuffer)
@@ -513,6 +515,7 @@ class FGaussianSplatPS : public FGlobalShader
     using FPermutationDomain = TShaderPermutationDomain<FVRDiagnosticMode,FPCVRLeanOutputs,FPCVRFinalOnly,FPCVRColorCache,FPCVRNoRemoval,FPCVRNoFogOutput>;
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(uint32, SourceReferenceMode)
 		SHADER_PARAMETER(uint32, PerSplatLightingEnabled)
         SHADER_PARAMETER(uint32, PCVRReuseRadialDepth)
         SHADER_PARAMETER(uint32, PCVREarlyAlphaEnabled)
@@ -677,6 +680,7 @@ class FGaussianSplatCompositePS : public FGlobalShader
 	using FPermutationDomain = TShaderPermutationDomain<FMSAAComposite>;
 
     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(uint32, SourceReferenceMode)
         SHADER_PARAMETER_TEXTURE(Texture2D, IntermediateTexture)
         SHADER_PARAMETER_TEXTURE(Texture2D, IntermediateDepthTexture)
 		SHADER_PARAMETER_TEXTURE(Texture2D, SnowIntermediateTexture)
@@ -743,6 +747,7 @@ class FGaussianSplatBloomCompositePS : public FGlobalShader
  class FMSAAComposite:SHADER_PERMUTATION_BOOL("GS_MSAA_COMPOSITE");
  using FPermutationDomain=TShaderPermutationDomain<FExtractCache,FMSAAComposite>;
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(uint32, SourceReferenceMode)
 		
 		SHADER_PARAMETER_TEXTURE(Texture2D, IntermediateTexture)
         SHADER_PARAMETER_TEXTURE(Texture2D, PCVRBloomExtractTexture)

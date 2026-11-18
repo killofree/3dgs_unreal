@@ -2474,14 +2474,14 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	#if !GS_VR_BASELINE
 	// Proof mode: avoid changing the root component visibility because the
 	// child puddle render component is attached beneath it. Works for LOD too.
-	if (PuddleHideMainSource != 0u)
+	if (SourceReferenceMode < 2u && PuddleHideMainSource != 0u)
 	{
 		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
 		return;
 	}
 	// Editor proof: the real source is skipped; the separate world-anchored
 	// Snow Gaussian asset stays visible. Do not touch any other weather path.
-	if (SnowCoveragePackedCount > 0u && DirectSplatSurfaceEffectParams0.x > 1.5 &&
+	if (SourceReferenceMode < 2u && SnowCoveragePackedCount > 0u && DirectSplatSurfaceEffectParams0.x > 1.5 &&
 		DirectSnowTuningParams.w >= 1.0 && DirectSplatSurfaceEffectParams2.z > 2.5)
 	{
 		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
@@ -2499,7 +2499,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	float4 rotation = splat.Rotation;
 	// Precision Foundation 2 showed no meaningful visual gain from the 8-byte FP16 scale side buffer.
 	// Keep the compact legacy UInt8 log scale to recover memory and bandwidth.
-	float3 scale = splat.Scale * SplatScale;
+	float3 scale = splat.Scale * (SourceReferenceMode >= 2u ? 1.0 : SplatScale);
 	float4 colorOpacity = splat.ColorOpacity;
 	if (UseHighPrecisionColorOpacity != 0u)
 	{
@@ -2507,7 +2507,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		// preserves Float16 base color and opacity without allocating another buffer.
 		colorOpacity = LoadHighPrecisionColorOpacity(splatIndex);
 	}
-	float opacity = saturate(colorOpacity.a) * OpacityScale;
+	float opacity = saturate(colorOpacity.a) * (SourceReferenceMode >= 2u ? 1.0 : OpacityScale);
 #if GS_VR_BASELINE
     // Half-packed alpha is what the raster stage actually uses.
     if (UnpackHalf2x16(PackHalf2x16(float2(0, opacity))).y < (1.0 / 255.0))
@@ -2563,6 +2563,20 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	float3x3 viewMat = (float3x3)WorldToView;
 	float2x2 cov2D = CalcCovariance2D(cov3D_world, viewMat, viewPos.xyz, FocalLength);
 
+    // Screenshot-matched SuperSplat reference: minPixelSize=2, depth sort.
+    // This is a projected-footprint cull, NOT SplatScale=2. The standard
+    // 0.3 pixel^2 covariance filter is already included, as in its cull path.
+    if (SourceReferenceMode >= 2u)
+    {
+        const float Mid = 0.5 * (cov2D[0][0] + cov2D[1][1]);
+        const float Radius = length(float2(0.5 * (cov2D[0][0] - cov2D[1][1]), cov2D[0][1]));
+        const float ProjectedSize = 2.0 * sqrt(2.0 * max(Mid + Radius, 0.0));
+        if (ProjectedSize < 2.0)
+        {
+            WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
+            return;
+        }
+    }
 	// Production path: use the original projected covariance footprint.
 	float2 axis1, axis2;
 	DecomposeCovariance2D(cov2D, axis1, axis2);
@@ -2625,6 +2639,24 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	{
 		decodedSrgb = max(colorOpacity.rgb, 0.0);
 	}
+
+    // Return before scene-specific sky removal, season, relighting, contact
+    // repairs, fog and weather. Source precision and mesh/MSAA depth stay intact.
+    if (SourceReferenceMode >= 2u)
+    {
+        FGaussianSplatViewData Reference = (FGaussianSplatViewData)0;
+        Reference.ClipPosition = clipPos;
+        Reference.TranslatedWorldPos = translatedWorldPos;
+        // SuperSplat's default display path alpha-blends trained display RGB.
+        // Decode once after accumulation when crossing back into UE SceneColor.
+        Reference.PackedColorRG = PackHalf2x16(decodedSrgb.rg);
+        Reference.PackedColorBA = PackHalf2x16(float2(decodedSrgb.b, saturate(colorOpacity.a)));
+        Reference.Axis1 = axis1;
+        Reference.Axis2 = axis2;
+        Reference.ClusterID = selectedClusterID;
+        ViewDataBuffer[outputIndex] = Reference;
+        return;
+    }
 	if (OriginalSplatCount == 4791498u || SplatCount == 4791498u)
 	{
 		// Mai scan repair: reject broad sky reconstruction outliers, while

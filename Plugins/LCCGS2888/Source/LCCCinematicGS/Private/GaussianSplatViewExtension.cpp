@@ -392,7 +392,43 @@ void FGaussianSplatViewExtension::SetPendingComposite_RenderThread(
 	const FVector4f& CompositeBloomTint,
 	float CompositeBloomSoftKnee, int32 VRDiagnosticMode, FRDGTexture* MSAAColorTarget)
 {
-	if (View && IntermediateTexture && MSAAColorTarget)
+    const bool bSourceReference = FGaussianSplatRenderer::GetSuperSplatCompareMode_RenderThread() >= 2;
+    if (bSourceReference && View && IntermediateTexture && IntermediateTexture->Desc.NumSamples > 1)
+    {
+        FRDGBuilder& GraphBuilder = *OwningGraphBuilder;
+        // GS rasterization has already tested each original mesh depth sample.
+        // Resolve only its premultiplied display color; do not run UE tone mapping on it.
+        FRDGTextureDesc GradedDesc = IntermediateTexture->Desc;
+        FRDGTexture* Graded = GraphBuilder.CreateTexture(GradedDesc, TEXT("GaussianSplatReferenceMSAA"));
+        FRDGTextureDesc ResolvedDesc = GradedDesc;
+        ResolvedDesc.NumSamples = 1;
+        // D3D12 forbids combining RenderTargetable and ResolveTargetable.
+        // Build the resolve descriptor explicitly instead of inheriting RT flags.
+        ResolvedDesc.Flags = TexCreate_ResolveTargetable | TexCreate_ShaderResource;
+        FRDGTexture* Resolved = GraphBuilder.CreateTexture(ResolvedDesc, TEXT("GaussianSplatReferenceResolved"));
+        auto* Grade = GraphBuilder.AllocParameters<FGaussianPostGradePassParameters>();
+        Grade->IntermediateTexture = IntermediateTexture;
+        Grade->IntermediateDepthTexture = IntermediateDepthTexture;
+        Grade->SnowIntermediateTexture = IntermediateTexture;
+        Grade->SnowIntermediateDepthTexture = IntermediateDepthTexture;
+        Grade->SnowOcclusionDepthTexture = IntermediateDepthTexture;
+        Grade->RenderTargets[0] = FRenderTargetBinding(Graded, Resolved, ERenderTargetLoadAction::EClear);
+        GraphBuilder.AddPass(RDG_EVENT_NAME("GaussianSplat_ReferenceSampleResolve"), Grade, ERDGPassFlags::Raster,
+            [Grade, View, ViewRect, CompositeLookParams0, CompositeLookParams1,
+             CompositeLookParams2, CompositeLookParams3, CompositeLookParams4](FRHICommandListImmediate& RHICmdList)
+            {
+                FGaussianSplatRenderer::GradeToTexture(RHICmdList, *View,
+                    Grade->IntermediateTexture->GetRHI(), Grade->IntermediateDepthTexture->GetRHI(),
+                    nullptr, nullptr, nullptr, false, ViewRect, ViewRect,
+                    CompositeLookParams0, CompositeLookParams1, CompositeLookParams2,
+                    CompositeLookParams3, CompositeLookParams4);
+            });
+        IntermediateTexture = Resolved;
+        IntermediateDepthTexture = Resolved;
+        IntermediateNormalTexture = Resolved;
+        IntermediateFogDepthTexture = Resolved;
+    }
+	if (!bSourceReference && View && IntermediateTexture && MSAAColorTarget)
 	{
         FRDGBuilder& GraphBuilder = *OwningGraphBuilder;
         // Preserve each mesh depth/coverage sample until GS grade, alpha sealing
@@ -470,11 +506,11 @@ void FGaussianSplatViewExtension::SetPendingComposite_RenderThread(
 		Pending.CompositeColorBloomParams = CompositeColorBloomParams;
 		Pending.CompositeBloomTint = CompositeBloomTint;
 		Pending.CompositeBloomSoftKnee = CompositeBloomSoftKnee;
-		const int32 RequestedMode = FMath::Clamp(CVarGSPanoramaGSCompositeMode.GetValueOnRenderThread(), 0, 2);
+		const int32 RequestedMode = bSourceReference ? 2 : FMath::Clamp(CVarGSPanoramaGSCompositeMode.GetValueOnRenderThread(), 0, 2);
 		// Rain/snow Niagara can composite after DOF. Do not reorder those particles:
 		// opt-in isolation is suspended and all original weather behavior is retained.
 		Pending.PanoramaGSCompositeMode =
-			(RequestedMode == 2 && GGaussianRainNiagaraCompositeVisible.Load())
+			(!bSourceReference && RequestedMode == 2 && GGaussianRainNiagaraCompositeVisible.Load())
 				? 0u : static_cast<uint32>(RequestedMode);
 		Pending.bAfterTonemap = (Pending.PanoramaGSCompositeMode == 2u);
 	}
@@ -489,11 +525,12 @@ void FGaussianSplatViewExtension::SubscribeToPostProcessingPass(EPostProcessingP
 	// Original pass selection remains byte-for-byte equivalent in mode 0 and 1.
 	const bool bWeatherNiagaraVisible = GGaussianRainNiagaraCompositeVisible.Load();
 	const bool bIsolated =
-		CVarGSPanoramaGSCompositeMode.GetValueOnAnyThread() == 2 && !bWeatherNiagaraVisible;
+		(FGaussianSplatRenderer::GetSuperSplatCompareMode_RenderThread() >= 2) ||
+		(CVarGSPanoramaGSCompositeMode.GetValueOnAnyThread() == 2 && !bWeatherNiagaraVisible);
 	const EPostProcessingPass TargetPass = bIsolated
 		? EPostProcessingPass::Tonemap
 		: (bWeatherNiagaraVisible ? EPostProcessingPass::AfterDOF : EPostProcessingPass::MotionBlur);
-	if (Pass == TargetPass && (!bIsolated || bIsPassEnabled))
+	if (Pass == TargetPass)
 	{
 		InOutPassCallbacks.Add(FPostProcessingPassDelegate::CreateRaw(
 			this, bIsolated
@@ -565,6 +602,26 @@ FScreenPassTexture FGaussianSplatViewExtension::CompositePending_RenderThread(
 		AddDrawTexturePass(GraphBuilder, View, SceneColor, Output);
 	}
 
+    if (FGaussianSplatRenderer::GetSuperSplatCompareMode_RenderThread() >= 2)
+    {
+        auto* Blend = GraphBuilder.AllocParameters<FGaussianBloomCompositePassParameters>();
+        Blend->GradedTexture = Pending.IntermediateTexture;
+        Blend->RawFogCoverageTexture = Pending.IntermediateTexture;
+        Blend->IntermediateDepthTexture = Pending.IntermediateTexture;
+        Blend->IntermediateFogDepthTexture = Pending.IntermediateTexture;
+        Blend->BloomExtractTexture = Pending.IntermediateTexture;
+        Blend->RenderTargets[0] = FRenderTargetBinding(Output.Texture, ERenderTargetLoadAction::ELoad);
+        GraphBuilder.AddPass(RDG_EVENT_NAME("GaussianSplat_SourceDisplayComposite"), Blend, ERDGPassFlags::Raster,
+            [Blend, &View, SourceRect=Pending.ViewRect, OutputRect=Output.ViewRect](FRHICommandListImmediate& RHICmdList)
+            {
+                FGaussianSplatRenderer::CompositeToSceneColor(RHICmdList, View,
+                    Blend->GradedTexture->GetRHI(), Blend->RawFogCoverageTexture->GetRHI(),
+                    Blend->IntermediateDepthTexture->GetRHI(), Blend->IntermediateFogDepthTexture->GetRHI(),
+                    SourceRect, OutputRect, FVector4f(0,0,0,0), FVector4f(0,0,0,0),
+                    FVector4f(0,0,0,0), 0.0f, 2u, 0.0f, nullptr);
+            });
+        return FScreenPassTexture(Output.Texture, Output.ViewRect);
+    }
     const auto* AblationVar=IConsoleManager::Get().FindTConsoleVariableDataInt(TEXT("gs.PCVR.Ablation"));
     const int32 Ablation=AblationVar?AblationVar->GetValueOnRenderThread():0;
     if (Pending.VRDiagnosticMode >= 2 || Ablation==3 || Ablation==4)

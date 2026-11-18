@@ -1,4 +1,5 @@
 #include "PCVRTileRenderer.h"
+#include "GaussianSplatRenderer.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "GaussianGlobalAccumulator.h"
@@ -273,6 +274,7 @@ public:
 };
 
 bool DrawPCVRTileComposite(FRHICommandListImmediate& Cmd,const FSceneView& View,FGaussianGlobalAccumulator* A,FRHITexture* SceneDepth,int32 Quality,bool bTrim,FBufferRHIRef& RasterArgs) {
+ if(FGaussianSplatRenderer::GetSuperSplatCompareMode_RenderThread()!=0)return false;
  // The tiled compute resolve has no per-sample coverage output. Retain the
  // raster path whenever the destination still owns MSAA depth samples.
  if(SceneDepth && SceneDepth->GetDesc().NumSamples>1)return false;

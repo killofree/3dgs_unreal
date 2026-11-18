@@ -31,6 +31,17 @@ FVertexOutput MainVS(
 	// Get sorted splat index
 	uint splatIndex = SortKeysBuffer[InstanceId];
 	FGaussianSplatViewData viewData = ViewDataBuffer[splatIndex];
+    if (SourceReferenceMode >= 2u)
+    {
+        if (viewData.ClipPosition.w <= 0.0) { Output.Position = float4(0,0,0,1); return Output; }
+        Output.Color = float4(UnpackHalf2x16(viewData.PackedColorRG), UnpackHalf2x16(viewData.PackedColorBA));
+        const float2 Offset = corner.x * viewData.Axis1 + corner.y * viewData.Axis2;
+        Output.Position = float4(viewData.ClipPosition.xy + Offset * viewData.ClipPosition.w, viewData.ClipPosition.zw);
+        Output.LocalPos = corner;
+        Output.TranslatedWorldPos = float4(viewData.TranslatedWorldPos, length(viewData.TranslatedWorldPos));
+        return Output;
+    }
+
 
 #if GS_VR_BASELINE
     // Keep trained SH colour and projection; strip all weather payload unpacking.
@@ -1710,6 +1721,26 @@ float3 PuddlePixelWorldPosition(float4 ScreenPosition, float3 WorldCenter, float
 #if GS_VR_DIAGNOSTIC_MODE > 0
 FMainPixelOutput MainPS(FVertexOutput Input)
 {
+    if (SourceReferenceMode >= 2u)
+    {
+        const float R2 = dot(Input.LocalPos, Input.LocalPos);
+        if (R2 > 1.0) discard;
+        const float Edge = exp(-4.0);
+        const float Alpha = saturate(Input.Color.a * (exp(-4.0 * R2) - Edge) / (1.0 - Edge));
+        if (Alpha < (1.0 / 255.0)) discard;
+        FMainPixelOutput Reference = (FMainPixelOutput)0;
+        Reference.Color = float4(Input.Color.rgb * Alpha, Alpha);
+#if GS_VR_DIAGNOSTIC_MODE != 3
+        Reference.Depth = length(Input.TranslatedWorldPos.xyz);
+#endif
+#if GS_VR_DIAGNOSTIC_MODE < 2
+        Reference.Normal = float4(0.5, 0.5, 1.0, 0.0);
+        Reference.SnowOcclusionDepth = 1.0e30;
+        Reference.FogDepthAccum = float4(Reference.Depth * 0.01 * Alpha, 0, 0, Alpha);
+#endif
+        return Reference;
+    }
+
     // Same removal, support, quality falloff and alpha cutoff as production.
     // ViewData/SH/projection/opacity and LOD are deliberately not replaced.
     if (IsInsideAnyGSRemovalBox(Input.Position, Input.TranslatedWorldPos.xyz)) discard;
@@ -1739,6 +1770,26 @@ FMainPixelOutput MainPS(FVertexOutput Input)
 #else
 FMainPixelOutput MainPS(FVertexOutput Input)
 {
+    if (SourceReferenceMode >= 2u)
+    {
+        const float R2 = dot(Input.LocalPos, Input.LocalPos);
+        if (R2 > 1.0) discard;
+        const float Edge = exp(-4.0);
+        const float Alpha = saturate(Input.Color.a * (exp(-4.0 * R2) - Edge) / (1.0 - Edge));
+        if (Alpha < (1.0 / 255.0)) discard;
+        FMainPixelOutput Reference = (FMainPixelOutput)0;
+        Reference.Color = float4(Input.Color.rgb * Alpha, Alpha);
+#if GS_VR_DIAGNOSTIC_MODE != 3
+        Reference.Depth = length(Input.TranslatedWorldPos.xyz);
+#endif
+#if GS_VR_DIAGNOSTIC_MODE < 2
+        Reference.Normal = float4(0.5, 0.5, 1.0, 0.0);
+        Reference.SnowOcclusionDepth = 1.0e30;
+        Reference.FogDepthAccum = float4(Reference.Depth * 0.01 * Alpha, 0, 0, Alpha);
+#endif
+        return Reference;
+    }
+
     if (IsInsideAnyGSRemovalBox(Input.Position, Input.TranslatedWorldPos.xyz)) discard;
     // V15-A: reject only provably invisible ordinary source pixels BEFORE
     // the expensive stable-shadow / per-pixel lighting equations. Diagnostic

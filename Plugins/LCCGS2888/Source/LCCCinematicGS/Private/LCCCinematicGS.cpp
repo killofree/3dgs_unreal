@@ -592,7 +592,7 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 			Info.Proxy = Proxy;
 			Info.LocalToWorld = Proxy->GetLocalToWorld();
 			Info.GlobalBaseOffset = 0;  // Will be computed after sorting
-			Info.bUseLODRendering = GPUResources->bEnableNanite && GPUResources->bHasLODSplats && (!Proxy->ShouldDisableLODInReference() || FParse::Param(FCommandLine::Get(),TEXT("GSPCVRLODTest")));
+			Info.bUseLODRendering = FGaussianSplatRenderer::GetSuperSplatCompareMode_RenderThread() < 2 && GPUResources->bEnableNanite && GPUResources->bHasLODSplats && (!Proxy->ShouldDisableLODInReference() || FParse::Param(FCommandLine::Get(),TEXT("GSPCVRLODTest")));
 			Info.DistanceToCamera = FVector::Dist(Bounds.Origin, CameraLocation);
 			bForceFullSortRequested |= Proxy->ShouldForceFullSortEveryFrame();
 			// Receiving Unreal lighting does not change splat depth order. Lighting-only
@@ -722,7 +722,8 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 		{
 			CurrentLightingHash = HashCombine(CurrentLightingHash, GetTypeHash(ExternalShadows->GetInt()));
 		}
-		uint32 CurrentProxySetHash = HashCombine(GetTypeHash(VRDiagnosticMode), GSPCVR::CacheKey(*SceneView)); // Changing alpha culling requires a fresh sort.
+		uint32 CurrentProxySetHash = HashCombine(GetTypeHash(VRDiagnosticMode), GSPCVR::CacheKey(*SceneView));
+        CurrentProxySetHash = HashCombine(CurrentProxySetHash, GetTypeHash(FGaussianSplatRenderer::GetSuperSplatCompareMode_RenderThread())); // Changing alpha culling requires a fresh sort.
         if(GSPCVR::IsActive(*SceneView))
         {
             CurrentProxySetHash=HashCombine(CurrentProxySetHash,GetTypeHash(Parameters.ViewportRect.Min));

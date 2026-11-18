@@ -2,6 +2,8 @@
 
 #pragma once
 
+uint SourceReferenceMode; // gs.SuperSplatCompare, explicit per-stage binding
+
 // Constants
 #define SPLATS_PER_CHUNK 256
 #define COLOR_TEXTURE_WIDTH 2048

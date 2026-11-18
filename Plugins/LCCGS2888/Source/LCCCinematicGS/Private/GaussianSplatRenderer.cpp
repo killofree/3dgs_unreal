@@ -102,6 +102,24 @@ void GSPreviewPassCounters::SnapshotRaster(uint64 OutMetrics[RasterEyeCount][Ras
 #include "SceneView.h"
 #include "StereoRendering.h"
 #include "SceneRendering.h"
+
+static TAutoConsoleVariable<int32> CVarGSSuperSplatCompare(
+    TEXT("gs.SuperSplatCompare"), 0,
+    TEXT("Temporary comparison: 0 production, 1 disable accumulated alpha seal only, 2 trained SH source with no plugin effects/LOD (UE tonemapping and mesh/MSAA coverage retained)."),
+    ECVF_RenderThreadSafe);
+int32 FGaussianSplatRenderer::GetSuperSplatCompareMode_RenderThread()
+{
+    const int32 Mode = FMath::Clamp(CVarGSSuperSplatCompare.GetValueOnRenderThread(), 0, 2);
+    static int32 LastMode = -1;
+    if (Mode != LastMode)
+    {
+        UE_LOG(LogTemp, Display, TEXT("[GSSuperSplatCompare] Mode=%d UEPost=Retained MSAA=Unchanged Seal=%s PluginEffects=%s"),
+            Mode, Mode == 0 ? TEXT("Production") : TEXT("Off"), Mode >= 2 ? TEXT("Bypassed") : TEXT("Production"));
+        LastMode = Mode;
+    }
+    return Mode;
+}
+
 #include "SceneManagement.h"
 #include "RenderCore.h"
 #include "CommonRenderResources.h"
@@ -1374,6 +1392,7 @@ void FGaussianSplatRenderer::DispatchCalcViewData(
 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->ViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
 
 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
+	Parameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
 	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
 	Parameters.Float32PositionBuffer = GPUResources->Float32PositionBufferSRV;
 	Parameters.UseFloat32Position = GPUResources->ShouldUseFloat32Positions() ? 1u : 0u;
@@ -1854,6 +1873,7 @@ void FGaussianSplatRenderer::DrawSplats(
 
 	// Set vertex shader parameters
 	FGaussianSplatVS::FParameters VSParameters{};
+	VSParameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
 	VSParameters.PerSplatLightingEnabled = 0;
     VSParameters.PCVRReuseRadialDepth = CVarPCVRReuseRadialDepth.GetValueOnRenderThread()!=0 ? 1u : 0u;
 	VSParameters.BaselineRenderQualityMode = 0;
@@ -1870,6 +1890,7 @@ void FGaussianSplatRenderer::DrawSplats(
 
 	// Pixel shader parameters
 	FGaussianSplatPS::FParameters PSParameters;
+	PSParameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
 	PSParameters.PerSplatLightingEnabled = 0;
     PSParameters.PCVREarlyAlphaEnabled = CVarGSPCVREarlyAlpha.GetValueOnRenderThread()!=0 ? 1u : 0u;
     PSParameters.PCVRReuseRadialDepth = CVarPCVRReuseRadialDepth.GetValueOnRenderThread()!=0 ? 1u : 0u;
@@ -2039,6 +2060,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompacted(
 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->ViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
 
 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
+	Parameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
 	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
 	Parameters.Float32PositionBuffer = GPUResources->Float32PositionBufferSRV;
 	Parameters.UseFloat32Position = GPUResources->ShouldUseFloat32Positions() ? 1u : 0u;
@@ -2309,6 +2331,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
 
 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
+	Parameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
 	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
 	Parameters.Float32PositionBuffer = GPUResources->Float32PositionBufferSRV;
 	Parameters.UseFloat32Position = GPUResources->ShouldUseFloat32Positions() ? 1u : 0u;
@@ -2759,6 +2782,7 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 	);
 
 	FGaussianSplatVS::FParameters VSParameters{};
+	VSParameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
 	VSParameters.PerSplatLightingEnabled = 0;
     VSParameters.PCVRReuseRadialDepth = CVarPCVRReuseRadialDepth.GetValueOnRenderThread()!=0 ? 1u : 0u;
 	VSParameters.BaselineRenderQualityMode = 0;
@@ -2776,6 +2800,7 @@ void FGaussianSplatRenderer::DrawSplatsGlobal(
 
 
 	FGaussianSplatPS::FParameters PSParameters;
+	PSParameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
 	PSParameters.PerSplatLightingEnabled = 0;
     PSParameters.PCVREarlyAlphaEnabled = CVarGSPCVREarlyAlpha.GetValueOnRenderThread()!=0 ? 1u : 0u;
     PSParameters.PCVRReuseRadialDepth = CVarPCVRReuseRadialDepth.GetValueOnRenderThread()!=0 ? 1u : 0u;
@@ -3112,6 +3137,7 @@ void FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
 
 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
+	Parameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
 	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
 	Parameters.Float32PositionBuffer = GPUResources->Float32PositionBufferSRV;
 	Parameters.UseFloat32Position = GPUResources->ShouldUseFloat32Positions() ? 1u : 0u;
@@ -3496,6 +3522,7 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 	// GlobalDrawIndirectArgsBuffer is in IndirectArgs state from DispatchPrefixSumVisibleCounts
 	// (or retained from previous frame when bCanSkip is true)
 	FGaussianSplatVS::FParameters VSParameters{};
+	VSParameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
 	VSParameters.PerSplatLightingEnabled = 0;
     VSParameters.PCVRReuseRadialDepth = CVarPCVRReuseRadialDepth.GetValueOnRenderThread()!=0 ? 1u : 0u;
 	VSParameters.BaselineRenderQualityMode = 0;
@@ -3513,6 +3540,7 @@ void FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
 
 
 	FGaussianSplatPS::FParameters PSParameters;
+	PSParameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
 	PSParameters.PerSplatLightingEnabled = 0;
     PSParameters.PCVREarlyAlphaEnabled = CVarGSPCVREarlyAlpha.GetValueOnRenderThread()!=0 ? 1u : 0u;
     PSParameters.PCVRReuseRadialDepth = CVarPCVRReuseRadialDepth.GetValueOnRenderThread()!=0 ? 1u : 0u;
@@ -4028,6 +4056,7 @@ void FGaussianSplatRenderer::GradeToTexture(
 
 	// Set pixel shader parameters
     FGaussianSplatCompositePS::FParameters PSParameters;
+	PSParameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
 	PSParameters.PanoramaShadowMaskProbe =
 		(GStableShadowDebugMode >= 102 && GStableShadowDebugMode <= 104)
 			? static_cast<uint32>(FMath::Clamp(CVarGSPanoramaShadowMaskProbe.GetValueOnRenderThread(), 0, 2))
@@ -4142,6 +4171,7 @@ void FGaussianSplatRenderer::CompositeToSceneColor(
 		OutputViewRect.Max.X, OutputViewRect.Max.Y, 1.0f);
 
 	FGaussianSplatBloomCompositePS::FParameters PSParameters;FMemory::Memzero(PSParameters);
+	PSParameters.SourceReferenceMode = uint32(GetSuperSplatCompareMode_RenderThread());
     PSParameters.PCVRBloomExtractTexture=BloomExtractTexture?BloomExtractTexture:GBlackTexture->TextureRHI.GetReference();
 	PSParameters.IntermediateTexture = GradedTexture;
     PSParameters.PCVRFogCoverageTexture = RawFogCoverageTexture;

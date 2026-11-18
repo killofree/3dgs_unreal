@@ -1,4 +1,5 @@
 #include "/Engine/Public/Platform.ush"
+uint SourceReferenceMode;
 
 
 #ifndef GS_PCVR_BLOOM_CACHE
@@ -429,6 +430,7 @@ float3 AccumToStraight(float4 Accum)
 float ComputeProductionAccumulatedAlphaSeal(float AccumulatedAlpha)
 {
     const float A = saturate(AccumulatedAlpha);
+    if (SourceReferenceMode != 0u) return A;
     if (A <= (1.0 / 255.0))
     {
         return A;
@@ -1041,13 +1043,14 @@ float4 MainGradePS(FScreenVertexOutput Input
     GetGSIntermediateDimensions(TextureWidth, TextureHeight);
     const int2 MaxPixel = int2(max(int(TextureWidth) - 1, 0), max(int(TextureHeight) - 1, 0));
 
-    const float4 Accum = LoadWeatherAccumulated(PixelPos, MaxPixel);
+    const float4 Accum = SourceReferenceMode >= 2u ? LoadAccumulated(PixelPos, MaxPixel) : LoadWeatherAccumulated(PixelPos, MaxPixel);
     const float Alpha = saturate(Accum.a);
     // v2888: explicitly initialize uncovered output pixels. In full-extent
     // views this replaces the redundant RGBA16F clear; in cropped views the
     // clear is kept for all pixels OUTSIDE the viewport. Alpha/colour matches
     // the former transparent-clear-plus-discard semantics exactly.
     if (Alpha <= (1.0 / 255.0)) return 0.0.xxxx;
+    if (SourceReferenceMode >= 2u) return Accum;
     // v2886: shader-visible source-linear, ungraded monochrome GS debug signal.
     // Source from CalcViewData (102/103/104), not a late tone-mapped approximation.
     // Only the plugin's grade/bloom/fog are bypassed, not UE tonemapping.
@@ -1282,6 +1285,19 @@ float4 MainBloomCompositePS(FScreenVertexOutput Input
 
     const float4 GradedAccum = LoadAccumulated(PixelPos, MaxPixel);
     const float Alpha = saturate(GradedAccum.a);
+    if (SourceReferenceMode >= 2u)
+    {
+        // Source color is already in the viewer's display space. Composition
+        // after UE tone mapping must not apply exposure or a second transfer.
+        if (PanoramaGSCompositeMode == 2u) return float4(GradedAccum.rgb, Alpha);
+        // Match display-space Gaussian-to-Gaussian blending, then convert the
+        // straight result once for UE's linear scene/MSAA mesh composition.
+        const float3 DisplayRGB = max(GradedAccum.rgb, 0.0) / max(Alpha, 1.0e-6);
+        const float3 LinearLow = DisplayRGB / 12.92;
+        const float3 LinearHigh = pow((DisplayRGB + 0.055) / 1.055, 2.4);
+        const float3 SceneLinear = lerp(LinearLow, LinearHigh, step(0.04045, DisplayRGB));
+        return float4(SceneLinear * Alpha * max(GaussianCompositeParams0.x, 1.0e-4), Alpha);
+    }
     // v2886: direct, linear GS diagnostic before plugin bloom, sealing and fog.
     // Mode 1 retains the view's pre-exposure; mode 2 removes just the GS factor.
     // UE's own tonemapper still applies after this pre-tonemap composite.

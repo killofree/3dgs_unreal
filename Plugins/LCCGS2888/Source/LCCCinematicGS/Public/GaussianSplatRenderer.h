@@ -20,6 +20,7 @@ struct FGaussianCapturedDepthShadowRenderData;
 class LCCCINEMATICGS_API FGaussianSplatRenderer
 {
 public:
+	static int32 GetSuperSplatCompareMode_RenderThread();
     static void DispatchPCVRSourceCompact(FRHICommandListImmediate& Cmd,FGaussianSplatGPUResources* R,FGaussianGlobalAccumulator* A,uint32 Count,uint32 OriginalCount,bool UseLOD);
 
     static void DispatchPCVRStableCompact(FRHICommandListImmediate& Cmd,FGaussianGlobalAccumulator* A,int32 Count,const FSceneView& View);
