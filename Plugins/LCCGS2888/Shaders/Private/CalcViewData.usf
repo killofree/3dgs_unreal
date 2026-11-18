@@ -2433,6 +2433,41 @@ float4 LoadHighPrecisionColorOpacity(uint splatIndex)
 	return HighPrecisionColorTexture.Load(int3(coord, 0));
 }
 
+// Mai courtyard soft contact layer, applied to the scan's indirect colour only.
+// World anchored for stereo; keeps the existing bright daylight outside receivers.
+float MaiAutumnGroundContact(float3 P)
+{
+ if (!(OriginalSplatCount==3635715u || SplatCount==3635715u)) return 1.0;
+ const float4 trees[10]={float4(10428.000,2654.000,2900.000,1.100),float4(11728.000,3754.000,3200.000,1.250),float4(2100.000,-1000.000,400.000,0.400),float4(3600.000,-1384.705,708.132,0.500),float4(3500.000,1750.000,1050.000,0.750),float4(5400.000,2000.000,1245.456,1.000),float4(7800.000,2300.000,1602.568,1.100),float4(5400.000,2000.000,1213.072,1.000),float4(12457.066,2300.000,2818.930,1.100),float4(12457.066,1294.098,2818.930,1.100)};
+ float shade=0.0;
+ [unroll] for(int i=0;i<10;i++)
+ {
+  float4 t=trees[i];float sz=t.w;
+  float heightGate=(1.0-smoothstep(t.z+30.0,t.z+120.0,P.z))*smoothstep(t.z-1200.0,t.z-900.0,P.z);
+  float2 root=(P.xy-t.xy)/max(sz,.2);
+  float contact=(1.0-smoothstep(18.0,190.0,length(root)))*.70;
+  float2 crown=(P.xy-(t.xy+float2(-430,-360)*sz))/(float2(650,480)*sz);
+  float dapples=.78+.22*sin(P.x*.035)*sin(P.y*.043);
+  float canopy=(1.0-smoothstep(.40,1.0,length(crown)))*.64*dapples;
+  shade=max(shade,max(contact,canopy)*heightGate);
+ }
+ const float4 towers[3]={float4(2980,-700,410,310),float4(3450,-110,440,210),float4(4000,800,460,210)};
+ const float2 shadowAxis=float2(-0.766044,-0.642788);
+ [unroll] for(int j=0;j<3;j++)
+ {
+  float4 t=towers[j];float2 v=P.xy-t.xy;
+  float along=dot(v,shadowAxis);float across=abs(dot(v,float2(-shadowAxis.y,shadowAxis.x)));
+  float span=1300.0+max(t.z-P.z,0.0)*1.28;
+  float width=t.w*saturate(1.0-along/span);
+  float mask=smoothstep(-70.0,20.0,along)*(1.0-smoothstep(span-70.0,span+40.0,along));
+  mask*=1.0-smoothstep(max(width-35.0,0.0),width+45.0,across);
+  mask*=1.0-smoothstep(t.z+10.0,t.z+70.0,P.z);
+  mask*=smoothstep(t.z-550.0,t.z-450.0,P.z);
+  shade=max(shade,.70*mask);
+ }
+ return 1.0-shade;
+}
+
 // Core: transform a single splat to screen space and write to ViewDataBuffer
 void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uint selectedLODLevel)
 {
@@ -2604,6 +2639,23 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		opacity *= 1.0 - upperRegion * max(skyResidual, broadSplat * (1.0 - foliageSupport));
 	}
 
+
+    // Current Mai scan: remove reconstructed sky colour only above the tree line.
+    // World-space criteria are shared by both stereo eyes; architecture is below this band.
+    if (OriginalSplatCount == 3635715u || SplatCount == 3635715u)
+    {
+        float3 skyDC = max(colorOpacity.rgb, 0.0);
+        float blueSky = smoothstep(1.04, 1.14, skyDC.b / max(max(skyDC.r, skyDC.g), 0.002));
+        float highBand = smoothstep(2600.0, 3400.0, localPos.z);
+        float aboveCanopy = smoothstep(5800.0, 6500.0, localPos.z) * smoothstep(-650.0, -350.0, localPos.y);
+        float farBackground = smoothstep(15500.0, 18000.0, localPos.x) * highBand;
+        float openSkyVolume = smoothstep(-750.0, -450.0, localPos.y) * smoothstep(3500.0 + max(localPos.y, 0.0) * 0.30, 3900.0 + max(localPos.y, 0.0) * 0.30, localPos.z);
+        float whiteSkyFragment = smoothstep(0.72, 0.9, min(skyDC.r, min(skyDC.g, skyDC.b))) * highBand;
+        opacity *= 1.0 - whiteSkyFragment;
+        float boundaryOutlier = smoothstep(25.0, 55.0, max(scale.x, max(scale.y, scale.z))) * highBand * smoothstep(-1800.0, -1400.0, localPos.y);
+        opacity *= 1.0 - max(boundaryOutlier, max(openSkyVolume, max(highBand * blueSky, max(aboveCanopy, farBackground))));
+    }
+
 #if GS_VR_BASELINE
     // No relighting, proxy sampling, vegetation, rain, fog or snow evaluation.
     FGaussianSplatViewData baseline = (FGaussianSplatViewData)0;
@@ -2611,6 +2663,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
     baseline.TranslatedWorldPos = translatedWorldPos;
     float3 trainedLinear = J02MaintainedGiwaColor(
         SRGBToSceneLinearExact(decodedSrgb), J02MaintainedGiwaMask(localPos));
+    trainedLinear *= MaiAutumnGroundContact(worldPos.xyz);
     baseline.PackedColorRG = PackHalf2x16(trainedLinear.rg);
     baseline.PackedColorBA = PackHalf2x16(float2(trainedLinear.b, opacity));
     baseline.Axis1 = axis1;
@@ -3388,6 +3441,7 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		baseIndirectLinear = lerp(baseIndirectLinear,
 			SceneLinearLuminance(baseIndirectLinear) * float3(0.92, 0.98, 1.08), j02RoofMask);
 	}
+	baseIndirectLinear *= MaiAutumnGroundContact(worldPos.xyz);
 	viewData.PackedColorRG = PackHalf2x16(baseIndirectLinear.rg);
 	viewData.PackedColorBA = PackHalf2x16(float2(baseIndirectLinear.b, opacity));
 	// Production uses the camera-independent dense cast field. It stores a stable
@@ -3725,6 +3779,49 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		}
 	}
 
+
+    // Mai scan-only fallback for three porous foreground stone towers. Test the
+    // live sun ray against their closed measured envelopes at the GS receiver,
+    // avoiding gaps/interpolation loss in the scan-derived ground proxy.
+    if (stableProductionShadow && (OriginalSplatCount == 3635715u || SplatCount == 3635715u))
+    {
+        float3 maiL; float3 maiTint; float maiEnergy;
+        GetStrongestDirectionalState(maiL, maiTint, maiEnergy);
+        float3 maiP = worldPos.xyz;
+        if (maiL.z > 0.05 && maiP.x > 1500.0 && maiP.x < 5200.0 && maiP.z < 720.0)
+        {
+            const float4 maiTowers[3] = {float4(2980,-700,410,490),float4(3450,-110,440,465),float4(4000,800,460,435)};
+            const float maiRadii[3] = {310.0,210.0,210.0};
+            float maiVisibility = 1.0;
+            [unroll] for (int ti=0; ti<3; ++ti)
+            {
+                float4 tower=maiTowers[ti];
+                if (maiP.z < tower.z + 45.0)
+                {
+                    float2 d=maiP.xy-tower.xy;
+                    float q=tower.z+tower.w-maiP.z;
+                    float k=maiRadii[ti]/tower.w;
+                    float lo=max(4.0,(tower.z-maiP.z)/maiL.z);
+                    float hi=q/maiL.z;
+                    float aa=dot(maiL.xy,maiL.xy)-k*k*maiL.z*maiL.z;
+                    float bb=dot(d,maiL.xy)+k*k*q*maiL.z;
+                    float tt=aa>0.00001 ? clamp(-bb/aa,lo,hi) : lo;
+                    float side=length(d+tt*maiL.xy)-k*(q-tt*maiL.z);
+                    float sideHi=length(d+hi*maiL.xy);
+                    float outside=smoothstep(-8.0,14.0,min(side,sideHi));
+                    if(hi>lo)maiVisibility=min(maiVisibility,lerp(0.18,1.0,outside));
+                }
+            }
+            stableFinalCastVisibility=min(stableFinalCastVisibility>=0.0?stableFinalCastVisibility:1.0,maiVisibility);
+            stableFinalDirectLinear*=maiVisibility;
+            // Soft cast on the scan base remains visible under bright sky fill.
+            float3 maiBase=float3(UnpackHalf2x16(viewData.PackedColorRG),UnpackHalf2x16(viewData.PackedColorBA).x);
+            maiBase*=lerp(0.76,1.0,maiVisibility);
+            viewData.PackedColorRG=PackHalf2x16(maiBase.rg);
+            viewData.PackedColorBA=PackHalf2x16(float2(maiBase.b,opacity));
+        }
+    }
+
 	// Mode 02 receives the full Stable lighting reference. Final receives a color-
 	// preserving Stable DIRECT sun layer built from the same proxy normal/cast/closure
 	// authority. The old Gaussian-native direct accent is no longer a competing Final path.
@@ -3764,6 +3861,15 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	{
 		packedDirectDebug = lerp(packedDirectDebug,
 			SceneLinearLuminance(packedDirectDebug) * float3(0.92, 0.98, 1.08), j02RoofMask);
+	}
+	// The scene's contact/cast mask must attenuate the direct layer too;
+	// otherwise bright additive sun washes the indirect-only ground shadow away.
+	if (StableShadowDebugMode == 0u && PuddleWaterLayer == 0u)
+	{
+		float maiGroundVisibility = MaiAutumnGroundContact(worldPos.xyz);
+		packedDirectDebug *= maiGroundVisibility;
+		productionLocalLinear *= maiGroundVisibility;
+		gaussianPlantTransmissionLinear *= maiGroundVisibility;
 	}
 	viewData.PackedDirectRG = PackHalf2x16(packedDirectDebug.rg);
 	viewData.PackedDirectBA = PackHalf2x16(float2(packedDirectDebug.b, stableFinalCastVisibility));
