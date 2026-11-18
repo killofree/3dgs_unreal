@@ -2438,8 +2438,8 @@ float4 LoadHighPrecisionColorOpacity(uint splatIndex)
 // World anchored for stereo; keeps the existing bright daylight outside receivers.
 float MaiAutumnGroundContact(float3 P)
 {
- if (!(OriginalSplatCount==3635715u || SplatCount==3635715u)) return 1.0;
- const float4 trees[10]={float4(10428.000,2654.000,2900.000,1.100),float4(11728.000,3754.000,3200.000,1.250),float4(2100.000,-1000.000,400.000,0.400),float4(3600.000,-1384.705,708.132,0.500),float4(3500.000,1750.000,1050.000,0.750),float4(5400.000,2000.000,1245.456,1.000),float4(7800.000,2300.000,1602.568,1.100),float4(5400.000,2000.000,1213.072,1.000),float4(12457.066,2300.000,2818.930,1.100),float4(12457.066,1294.098,2818.930,1.100)};
+ if (!(OriginalSplatCount==3635715u || SplatCount==3635715u || OriginalSplatCount==12982984u || SplatCount==12982984u || OriginalSplatCount==14067854u || SplatCount==14067854u)) return 1.0;
+ const float4 trees[10]={float4(10428.000,2654.000,2900.000,1.100),float4(11728.000,3754.000,3200.000,1.250),float4(2100.000,-1000.000,400.000,0.400),float4(3785.156,-1177.146,741.479,0.500),float4(3500.000,1899.924,1050.000,0.750),float4(4259.108,2124.492,1245.456,1.000),float4(7800.000,2300.000,1602.568,1.100),float4(5400.000,2000.000,1213.072,1.000),float4(12457.066,2300.000,2818.930,1.100),float4(12457.066,1294.098,2818.930,1.100)};
  float shade=0.0;
  [unroll] for(int i=0;i<10;i++)
  {
