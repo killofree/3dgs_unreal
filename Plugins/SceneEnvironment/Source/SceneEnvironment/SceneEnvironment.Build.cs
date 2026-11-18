@@ -5,6 +5,7 @@ public class SceneEnvironment : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
         PublicDependencyModuleNames.AddRange(new[] { "Core", "CoreUObject", "Engine" });
-        PrivateDependencyModuleNames.Add("Niagara");
+        PrivateDependencyModuleNames.AddRange(new[] { "Niagara", "LCCCinematicGS" });
+        if (Target.bBuildEditor) PrivateDependencyModuleNames.Add("NiagaraEditor");
     }
 }

@@ -15,17 +15,32 @@ ARainSceneController::ARainSceneController()
  PrimaryActorTick.bCanEverTick=true;
  SceneRoot=CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));SetRootComponent(SceneRoot);
  RainComponent=CreateDefaultSubobject<UNiagaraComponent>(TEXT("Rain"));RainComponent->SetupAttachment(SceneRoot);
+ SequenceSnowComponent=CreateDefaultSubobject<UNiagaraComponent>(TEXT("SequenceSnow"));
+ SequenceSnowComponent->SetupAttachment(SceneRoot);SequenceSnowComponent->SetAutoActivate(false);
  RainComponent->SetRelativeLocation(FVector(0,0,RainHeight));RainComponent->SetAutoActivate(false);
 }
 void ARainSceneController::OnConstruction(const FTransform& T){Super::OnConstruction(T);ApplyParameters(true);}
 void ARainSceneController::BeginPlay(){Super::BeginPlay();ApplyParameters(true);}
-void ARainSceneController::SetRainAmount(float Amount){RainAmount=FMath::Clamp(Amount,0.f,1.f);ApplyParameters(true);}
+void ARainSceneController::SetRainAmount(float Amount)
+{
+ RainAmount=FMath::Clamp(Amount,0.f,1.f);
+ if(RainControls && GetWorld())UKismetMaterialLibrary::SetScalarParameterValue(this,RainControls,TEXT("RainAmount"),RainAmount);
+ ApplyParameters(true);
+}
+void ARainSceneController::SetSequencerRainAmount(float Amount){SequencerRainAmount=FMath::Clamp(Amount,0.f,1.f);SetRainAmount(SequencerRainAmount);}
 void ARainSceneController::RefreshRain(){ApplyParameters(true);}
 #if WITH_EDITOR
 void ARainSceneController::PostEditChangeProperty(FPropertyChangedEvent& E){Super::PostEditChangeProperty(E);ApplyParameters(true);}
 #endif
 void ARainSceneController::ApplyParameters(bool Force)
 {
+ // The original sequence owns its MPC RainAmount curve. Read that curve instead
+ // of overwriting it with a stale controller property during editor evaluation.
+ if(RainControls && GetWorld())
+  RainAmount=UKismetMaterialLibrary::GetScalarParameterValue(this,RainControls,TEXT("RainAmount"));
+ // The authored MPC curve is the only rain authority, including the winter transition.
+ ApplySeasonSequence();
+ Force=Force || bEnableSeasonSequence; // Reassert MPC values after Sequencer material tracks.
  UWorld* W=GetWorld();if(!W)return;
  RainAmount=FMath::Clamp(RainAmount,0.f,1.f);Wetness=FMath::Clamp(Wetness,0.f,1.f);
  FlowTiling=FMath::Clamp(FlowTiling,.25f,16.f);RippleTiling=FMath::Clamp(RippleTiling,.25f,16.f);
@@ -36,7 +51,7 @@ void ARainSceneController::ApplyParameters(bool Force)
  if(!Changed && LastSplashSize==SplashSizeMultiplier && LastSplashFrequency==SplashFrequencyMultiplier)return;
  if(RainControls)
  {
-  UKismetMaterialLibrary::SetScalarParameterValue(this,RainControls,TEXT("RainAmount"),RainAmount);
+  // Read-only RainAmount here: never replace the Sequencer MPC curve.
   UKismetMaterialLibrary::SetScalarParameterValue(this,RainControls,TEXT("FlowTiling"),FlowTiling);
   UKismetMaterialLibrary::SetScalarParameterValue(this,RainControls,TEXT("RippleTiling"),RippleTiling);
   UKismetMaterialLibrary::SetScalarParameterValue(this,RainControls,TEXT("FlowStrength"),FlowStrength);
@@ -47,14 +62,15 @@ void ARainSceneController::ApplyParameters(bool Force)
   UKismetMaterialLibrary::SetScalarParameterValue(this,RainControls,TEXT("SplashFrequency"),SplashFrequencyMultiplier);
  }
  if(SurfaceWetness)UKismetMaterialLibrary::SetScalarParameterValue(this,SurfaceWetness,TEXT("Humidity"),Wetness);
- if(RainSystem)
+ const bool bPluginPrecipitation=ApplyPluginPrecipitation();
+ if(RainSystem && !bPluginPrecipitation)
  {
   RainComponent->SetVariableFloat(TEXT("User.SpawnRateMultiplyer"),RainAmount*FMath::Clamp(FullRainSpawnMultiplier,0.f,8.f));
   RainComponent->SetCustomTimeDilation(FMath::Lerp(FMath::Clamp(LightRainSpeed,.1f,3.f),FMath::Clamp(FullRainSpeed,.1f,3.f),RainAmount));
   if(RainAmount>0.f){RainComponent->SetVisibility(true);if(!RainComponent->IsActive())RainComponent->Activate(false);}
   else {RainComponent->Deactivate();RainComponent->SetVisibility(false);}
  }
- if(RainFogActor)
+ if(RainFogActor && !bPluginPrecipitation)
  {
   UExponentialHeightFogComponent* Fog=RainFogActor->GetComponent();
   Fog->SetVolumetricFog(false);

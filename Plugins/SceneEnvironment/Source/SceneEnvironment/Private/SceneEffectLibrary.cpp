@@ -2,6 +2,15 @@
 #include "Components/ActorComponent.h"
 #include "NiagaraComponent.h"
 #include "NiagaraSystem.h"
+#include "NiagaraEmitter.h"
+#if WITH_EDITOR
+#include "NiagaraScriptSource.h"
+#include "NiagaraGraph.h"
+#include "NiagaraNodeOutput.h"
+#include "NiagaraNodeFunctionCall.h"
+#include "NiagaraNodeAssignment.h"
+#include "ViewModels/Stack/NiagaraStackGraphUtilities.h"
+#endif
 #include "NiagaraParameterStore.h"
 #include "UObject/UnrealType.h"
 
@@ -179,3 +188,81 @@ bool USceneEffectLibrary::WriteNiagaraFloat(UNiagaraComponent* Component, FName 
     if (!ValidateNiagaraFloat(Component, Parameter, Error)) return false;
     Component->SetVariableFloat(Parameter, Value); return true;
 }
+
+bool USceneEffectLibrary::AuthorWorldSpaceSnow(UNiagaraSystem* System)
+{
+#if WITH_EDITOR
+    if (!System) return false;
+    System->Modify();
+    const FNiagaraVariable RateVariable(FNiagaraTypeDefinition::GetFloatDef(),TEXT("User.SeasonSnowSpawnRate"));
+    System->GetExposedParameters().SetParameterValue<float>(700.f,RateVariable,true);
+    for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+    {
+        FVersionedNiagaraEmitterData* Data=Handle.GetInstance().GetEmitterData();
+        if(!Data)continue;
+        Data->bLocalSpace=false;
+        UNiagaraScriptSource* Source=Cast<UNiagaraScriptSource>(Data->GraphSource);
+        UNiagaraGraph* Graph=Source?Source->NodeGraph:nullptr;
+        if(!Graph)return false;
+        Graph->Modify();
+        TArray<UNiagaraNodeFunctionCall*> Calls;Graph->GetNodesOfClass(Calls);
+        for(UNiagaraNodeFunctionCall* Call:Calls)
+        {
+            if(!Call->FunctionScript || Call->FunctionScript->GetUsage()!=ENiagaraScriptUsage::Module)continue;
+            const FString Name=Call->FunctionScript->GetName();
+            if(Name.Contains(TEXT("SpawnRate")))
+            {
+                const auto Aliased=FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(FNiagaraParameterHandle(FName(TEXT("Module.SpawnRate"))),Call);
+                UEdGraphPin& Pin=FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(*Call,Aliased,FNiagaraTypeDefinition::GetFloatDef(),FGuid(),FGuid());
+                TSet<FNiagaraVariableBase> Known;Known.Add(RateVariable);
+                FNiagaraStackGraphUtilities::SetLinkedParameterValueForFunctionInput(Pin,RateVariable,Known);
+            }
+            const bool Solve=Name.Contains(TEXT("SolveForcesAndVelocity"));
+            const bool Motion=Name.Contains(TEXT("Force")) || Name.Contains(TEXT("Velocity")) ||
+                Name.Contains(TEXT("Gravity")) || Name.Contains(TEXT("Wind")) ||
+                Name.Contains(TEXT("CurlNoise")) || Name.Contains(TEXT("Camera")) || Name.Contains(TEXT("Drag")) || Name.Contains(TEXT("Orbit"));
+            if(Motion || Solve || Name.Contains(TEXT("SpawnBurst")))
+            {
+                FNiagaraStackGraphUtilities::SetModuleIsEnabled(*Call,false);
+                UE_LOG(LogTemp,Display,TEXT("[SequenceSnowMotion] Disabled %s"),*Name);
+            }
+        }
+        TArray<UNiagaraNodeOutput*> Outputs;Graph->GetNodesOfClass(Outputs);
+        for(UNiagaraNodeOutput* Output:Outputs)
+        {
+            const bool Spawn=Output->GetUsage()==ENiagaraScriptUsage::ParticleSpawnScript ||
+                Output->GetUsage()==ENiagaraScriptUsage::ParticleSpawnScriptInterpolated;
+            const bool Update=Output->GetUsage()==ENiagaraScriptUsage::ParticleUpdateScript;
+            if(!Spawn && !Update)continue;
+            TArray<FNiagaraVariable> Variables;
+            Variables.Emplace(FNiagaraTypeDefinition::GetVec3Def(),TEXT("Particles.Velocity"));
+            TArray<FString> Values={TEXT("(X=0,Y=0,Z=-120)")};
+            if(Update)
+            {
+                Variables.Emplace(FNiagaraTypeDefinition::GetVec3Def(),TEXT("Particles.PhysicsForce"));
+                Values.Add(TEXT("(X=0,Y=0,Z=0)"));
+            }
+            UNiagaraNodeAssignment* Assignment=FNiagaraStackGraphUtilities::AddParameterModuleToStack(
+                Variables,*Output,Spawn?INDEX_NONE:0,Values);
+            if(!Assignment)return false;
+            Assignment->NodeComment=TEXT("Season snow: world down velocity, no camera-directed force");
+            if(Update)
+            {
+                UNiagaraScript* Solver=LoadObject<UNiagaraScript>(nullptr,TEXT("/Niagara/Modules/Solvers/SolveForcesAndVelocity.SolveForcesAndVelocity"));
+                if(!Solver || !FNiagaraStackGraphUtilities::AddScriptModuleToStack(Solver,*Output))return false;
+            }
+        }
+    }
+    System->RequestCompile(true);
+    System->WaitForCompilationComplete(true, false);
+    if(!System->IsValid())return false;
+    System->MarkPackageDirty();
+    return true;
+#else
+    return false;
+#endif
+}
+
+
+
+

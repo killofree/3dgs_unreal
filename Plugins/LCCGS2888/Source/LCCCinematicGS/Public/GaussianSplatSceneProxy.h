@@ -36,6 +36,7 @@ struct FGaussianCapturedDepthShadowRenderData
 class FGaussianSplatGPUResources : public FRenderResource
 {
 public:
+	FVector4f SequenceSnowGrowthParams = FVector4f(-1.f,0.f,0.f,0.f);
 	FGaussianSplatGPUResources();
 	virtual ~FGaussianSplatGPUResources();
 
@@ -600,6 +601,15 @@ public:
 	/** Get rendering parameters */
 	int32 GetSHOrder() const { return SHOrder; }
 	float GetOpacityScale() const { return OpacityScale; }
+	void UpdateOpacityScale_RenderThread(float Value) { OpacityScale = FMath::Max(0.0f, Value); }
+    void UpdateSequenceSnowGrowth_RenderThread(const FVector4f& Value)
+    {
+        if(!SequenceSnowGrowthValue.Equals(Value,1.e-6f))
+        {
+            SequenceSnowGrowthValue=Value;
+            if(GPUResources){GPUResources->SequenceSnowGrowthParams=Value;GPUResources->bHasCachedSortData=false;}
+        }
+    }
 	float GetSplatScale() const { return SplatScale; }
 	float GetEffectiveSplatScale() const { return SplatScale; }
 	float GetLODErrorThreshold() const { return LODErrorThreshold; }
@@ -616,6 +626,7 @@ public:
 
 	/** Lighting payload collected from Unreal LightComponents for the cinematic splat shader. */
 	const FGaussianSplatLightingData& GetLightingData() const { return LightingData; }
+    bool IsSequenceSourceLookAuthority() const { return bSequenceSourceLookAuthority; }
 
 	/** Proxy mesh triangles used to build the light-space GS shadow map. */
 
@@ -692,6 +703,8 @@ private:
 	int32 SplatCount = 0;
 	int32 SHOrder = 3;
 	float OpacityScale = 1.0f;
+    FVector4f SequenceSnowGrowthValue = FVector4f(-1.f,0.f,0.f,0.f);
+    bool bSequenceSourceLookAuthority = false;
 	float SplatScale = 1.0f;
 	float LODErrorThreshold = 0.03f;
 	int32 RenderProfileValue = 0;

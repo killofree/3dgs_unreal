@@ -232,7 +232,7 @@ void AGaussianSplatActor::GenerateSnowGaussians()
     if (!bBuildingSnowHeightStages2878)
     {
         const float FullHeight = FMath::Clamp(SnowBakeMaximumHeightCm2878, 4.0f, 50.0f);
-        const int32 StageCount2879 = FMath::Clamp(SnowBakeIntervalCount2879, 4, 12);
+        const int32 StageCount2879 = ActorHasTag(TEXT("SeasonSequenceSmoothSnow")) ? 1 : FMath::Clamp(SnowBakeIntervalCount2879, 4, 12);
         const float SavedThickness = Source->SnowGaussianThicknessCm;
         const float SavedRuntimeHeight = SnowRuntimeHeightCm2878;
         const float OldBakedMaximum = SnowBakedMaximumHeightCm2878;
@@ -931,28 +931,34 @@ void AGaussianSplatActor::GenerateSnowGaussians()
 				OverheadCells.FindOrAdd(FIntPoint(X, Y)).Add(I);
 		}
 	}
-	// The v2.8.58 production preset bypassed all four strict proxy blockers.
-	// Retain a trivial callable for the current production paths but remove the
-	// unreachable legacy roof-ray intersection and 13-way A/B implementation.
-	const auto IsSheltered = [](int32, const FVector&) -> bool { return false; };
+    // A supported roof intercepts precipitation before it reaches the surface
+    // below. Use world +Z and actual triangles, never the current camera depth.
+    const auto IsSheltered = [&Triangles,&OverheadCells,&OversizedOverhead,&HasSourceGS,SkyCell,SourceHeightToleranceCm]
+        (int32 Receiver,const FVector& P)->bool
+    {
+        const double Bias=FMath::Clamp(SourceHeightToleranceCm*0.20,4.0,14.0);
+        const auto Blocks=[&](int32 I)->bool
+        {
+            if(I==Receiver || !Triangles.IsValidIndex(I))return false;
+            const FTriangle& T=Triangles[I];
+            if(!T.bValid || T.Up<0.05f)return false;
+            double Z=0.0;
+            if(!HeightAtXY(T,P.X,P.Y,Z) || Z<=P.Z+Bias)return false;
+            // Detached proxy triangles are not real ceilings.
+            return HasSourceGS(FVector(P.X,P.Y,Z));
+        };
+        if(const TArray<int32>* Nearby=OverheadCells.Find(XYCell(P,SkyCell)))
+            for(int32 I:*Nearby)if(Blocks(I))return true;
+        for(int32 I:OversizedOverhead)if(Blocks(I))return true;
+        return false;
+    };
 
 	// 2.8.57 floor-only blocker corroboration. A real roof normally has original
 	// GS support over adjacent nearby rays. A solitary proxy hit with only coarse
 	// splat support should not delete a dense *measured* ground patch. Never call
 	// this from the cliff/rail/roof or general receiver pipeline.
-	const auto IsFloorSheltered = [&](int32 Receiver, const FVector& P) -> bool
-	{
-		if (!Source->bSnowGaussianSkyExposure || !IsSheltered(Receiver, P)) return false;
-		if (!Source->bSnowFloorPreferSource) return true;
-		const double Offset = SourceDetailCellCm * 0.70;
-		const FVector Delta[4] = {
-			FVector( Offset,0.0,0.0), FVector(-Offset,0.0,0.0),
-			FVector(0.0, Offset,0.0), FVector(0.0,-Offset,0.0)};
-		int32 NeighborHits = 0;
-		for (const FVector& D : Delta)
-			if (IsSheltered(INDEX_NONE, P + D)) ++NeighborHits;
-		return NeighborHits >= FMath::Clamp(Source->SnowFloorBlockerNeighborHits, 1, 4);
-	};
+    const auto IsFloorSheltered = [&](int32 Receiver,const FVector& P)->bool
+    {return Source->bSnowGaussianSkyExposure && IsSheltered(Receiver,P);};
 
 	// v2844: Project ORIGINAL GS positions onto REAL upward proxy triangles.
 	// This is the missing bridge between source tint and Snow-Gaussian geometry:
@@ -4283,6 +4289,44 @@ for (int32 TriIndex = 0; TriIndex < Triangles.Num() && SnowSplats.Num() < Primar
 		}
 	}
 
+    if(ActorHasTag(TEXT("SeasonSequenceSmoothSnow")))
+    {
+        const int32 NoiseWords=PackedGeneratedSnowField2873.Num();
+        PackedGeneratedSnowField2873.SetNumZeroed(NoiseWords+GeneratedFieldCount2873+1);
+        constexpr int32 GeometryChunk=65536;
+        TArray<FVector3f> Decoded;
+        for(int32 Offset=0;Offset<GeneratedFieldCount2873;Offset+=GeometryChunk)
+        {
+            const int32 Count=FMath::Min(GeometryChunk,GeneratedFieldCount2873-Offset);
+            if(!NewSnowAsset->GetDecompressedPositionRange(Offset,Count,Decoded))
+            {Fail(TEXT("Snow growth support payload failed"));return;}
+            for(int32 J=0;J<Decoded.Num();++J)
+            {
+                const FVector P=GSWorld.TransformPosition(FVector(Decoded[J]));
+                const FIntVector C=XYZCell(P,SourceDetailCellCm);
+                double Best=DBL_MAX;
+                double BaseZ=P.Z-double(Source->SnowGaussianThicknessCm)*0.54;
+                for(int32 DZ=-2;DZ<=1;++DZ)
+                for(int32 DY=-1;DY<=1;++DY)
+                for(int32 DX=-1;DX<=1;++DX)
+                {
+                    const FSourceSurfaceCell* Cell=SourceSurfaceGrid.Find(C+FIntVector(DX,DY,DZ));
+                    if(!Cell || Cell->WeightSum<=0 || Cell->NormalSum.Z<0.25)continue;
+                    const FVector Q=Cell->PositionSum,N=Cell->NormalSum;
+                    const double Z=Q.Z-(N.X*(P.X-Q.X)+N.Y*(P.Y-Q.Y))/N.Z;
+                    const double Lift=P.Z-Z;
+                    if(Lift< -3.0 || Lift>double(Source->SnowGaussianThicknessCm)*2.0+12.0)continue;
+                    const double Score=FVector::DistSquaredXY(P,Q)+FMath::Square(Lift)*0.25;
+                    if(Score<Best){Best=Score;BaseZ=Z;}
+                }
+                const float FBaseZ=float(BaseZ);
+                uint32 Bits=0;FMemory::Memcpy(&Bits,&FBaseZ,sizeof(Bits));
+                PackedGeneratedSnowField2873[NoiseWords+Offset+J]=Bits;
+            }
+        }
+        PackedGeneratedSnowField2873.Last()=0x534E4731u; // SNG1: fixed-topology world-height growth.
+    }
+
 	// Swap atomically only after successful generation. Store the UAsset nested
 	// inside this actor for level serialization / PIE+MRQ world duplication.
 	SnowGaussianComponent->SetVisibility(false, false);
@@ -4310,6 +4354,7 @@ for (int32 TriIndex = 0; TriIndex < Triangles.Num() && SnowSplats.Num() < Primar
 	SnowGaussianComponent->SnowBakedFieldSourceAsset2873 = BakedSnowGaussianAsset.Get();
 	SnowGaussianComponent->SnowBakedFieldSplatCount2873 = GeneratedFieldCount2873;
 	SnowGaussianComponent->SnowBakedFieldPatternCm2873 = Source->SnowGaussianMoundScaleCm;
+    SnowGaussianComponent->SnowGaussianMoundScaleCm = Source->SnowGaussianMoundScaleCm;
 	SnowGaussianComponent->SnowBakedFieldLocalToWorld2873 = GSWorld;
 	SnowGaussianComponent->SnowBakedFieldSummary2873 = FString::Printf(
 		TEXT("2.8.73 눈 레이어 베이크 필드 %d개 (%.1fMB)"),

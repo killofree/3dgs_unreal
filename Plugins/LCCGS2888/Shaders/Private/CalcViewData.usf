@@ -61,6 +61,7 @@ StructuredBuffer<uint> SnowBakedFieldBuffer2873; // 4 packed UNORM8 values/uint,
 uint SnowBakedFieldCount2873;
 float SnowBakedFieldPatternCm2873;
 uint SnowBakedFieldValid2873;
+float4 SequenceSnowGrowthParams; // progress, maximum cm, enabled, reserved
 StructuredBuffer<uint4> StableSplatBindingBuffer; // x triangleID, y barycentric, z multi-triangle normal, w valid
 uint StableSplatBindingCount;
 StructuredBuffer<uint4> StableProxyTriangleBuffer; // xyz welded vertex IDs, w packed average normal + closure
@@ -2517,6 +2518,31 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 
 	// Transform to world space
 	float4 worldPos = mul(float4(localPos, 1.0), LocalToWorld);
+    float snowWorldZScale=1.0;
+    float snowWorldXYScale=1.0;
+    uint snowNoiseWords=(SplatCount+3u)/4u;
+    if(SequenceSnowGrowthParams.z>0.5 && SnowBakedFieldValid2873!=0u &&
+        SnowBakedFieldCount2873==snowNoiseWords+SplatCount+1u &&
+        SnowBakedFieldBuffer2873[SnowBakedFieldCount2873-1u]==0x534E4731u)
+    {
+        float progress=saturate(SequenceSnowGrowthParams.x);
+        float field=float((SnowBakedFieldBuffer2873[splatIndex>>2u]>>((splatIndex&3u)*8u))&255u)/255.0;
+        float supportZ=min(asfloat(SnowBakedFieldBuffer2873[snowNoiseWords+splatIndex]),worldPos.z);
+        // Stable receiving-surface grains, independent of camera depth and playback direction.
+        float grain=frac(sin(dot(floor(worldPos.xy*0.12),float2(127.1,311.7)))*43758.5453);
+        float onset=0.5*(1.0-(0.25*field+0.75*grain));
+        float growth=saturate((progress-onset)/max(1.0-onset,0.001));
+        if(growth<=0.00001)
+        {WriteInvalidSplat(outputIndex,selectedClusterID,selectedLODLevel);return;}
+        float settled=growth*growth*(3.0-2.0*growth);
+        snowWorldXYScale=max(sqrt(settled),0.001);
+        snowWorldZScale=max(settled,0.001);
+        worldPos.z=lerp(supportZ,worldPos.z,settled);
+        // Compensate only the rasterizer's minimum pixel footprint at grain birth.
+        // The developed snow layer retains its authored opacity throughout growth.
+        opacity*=saturate(settled*128.0);
+
+    }
 	float4 clipPos = mul(worldPos, WorldToClip);
 
 	// Store translated world position for velocity calculation in pixel shader
@@ -2545,6 +2571,14 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 	float3x3 cov3D_local = CalcCovariance3D(rotation, scale);
 	float3x3 localToWorldRot = (float3x3)LocalToWorld;
 	float3x3 cov3D_world = mul(transpose(localToWorldRot), mul(cov3D_local, localToWorldRot));
+    // D * covariance * D^T: compress physical world-Z thickness independently
+    // of camera orientation, preserving the measured tangent footprint.
+    cov3D_world[0][0]*=snowWorldXYScale*snowWorldXYScale;
+    cov3D_world[1][1]*=snowWorldXYScale*snowWorldXYScale;
+    cov3D_world[0][1]*=snowWorldXYScale*snowWorldXYScale;cov3D_world[1][0]*=snowWorldXYScale*snowWorldXYScale;
+    cov3D_world[0][2]*=snowWorldXYScale*snowWorldZScale;cov3D_world[2][0]*=snowWorldXYScale*snowWorldZScale;
+    cov3D_world[1][2]*=snowWorldXYScale*snowWorldZScale;cov3D_world[2][1]*=snowWorldXYScale*snowWorldZScale;
+    cov3D_world[2][2]*=snowWorldZScale*snowWorldZScale;
 	#if !GS_VR_BASELINE
 	// P08: optional world-space, source-only per-Gaussian opacity attenuation.
 	// This has NO camera position, view depth or screen mask dependency.
@@ -3160,6 +3194,12 @@ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uin
 		if (SnowCoveragePackedCount == 0u) matchedSnowCover = 0.0;
 		sourceSnowBlend = saturate(sourceSnowBlend +
 			(1.0 - sourceSnowBlend) * matchedSnowCover * 0.80 * saturate(hybridMix));
+        if(SnowSourceCoverParams.y>0.5)
+        {
+            // The rising snow geometry covers the scan naturally. Do not fade
+            // the original 3DGS surface white ahead of the emerging snow layer.
+            sourceSnowBlend=0.0;
+        }
 		if (sourceSnowBlend > 0.0001)
 		{
 			float3 originalSplatLinear = baseLinear;
@@ -4056,4 +4096,5 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 	ProcessSplat(splatIndex, outputIndex, selectedClusterID, selectedLODLevel);
 }
+
 

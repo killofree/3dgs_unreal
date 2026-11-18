@@ -1223,7 +1223,14 @@ FGaussianSplatSceneProxy::FGaussianSplatSceneProxy(const UGaussianSplatComponent
 	, CachedAsset(InComponent->SplatAsset)
 	, SplatCount(InComponent->SplatAsset ? InComponent->SplatAsset->GetSplatCount() : 0)
 	, SHOrder(InComponent->SHOrder)
-	, OpacityScale(InComponent->OpacityScale)
+	, OpacityScale(InComponent->OpacityScale *
+        (InComponent->ComponentHasTag(TEXT("SeasonSequenceSnowBlend")) && InComponent->GetCustomPrimitiveData().Data.Num()>0
+            ? InComponent->GetCustomPrimitiveData().Data[0] : 1.f))
+	, SequenceSnowGrowthValue(InComponent->ComponentHasTag(TEXT("SeasonSequenceSnowGrowth")) && InComponent->GetCustomPrimitiveData().Data.Num()>=4
+        ? FVector4f(InComponent->GetCustomPrimitiveData().Data[1],InComponent->GetCustomPrimitiveData().Data[2],1.f,0.f) : FVector4f(-1.f,0.f,0.f,0.f))
+    , bSequenceSourceLookAuthority(InComponent->GetOwner() && InComponent->GetOwner()->ActorHasTag(TEXT("SeasonSequenceWorldSnow")) &&
+        Cast<AGaussianSplatActor>(InComponent->GetOwner()) &&
+        Cast<AGaussianSplatActor>(InComponent->GetOwner())->GaussianSplatComponent.Get()==InComponent)
 	, SplatScale(InComponent->SplatScale)
 	, LODErrorThreshold(InComponent->LODErrorThreshold)
 	, RenderProfileValue(static_cast<int32>(InComponent->RenderProfile))
@@ -1417,6 +1424,7 @@ void FGaussianSplatSceneProxy::CreateRenderThreadResources(FRHICommandListBase& 
 		GPUResources->SetStableSplatBindingData(StableSplatBindingData);
 		GPUResources->SetPuddleDampenPackedData(PuddleDampenPackedData);
 		GPUResources->SetSnowCoveragePackedData(SnowCoveragePackedData);
+		GPUResources->SequenceSnowGrowthParams=SequenceSnowGrowthValue;
 		GPUResources->SetSnowBakedFieldData2873(SnowBakedFieldPackedData2873,
 			SnowBakedFieldPatternCm2873, SnowBakedFieldTransform2873);
 		GPUResources->SetStableProxySurfaceData(StableProxyVertexData, StableProxyTriangleData, StableProxyTriangleVertexNormalData);

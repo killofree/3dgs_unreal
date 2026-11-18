@@ -5519,6 +5519,18 @@ void UGaussianSplatComponent::SendRenderDynamicData_Concurrent()
 
 	FGaussianSplatSceneProxy* SplatProxy = static_cast<FGaussianSplatSceneProxy*>(SceneProxy);
 	FGaussianSplatLightingData LightingCopy = CachedLightingData;
+    const auto& GrowthData=GetCustomPrimitiveData().Data;
+    const FVector4f Growth=ComponentHasTag(TEXT("SeasonSequenceSnowGrowth")) && GrowthData.Num()>=4
+        ? FVector4f(GrowthData[1],GrowthData[2],1.f,0.f) : FVector4f(-1.f,0.f,0.f,0.f);
+    ENQUEUE_RENDER_COMMAND(UpdateGaussianSequenceGrowth)(
+        [SplatProxy,Growth](FRHICommandListImmediate&){SplatProxy->UpdateSequenceSnowGrowth_RenderThread(Growth);});
+
+    // Fade only a scalar; keep the splat GPU buffers and proxy alive.
+    const float BlendWeight=ComponentHasTag(TEXT("SeasonSequenceSnowBlend")) && GetCustomPrimitiveData().Data.Num()>0
+        ? GetCustomPrimitiveData().Data[0] : 1.f;
+    const float OpacityCopy=OpacityScale*BlendWeight;
+    ENQUEUE_RENDER_COMMAND(UpdateGaussianSequenceOpacity)(
+        [SplatProxy,OpacityCopy](FRHICommandListImmediate&){SplatProxy->UpdateOpacityScale_RenderThread(OpacityCopy);});
 	ENQUEUE_RENDER_COMMAND(UpdateGaussianSplatLightingData)(
 		[SplatProxy, LightingCopy](FRHICommandListImmediate& RHICmdList)
 		{
@@ -6456,7 +6468,8 @@ bool UGaussianSplatComponent::HasCurrentSnowBakedField2873() const
 	return SplatAsset &&
 		SnowBakedFieldSourceAsset2873 == SplatAsset &&
 		SnowBakedFieldSplatCount2873 == SplatAsset->GetSplatCount() &&
-		SnowBakedFieldPacked2873.Num() == (SnowBakedFieldSplatCount2873 + 3) / 4 &&
+		(SnowBakedFieldPacked2873.Num() == (SnowBakedFieldSplatCount2873 + 3) / 4 ||
+         (SnowBakedFieldPacked2873.Num() == (SnowBakedFieldSplatCount2873 + 3) / 4 + SnowBakedFieldSplatCount2873 + 1 && SnowBakedFieldPacked2873.Last()==0x534E4731u)) &&
 		SnowBakedFieldPatternCm2873 >= 50.0f &&
 		FMath::IsNearlyEqual(SnowGaussianMoundScaleCm, SnowBakedFieldPatternCm2873, 0.005f) &&
 		GetComponentTransform().Equals(SnowBakedFieldLocalToWorld2873, 0.001);

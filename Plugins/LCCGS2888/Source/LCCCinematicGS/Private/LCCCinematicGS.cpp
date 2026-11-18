@@ -607,6 +607,19 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 		}
 
 
+        // Depth sorting may put an auxiliary snow/puddle proxy first as it appears.
+        // Shared colour, exposure and render-profile settings belong to the source scan.
+        // Select that authority independently; preserve the original draw/splat order.
+        const FGaussianSplatSceneProxy* PrimaryRenderProxy=VisibleProxies.IsEmpty()?nullptr:VisibleProxies[0].Proxy;
+        for(const FProxyRenderInfo& Info:VisibleProxies)
+        {
+            if(Info.Proxy && Info.Proxy->IsSequenceSourceLookAuthority())
+            {
+                PrimaryRenderProxy=Info.Proxy;
+                break;
+            }
+        }
+
 		// Compute GlobalBaseOffset and TotalSplatCount for the complete visible proxy list
 		uint64 Count64 = 0;
 		for (FProxyRenderInfo& Info : VisibleProxies)
@@ -918,8 +931,8 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
                     Parameters.ViewportRect.Width(), Parameters.ViewportRect.Height(), Origin.X, Origin.Y, Origin.Z,
                     TotalSplatCount, VisibleProxies.Num(), (bAllNanite || VRDiagnosticMode == 3) ? 1 : 0,
                     VRDiagnosticMode == 3 ? 1 : (VRDiagnosticMode == 2 ? 2 : (bPCVRLeanOutputs ? (IntermediateFogDepthTexture ? 3 : 2) : (IntermediateFogDepthTexture ? 5 : 4))),
-                    VisibleProxies[0].Proxy->GetRenderProfileValue(), VisibleProxies[0].Proxy->GetEffectiveLODErrorThreshold(),
-                    VisibleProxies[0].Proxy->GetLightingData().RelightDetailParams2.Z >= 0.5f ? 1 : 0, VRDiagnosticMode == 3 ? 1 : 0);
+                    PrimaryRenderProxy->GetRenderProfileValue(), PrimaryRenderProxy->GetEffectiveLODErrorThreshold(),
+                    PrimaryRenderProxy->GetLightingData().RelightDetailParams2.Z >= 0.5f ? 1 : 0, VRDiagnosticMode == 3 ? 1 : 0);
                 UE_LOG(LogTemp,Display,TEXT("[GSPCVR][FogRT] Packed=%d Format=%s BytesPerPixel=%d Lean=%d Frame=%llu"),
                     FogPackingMode,FogPackingMode==2?TEXT("R16F"):(bPackedFog?TEXT("RG16F"):TEXT("RGBA16F")),FogPackingMode==2?2:(bPackedFog?4:8),bPCVRLeanOutputs?1:0,uint64(GFrameNumberRenderThread));
                 UE_LOG(LogTemp,Display,TEXT("[GSPCVR][Plan] Eye=%d Enabled=%d PreSort=%d StereoEyeCache=%d SharedTargets=%d PackedRoute=%d Frame=%llu GeometrySortReuse=%d FullReuse=%d RasterClip=%d RasterClipMinArea=%.1f"),
@@ -931,7 +944,7 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 		FBufferRHIRef SharedIndexBuffer;
 		if (VisibleProxies.Num() > 0)
 		{
-			FGaussianSplatGPUResources* FirstRes = VisibleProxies[0].Proxy->GetGPUResources();
+			FGaussianSplatGPUResources* FirstRes = PrimaryRenderProxy->GetGPUResources();
 			SharedIndexBuffer = FirstRes ? FirstRes->IndexBuffer : FBufferRHIRef();
 		}
 
@@ -942,8 +955,8 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 			VRDiagnosticMode == 0 && DebugMode == 0 &&
 			FGaussianSplatRenderer::GetStableShadowDebugMode() == 0 &&
 			VisibleProxies.Num() > 0 &&
-			VisibleProxies[0].Proxy &&
-			VisibleProxies[0].Proxy->GetLightingPreviewMode() == 0 &&
+			PrimaryRenderProxy &&
+			PrimaryRenderProxy->GetLightingPreviewMode() == 0 &&
 			FGaussianSplatRenderer::IsDirectSnowOverlayEnabled_RenderThread();
 		if (bSnowOverlayEnabled)
 		{
@@ -1613,8 +1626,8 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 		}
 
 		// Final nonlinear daylight controls are evaluated once on the fully accumulated
-		// GS HDR image. The first visible proxy defines the shared look, matching the
-		// global path's existing first-proxy render-profile convention.
+		// GS HDR image. The source scan defines the shared look when a weather sequence
+		// adds auxiliary layers; registration/depth order cannot replace its settings.
 		FVector4f CompositeLookParams0 = FVector4f::Zero();
 		FVector4f CompositeLookParams1 = FVector4f::Zero();
 		FVector4f CompositeLookParams2 = FVector4f::Zero();
@@ -1624,14 +1637,14 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 		FVector4f CompositeColorBloomParams = FVector4f(1.0f, 0.25f, 0.20f, 0.15f);
 		FVector4f CompositeBloomTint = FVector4f(1, 1, 1, 0);
 		float CompositeBloomSoftKnee = 0.25f;
-		if (VisibleProxies.Num() > 0 && VisibleProxies[0].Proxy)
+		if (VisibleProxies.Num() > 0 && PrimaryRenderProxy)
 		{
-			const FGaussianSplatLightingData& Lighting = VisibleProxies[0].Proxy->GetLightingData();
+			const FGaussianSplatLightingData& Lighting = PrimaryRenderProxy->GetLightingData();
 			const int32 StableShadowDebugMode = FGaussianSplatRenderer::GetStableShadowDebugMode();
 			const bool bCompositeInsetOnlyDebug =
 				StableShadowDebugMode >= 66 && StableShadowDebugMode <= 68;
 			const bool bLiteralLightingPreview =
-				VisibleProxies[0].Proxy->GetLightingPreviewMode() != 0 ||
+				PrimaryRenderProxy->GetLightingPreviewMode() != 0 ||
 				(StableShadowDebugMode != 0 && !bCompositeInsetOnlyDebug);
 			// One record per MRQ render frame rather than per pane. CPU-side settings
 			// are NOT a measurement of the actual output luminance/tonemapped PNG.
@@ -1711,7 +1724,7 @@ void FLCCCinematicGSModule::OnPostOpaqueRender_RenderThread(FPostOpaqueRenderPar
 			// Reusing a look tuned for the broader Legacy footprint can expose individual splat
 			// boundaries. Preserve the authored values, but apply a render-time safety multiplier
 			// only while the experimental footprint is active.
-			if (const FGaussianSplatGPUResources* FirstGPUResources = VisibleProxies[0].Proxy->GetGPUResources())
+			if (const FGaussianSplatGPUResources* FirstGPUResources = PrimaryRenderProxy->GetGPUResources())
 			{
 				if (FirstGPUResources->RuntimeFootprintMode == 1u)
 				{

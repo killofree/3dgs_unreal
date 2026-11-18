@@ -1,6 +1,6 @@
 # Source viewer rendering profile
 
-The project selects `gs.SuperSplatCompare=2` in DefaultEngine.ini on startup.
+The weather sequence preview uses `gs.SuperSplatCompare=0` (production rendering) in DefaultEngine.ini. Source viewer mode 2 remains available in the actor details dropdown.
 
 - 2: source SH/DC color, original opacity and scale, full source splats, minimum projected diameter 2 pixels. Accumulate premultiplied display RGB, preserve the mesh depth test at each MSAA sample, resolve GS color, and composite after UE tone mapping. UE exposure, color grading, bloom and plugin relighting are bypassed for GS. Ordinary meshes keep their UE rendering.
 - 1: production rendering with accumulated-alpha sealing disabled.

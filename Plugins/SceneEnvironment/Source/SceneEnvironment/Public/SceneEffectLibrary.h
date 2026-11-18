@@ -4,6 +4,7 @@
 #include "SceneEffectLibrary.generated.h"
 
 class UNiagaraComponent;
+class UNiagaraSystem;
 
 USTRUCT(BlueprintType)
 struct SCENEENVIRONMENT_API FSceneEffectParameter
@@ -22,6 +23,8 @@ class SCENEENVIRONMENT_API USceneEffectLibrary : public UBlueprintFunctionLibrar
 {
     GENERATED_BODY()
 public:
+    UFUNCTION(BlueprintCallable, Category="Scene Effects|Niagara")
+    static bool AuthorWorldSpaceSnow(UNiagaraSystem* System);
     UFUNCTION(BlueprintPure, Category="Scene Effects|Parameters", meta=(DisplayName="List Scene Effect Parameters"))
     static TArray<FSceneEffectParameter> ListParameters(UObject* Target, bool bIncludeComponents = true);
     UFUNCTION(BlueprintCallable, Category="Scene Effects|Parameters", meta=(DisplayName="Read Scene Float"))
@@ -43,3 +46,4 @@ public:
     UFUNCTION(BlueprintCallable, Category="Scene Effects|Niagara", meta=(DisplayName="Write Niagara User Float"))
     static bool WriteNiagaraFloat(UNiagaraComponent* Component, FName Parameter, float Value, FString& Error);
 };
+

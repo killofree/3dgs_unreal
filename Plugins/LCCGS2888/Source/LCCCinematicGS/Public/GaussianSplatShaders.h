@@ -64,6 +64,7 @@ class FGaussianSplatCalcViewDataCS : public FGlobalShader
 		SHADER_PARAMETER(uint32, SnowBakedFieldCount2873)
 		SHADER_PARAMETER(float, SnowBakedFieldPatternCm2873)
 		SHADER_PARAMETER(uint32, SnowBakedFieldValid2873)
+        SHADER_PARAMETER(FVector4f, SequenceSnowGrowthParams)
 		SHADER_PARAMETER_SRV(StructuredBuffer<uint4>, StableSplatBindingBuffer)
 		SHADER_PARAMETER(uint32, StableSplatBindingCount)
 		SHADER_PARAMETER_SRV(StructuredBuffer<FStableProxyTriangleGPU>, StableProxyTriangleBuffer)

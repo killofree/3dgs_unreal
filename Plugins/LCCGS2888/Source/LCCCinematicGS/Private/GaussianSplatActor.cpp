@@ -3123,8 +3123,13 @@ void AGaussianSplatActor::SyncWeatherEffects()
     // Existing four-stage 2.8.78 saves also work; newly generated bakes may have 4..12 stages.
     const int32 AvailableSnowStages2879 = BakedSnowHeightStages2878.Num();
     const bool bHasMultiHeightSnow2878 = !bBuildingSnowHeightStages2878 &&
-        AvailableSnowStages2879 >= 4 && AvailableSnowStages2879 <= 12 &&
+        (AvailableSnowStages2879 >= 4 || (ActorHasTag(TEXT("SeasonSequenceSmoothSnow")) && AvailableSnowStages2879 == 1)) && AvailableSnowStages2879 <= 12 &&
         SnowBakedMaximumHeightCm2878 > KINDA_SMALL_NUMBER;
+    // Opt-in blend of neighboring independent snow bakes.
+    const bool bSequenceSmoothSnow=ActorHasTag(TEXT("SeasonSequenceSmoothSnow"));
+    int32 SequenceLowerStage=-1;
+    float SequenceUpperWeight=1.f;
+    UGaussianSplatComponent* SequenceLowerLayer=FindObject<UGaussianSplatComponent>(this,TEXT("SequenceSnowLowerLayer"));
     int32 DesiredSnowStage2878 = -1; // legacy single-height asset, unchanged
     const float RequestedSnowHeight2879 = bHasMultiHeightSnow2878
         ? FMath::Clamp(SnowRuntimeHeightCm2878, 0.0f, SnowBakedMaximumHeightCm2878) : 0.0f;
@@ -3143,6 +3148,13 @@ void AGaussianSplatActor::SyncWeatherEffects()
                 DesiredSnowStage2878 = StageIndex + 1;
             }
         }
+        if(bSequenceSmoothSnow)
+        {
+            // One full-height topology. The shader grows each particle from its
+            // own baked world-space support plane; no stage/opacity crossfade.
+            DesiredSnowStage2878=RequestedSnowHeight2879>KINDA_SMALL_NUMBER ? AvailableSnowStages2879 : 0;
+            SequenceLowerStage=-1;SequenceUpperWeight=1.f;
+        }
         // v2898: put the chosen-stage PostLoad policy on the asset itself.
         // MRQ duplicates this state, so inactive stage assets skip GPU texture
         // creation without trying to discover their owner from Asset::PostLoad.
@@ -3151,7 +3163,7 @@ void AGaussianSplatActor::SyncWeatherEffects()
             if (UGaussianSplatAsset* StageAsset2898 = BakedSnowHeightStages2878[StageIndex2898].SnowAsset.Get())
             {
                 StageAsset2898->ConfigureSnowHeightStageTexturePolicy2898(
-                    true, DesiredSnowStage2878 == StageIndex2898 + 1);
+                    true, DesiredSnowStage2878 == StageIndex2898 + 1 || (bSequenceSmoothSnow && SequenceLowerStage == StageIndex2898));
             }
         }
 
@@ -3193,7 +3205,8 @@ void AGaussianSplatActor::SyncWeatherEffects()
                     SourceAsset && StageData.SourceCoverageCount == SourceAsset->GetSplatCount() &&
                     StageData.SourceCoverageMask.Num() == (StageData.SourceCoverageCount + 15) / 16 &&
                     StageData.SnowFieldCount == StageData.SnowAsset->GetSplatCount() &&
-                    StageData.SnowFieldPacked.Num() == (StageData.SnowFieldCount + 3) / 4;
+                    (StageData.SnowFieldPacked.Num() == (StageData.SnowFieldCount + 3) / 4 ||
+                     (StageData.SnowFieldPacked.Num() == (StageData.SnowFieldCount + 3) / 4 + StageData.SnowFieldCount + 1 && StageData.SnowFieldPacked.Last()==0x534E4731u));
                 if (!bValidStage)
                 {
                     SnowHeightBakeStatus2878 = FString::Printf(
@@ -3316,6 +3329,22 @@ void AGaussianSplatActor::SyncWeatherEffects()
             }
         }
     }
+    if(SequenceLowerLayer){SequenceLowerLayer->DestroyComponent();SequenceLowerLayer=nullptr;}
+    if(SnowGaussianComponent)
+    {
+        SnowGaussianComponent->ComponentTags.Remove(TEXT("SeasonSequenceSnowBlend"));
+        if(bSequenceSmoothSnow)
+        {
+            SnowGaussianComponent->ComponentTags.AddUnique(TEXT("SeasonSequenceSnowGrowth"));
+            SnowGaussianComponent->OpacityScale=1.f;
+            SnowGaussianComponent->SetCustomPrimitiveDataFloat(0,1.f);
+            SnowGaussianComponent->SetCustomPrimitiveDataFloat(1,FMath::Clamp(RequestedSnowHeight2879/FMath::Max(SnowBakedMaximumHeightCm2878,0.01f),0.f,1.f));
+            SnowGaussianComponent->SetCustomPrimitiveDataFloat(2,SnowBakedMaximumHeightCm2878);
+            SnowGaussianComponent->SetCustomPrimitiveDataFloat(3,1.f);
+        }
+        else SnowGaussianComponent->ComponentTags.Remove(TEXT("SeasonSequenceSnowGrowth"));
+        SnowGaussianComponent->MarkRenderDynamicDataDirty();
+    }
     // Only retire snow-stage GPU caches after the selection has remained
     // stable for ~90 ticks.  The render-thread job checks shared ownership;
     // assets still used by a proxy cannot be evicted.  CPU bake payloads and
@@ -3368,8 +3397,8 @@ void AGaussianSplatActor::SyncWeatherEffects()
         : RequestedSnowHeight2879;
     const float SnowHeightSourceFactor2878 = bHasMultiHeightSnow2878 &&
         PresentationSnowStage2879 >= 0
-        ? FMath::Sqrt(FMath::Clamp(
-            AppliedSourceHeight2879 / SnowBakedMaximumHeightCm2878, 0.0f, 1.0f)) : 1.0f;
+        ? (bSequenceSmoothSnow ? FMath::SmoothStep(0.f,SnowBakedMaximumHeightCm2878,AppliedSourceHeight2879)
+            : FMath::Sqrt(FMath::Clamp(AppliedSourceHeight2879 / SnowBakedMaximumHeightCm2878,0.f,1.f))) : 1.0f;
     const float HybridBaseMix = bSnowHeightZero2878 ? 0.0f : bSnowGaussianOwnsPresentation
         ? FMath::Clamp(GaussianSplatComponent->SnowHybridBaseCoverageStrength, 0.0f, 1.0f)
             * SnowHeightSourceFactor2878 : 1.0f;
@@ -3449,11 +3478,14 @@ void AGaussianSplatActor::SyncWeatherEffects()
 
 	const FVector4f SnowSourceCoverSettings(
 		bSnowGaussianOwnsPresentation && GaussianSplatComponent->bSnowSourceCover2872
-			? FMath::Clamp(GaussianSplatComponent->SnowSourceCoverStrength2872,0.0f,1.0f) : 0.0f,
-		0.0f,0.0f,0.0f);
+			? FMath::Clamp(GaussianSplatComponent->SnowSourceCoverStrength2872,0.0f,1.0f)*(bSequenceSmoothSnow ? SnowHeightSourceFactor2878 : 1.f) : 0.0f,
+        bSequenceSmoothSnow ? 1.f : 0.f,
+        bSequenceSmoothSnow ? FMath::Clamp(RequestedSnowHeight2879/FMath::Max(SnowBakedMaximumHeightCm2878,0.01f),0.f,1.f) : 0.f,0.f);
 	const FVector4f RainGrade0 = bActualRain
 		? FVector4f(
-			FMath::Clamp(GaussianSplatComponent->RainOverlayStrength, 0.0f, 1.0f),
+			FMath::Clamp(GaussianSplatComponent->RainOverlayStrength, 0.0f, 1.0f)*
+                (ActorHasTag(TEXT("SeasonSequenceWorldSnow")) && GaussianSplatComponent->GetCustomPrimitiveData().Data.Num()>4
+                 ? FMath::Clamp(GaussianSplatComponent->GetCustomPrimitiveData().Data[4],0.f,1.f) : 1.f),
 			FMath::Clamp(GaussianSplatComponent->RainOverlayExposureEV, -2.0f, 2.0f),
 			FMath::Clamp(GaussianSplatComponent->RainOverlayGamma, 0.5f, 2.0f),
 			FMath::Clamp(GaussianSplatComponent->RainOverlaySaturation, 0.0f, 2.0f))
@@ -3533,12 +3565,17 @@ void AGaussianSplatActor::SyncWeatherEffects()
 	// and snow. Detect only that explicitly named system in this world so its
 	// particles survive the final GS composite without changing unrelated effects.
 	bool bExternalNightStarNiagaraVisible = false;
+    bool bSequencePrecipitationVisible=false;
 	if (bOwnsWorldWeather)
 	{
 		for (TObjectIterator<UNiagaraComponent> It; It; ++It)
 		{
 			UNiagaraComponent* NiagaraComponent = *It;
 			UNiagaraSystem* NiagaraAsset = NiagaraComponent ? NiagaraComponent->GetAsset() : nullptr;
+            if(NiagaraComponent && NiagaraAsset && NiagaraComponent->GetWorld()==GetWorld() &&
+                NiagaraComponent->ComponentHasTag(TEXT("SeasonSequencePrecipitation")) &&
+                NiagaraComponent->IsRegistered() && NiagaraComponent->IsActive() && NiagaraComponent->IsVisible())
+                bSequencePrecipitationVisible=true;
 			if (NiagaraComponent && NiagaraAsset &&
 				NiagaraComponent != WeatherNiagaraComponent &&
 				NiagaraComponent->GetWorld() == GetWorld() &&
@@ -3560,13 +3597,16 @@ void AGaussianSplatActor::SyncWeatherEffects()
 		FGaussianSplatViewExtension::SetRainNiagaraCompositeVisible(
 			((bActualRain || bActualSnow) && DesiredSystem != nullptr) ||
 			bDawnStarSystem ||
-			bExternalNightStarNiagaraVisible);
+			bExternalNightStarNiagaraVisible || bSequencePrecipitationVisible ||
+            ActorHasTag(TEXT("SeasonSequenceWorldSnow")));
 	}
-	// Rain-only camera tracking: use the actual rendered FSceneView when available.
+	// Native precipitation anchor: rotation stays world-aligned. World-space snow
+	// particles keep their trajectories when the emitter follows the rendered position.
 	// Other weather systems retain their original actor-relative behavior.
-	if (GaussianSplatComponent->WeatherMode == ELCCCinematicGSWeatherMode::Rain)
+	if (GaussianSplatComponent->WeatherMode == ELCCCinematicGSWeatherMode::Rain ||
+        (bActualSnow && ActorHasTag(TEXT("SeasonSequenceWorldSnow"))))
 	{
-		// Rain only: follow the rendered camera position, but never inherit the
+		// Follow the rendered camera position, but never inherit the
 		// Gaussian actor rotation. The rain system must stay world-vertical.
 		WeatherNiagaraComponent->SetAbsolute(true, true, false);
 		WeatherNiagaraComponent->SetWorldRotation(FRotator::ZeroRotator);

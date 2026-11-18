@@ -1213,6 +1213,7 @@ static void SetSpatialDelightingResources(FGaussianSplatCalcViewDataCS::FParamet
 	Parameters.SnowCoveragePackedCount = GPUResources->SnowCoveragePackedCount;
 	Parameters.SnowBakedFieldBuffer2873 = GPUResources->SnowBakedFieldBufferSRV2873;
 	Parameters.SnowBakedFieldCount2873 = GPUResources->SnowBakedFieldCount2873;
+    Parameters.SequenceSnowGrowthParams = GPUResources->SequenceSnowGrowthParams;
 	Parameters.SnowBakedFieldPatternCm2873 = GPUResources->SnowBakedFieldPatternCm2873;
 	// The cached pattern was authored in WORLD coordinates. One matrix check
 	// per dispatch (not per splat) protects actor animation and relocated PLYs.
