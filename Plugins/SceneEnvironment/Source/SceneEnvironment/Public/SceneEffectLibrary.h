@@ -5,6 +5,7 @@
 
 class UNiagaraComponent;
 class UNiagaraSystem;
+class UMaterialInterface;
 
 USTRUCT(BlueprintType)
 struct SCENEENVIRONMENT_API FSceneEffectParameter
@@ -23,6 +24,10 @@ class SCENEENVIRONMENT_API USceneEffectLibrary : public UBlueprintFunctionLibrar
 {
     GENERATED_BODY()
 public:
+    UFUNCTION(BlueprintCallable, Category="Scene Effects|Niagara")
+    static bool AuthorWaterfallParticles(UNiagaraSystem* System, UMaterialInterface* Material, bool bMist);
+    UFUNCTION(BlueprintPure, Category="Scene Effects|Niagara")
+    static int32 GetLiveWaterfallParticleCount(UNiagaraComponent* Component);
     UFUNCTION(BlueprintCallable, Category="Scene Effects|Niagara")
     static bool AuthorWorldSpaceSnow(UNiagaraSystem* System);
     UFUNCTION(BlueprintPure, Category="Scene Effects|Parameters", meta=(DisplayName="List Scene Effect Parameters"))

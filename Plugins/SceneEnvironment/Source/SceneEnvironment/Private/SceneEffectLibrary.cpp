@@ -1,14 +1,20 @@
-#include "SceneEffectLibrary.h"
+﻿#include "SceneEffectLibrary.h"
+#include "SceneSeasonController.h"
 #include "Components/ActorComponent.h"
 #include "NiagaraComponent.h"
 #include "NiagaraSystem.h"
 #include "NiagaraEmitter.h"
+#include "NiagaraSpriteRendererProperties.h"
+#include "NiagaraSystemInstanceController.h"
+#include "NiagaraSystemInstance.h"
+#include "NiagaraEmitterInstance.h"
 #if WITH_EDITOR
 #include "NiagaraScriptSource.h"
 #include "NiagaraGraph.h"
 #include "NiagaraNodeOutput.h"
 #include "NiagaraNodeFunctionCall.h"
 #include "NiagaraNodeAssignment.h"
+#include "NiagaraParameterMapHistory.h"
 #include "ViewModels/Stack/NiagaraStackGraphUtilities.h"
 #endif
 #include "NiagaraParameterStore.h"
@@ -124,7 +130,10 @@ bool USceneEffectLibrary::WriteFloat(UObject* Target, const FString& Path, float
     if (!Resolve(Target, Path, Owner, Property, Error, true)) return false;
     auto* Number = CastField<FNumericProperty>(Property);
     if (!Number || !Number->IsFloatingPoint()) { Error = TEXT("Property is not a float/double."); return false; }
-    Number->SetFloatingPointPropertyValue(Property->ContainerPtrToValuePtr<void>(Owner), Value); return true;
+    Number->SetFloatingPointPropertyValue(Property->ContainerPtrToValuePtr<void>(Owner), Value);
+    // SceneFlow reflection writes must apply uniforms immediately, including zero-duration slots.
+    if (auto* Controls=Cast<ASceneSeasonController>(Owner)) Controls->ApplyControls();
+    return true;
 }
 bool USceneEffectLibrary::ReadBool(UObject* Target, const FString& Path, bool& Value, FString& Error)
 {
@@ -265,4 +274,117 @@ bool USceneEffectLibrary::AuthorWorldSpaceSnow(UNiagaraSystem* System)
 
 
 
+
+
+bool USceneEffectLibrary::AuthorWaterfallParticles(UNiagaraSystem* System, UMaterialInterface* Material, bool bMist)
+{
+#if WITH_EDITOR
+    if (!System || !Material) return false;
+    System->Modify();
+    auto& Parameters=System->GetExposedParameters();
+    const FNiagaraVariable Rate(FNiagaraTypeDefinition::GetFloatDef(),TEXT("User.FallsSpawnRate"));
+    const FNiagaraVariable Velocity(FNiagaraTypeDefinition::GetVec3Def(),TEXT("User.FallsVelocity"));
+    const FNiagaraVariable Force(FNiagaraTypeDefinition::GetVec3Def(),TEXT("User.FallsForce"));
+    const FNiagaraVariable Size(FNiagaraTypeDefinition::GetVec2Def(),TEXT("User.FallsSize"));
+    const FNiagaraVariable Life(FNiagaraTypeDefinition::GetFloatDef(),TEXT("User.FallsLifetime"));
+    const FNiagaraVariable Color(FNiagaraTypeDefinition::GetColorDef(),TEXT("User.FallsColor"));
+    const FNiagaraVariable Extent(FNiagaraTypeDefinition::GetVec3Def(),TEXT("User.FallsSpawnExtent"));
+    const FNiagaraVariable Radius(FNiagaraTypeDefinition::GetFloatDef(),TEXT("User.FallsSpawnRadius"));
+    const FNiagaraVariable Offset(FNiagaraTypeDefinition::GetVec3Def(),TEXT("User.FallsSpawnOffset"));
+    Parameters.SetParameterValue<float>(bMist?45.f:220.f,Rate,true);
+    Parameters.SetParameterValue<FVector3f>(bMist?FVector3f(35,-55,65):FVector3f(0,-100,-650),Velocity,true);
+    Parameters.SetParameterValue<FVector3f>(bMist?FVector3f(0,0,-4):FVector3f(0,0,-450),Force,true);
+    Parameters.SetParameterValue<FVector2f>(bMist?FVector2f(130,160):FVector2f(3,18),Size,true);
+    Parameters.SetParameterValue<float>(bMist?3.8f:2.3f,Life,true);
+    Parameters.SetParameterValue<FLinearColor>(bMist?FLinearColor(.68f,.73f,.76f,.20f):FLinearColor(.8f,.85f,.88f,.65f),Color,true);
+    Parameters.SetParameterValue<FVector3f>(bMist?FVector3f(220,130,100):FVector3f(110,65,120),Extent,true);
+    Parameters.SetParameterValue<float>(bMist?35.f:45.f,Radius,true);
+    Parameters.SetParameterValue<FVector3f>(FVector3f::ZeroVector,Offset,true);
+    auto Link=[&](UNiagaraNodeFunctionCall* Call,const FNiagaraVariable& Input,const FNiagaraVariable& User)
+    {
+        const auto Alias=FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(FNiagaraParameterHandle(Input.GetName()),Call);
+        UEdGraphPin& Pin=FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(*Call,Alias,Input.GetType(),FGuid(),FGuid());
+        Pin.BreakAllPinLinks();
+        TSet<FNiagaraVariableBase> Known; Known.Add(User);
+        FNiagaraStackGraphUtilities::SetLinkedParameterValueForFunctionInput(Pin,User,Known);
+    };
+    int32 Renderers=0,SpawnModules=0;
+    for (const FNiagaraEmitterHandle& Handle:System->GetEmitterHandles())
+    {
+        auto* Data=Handle.GetInstance().GetEmitterData(); if (!Data) continue;
+        Data->bLocalSpace=false; Data->SimTarget=ENiagaraSimTarget::CPUSim;
+        for (UNiagaraRendererProperties* Renderer:Data->GetRenderers())
+            if (auto* Sprite=Cast<UNiagaraSpriteRendererProperties>(Renderer))
+            { Sprite->Modify(); Sprite->Material=Material; Sprite->MICMaterial=nullptr; Sprite->MaterialUserParamBinding=FNiagaraUserParameterBinding(); Sprite->SubImageSize=FVector2D(1,1); Sprite->Alignment=bMist?ENiagaraSpriteAlignment::Unaligned:ENiagaraSpriteAlignment::VelocityAligned; Sprite->FacingMode=ENiagaraSpriteFacingMode::FaceCameraPosition; ++Renderers; }
+        auto* Source=Cast<UNiagaraScriptSource>(Data->GraphSource);
+        UNiagaraGraph* Graph=Source?Source->NodeGraph.Get():nullptr; if (!Graph) return false;
+        Graph->Modify();
+        TArray<UNiagaraNodeFunctionCall*> Calls;Graph->GetNodesOfClass(Calls);
+        for (auto* Call:Calls)
+        {
+            if (!Call->FunctionScript || Call->FunctionScript->GetUsage()!=ENiagaraScriptUsage::Module) continue;
+            const FString Name=Call->FunctionScript->GetName();
+            if (Name.Contains(TEXT("SpawnRate")))
+            { Link(Call,FNiagaraVariable(FNiagaraTypeDefinition::GetFloatDef(),TEXT("Module.SpawnRate")),Rate); ++SpawnModules; }
+            if (Name.Contains(TEXT("Shape")) || Name.Contains(TEXT("Location")))
+            {
+                TArray<FNiagaraVariable> Inputs;
+                FNiagaraStackGraphUtilities::GetStackFunctionInputsLegacy(*Call,Inputs,FCompileConstantResolver(Handle.GetInstance(),ENiagaraScriptUsage::ParticleSpawnScript),FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly);
+                for (const auto& Input:Inputs)
+                {
+                    const FString Key=Input.GetName().ToString();
+                    UE_LOG(LogTemp,Display,TEXT("[FallsShape] %s : %s"),*Name,*Key);
+                    if (Input.GetType()==FNiagaraTypeDefinition::GetVec3Def() && (Key.Contains(TEXT("Box Size")) || Key.Contains(TEXT("BoxSize")) || Key.Contains(TEXT("Box Dimensions")))) Link(Call,Input,Extent);
+                    if (Input.GetType()==FNiagaraTypeDefinition::GetFloatDef() && (Key.EndsWith(TEXT("Sphere Radius")) || Key.EndsWith(TEXT("Cylinder Radius")) || Key.EndsWith(TEXT("Ring Radius")))) Link(Call,Input,Radius);
+                    if (Input.GetType()==FNiagaraTypeDefinition::GetVec3Def() && (Key.EndsWith(TEXT(".Offset")) || Key.EndsWith(TEXT("Box Midpoint")))) Link(Call,Input,Offset);
+                }
+            }
+            if (Name.Contains(TEXT("Force")) || Name.Contains(TEXT("Velocity")) || Name.Contains(TEXT("Gravity")) || Name.Contains(TEXT("Wind")) || Name.Contains(TEXT("CurlNoise")) || Name.Contains(TEXT("Camera")) || Name.Contains(TEXT("Drag")) || Name.Contains(TEXT("Orbit")) || Name.Contains(TEXT("Collision")) || Name.Contains(TEXT("SpawnBurst")) || Name.Contains(TEXT("ScaleColor")) || Name.Contains(TEXT("ScaleSpriteSize")))
+                FNiagaraStackGraphUtilities::SetModuleIsEnabled(*Call,false);
+        }
+        TArray<UNiagaraNodeOutput*> Outputs;Graph->GetNodesOfClass(Outputs);
+        for (auto* Output:Outputs)
+        {
+            const bool Spawn=Output->GetUsage()==ENiagaraScriptUsage::ParticleSpawnScript || Output->GetUsage()==ENiagaraScriptUsage::ParticleSpawnScriptInterpolated;
+            const bool Update=Output->GetUsage()==ENiagaraScriptUsage::ParticleUpdateScript;
+            if (!Spawn && !Update) continue;
+            TArray<FNiagaraVariable> Variables;TArray<FString> Values;TArray<FNiagaraVariable> Users;
+            if (Spawn)
+            {
+                Variables={FNiagaraVariable(Velocity.GetType(),TEXT("Particles.Velocity")),FNiagaraVariable(Size.GetType(),TEXT("Particles.SpriteSize")),FNiagaraVariable(Life.GetType(),TEXT("Particles.Lifetime")),FNiagaraVariable(Color.GetType(),TEXT("Particles.Color"))};
+                Values={TEXT("(X=0,Y=0,Z=0)"),TEXT("(X=1,Y=1)"),TEXT("2"),TEXT("(R=1,G=1,B=1,A=1)")};Users={Velocity,Size,Life,Color};
+            }
+            else { Variables={FNiagaraVariable(Force.GetType(),TEXT("Particles.PhysicsForce"))};Values={TEXT("(X=0,Y=0,Z=0)")};Users={Force}; }
+            auto* Assignment=FNiagaraStackGraphUtilities::AddParameterModuleToStack(Variables,*Output,Spawn?INDEX_NONE:0,Values);
+            if (!Assignment) return false;
+            for (int32 I=0;I<Variables.Num();++I) Link(Assignment,FNiagaraVariable(Variables[I].GetType(),FName(*(TEXT("Module.")+Variables[I].GetName().ToString()))),Users[I]);
+            Assignment->NodeComment=TEXT("Waterfall: independently controlled spray / mist particles");
+            if (Update)
+            {
+                auto* Solver=LoadObject<UNiagaraScript>(nullptr,TEXT("/Niagara/Modules/Solvers/SolveForcesAndVelocity.SolveForcesAndVelocity"));
+                if (!Solver || !FNiagaraStackGraphUtilities::AddScriptModuleToStack(Solver,*Output)) return false;
+            }
+        }
+    }
+    System->SetFixedBounds(FBox(FVector(-2000,-2000,-6000),FVector(2000,2000,2000)));
+    System->RequestCompile(true);System->WaitForCompilationComplete(true,false);
+    System->MarkPackageDirty();
+    return Renderers>0 && SpawnModules>0 && System->IsValid();
+#else
+    return false;
+#endif
+}
+
+int32 USceneEffectLibrary::GetLiveWaterfallParticleCount(UNiagaraComponent* Component)
+{
+    if (!IsInGameThread() || !Component) return 0;
+    auto Controller=Component->GetSystemInstanceController();
+    if (!Controller.IsValid()) return 0;
+    Controller->WaitForConcurrentTickAndFinalize();
+    auto* Instance=Controller->GetSystemInstance_Unsafe();
+    if (!Instance) return 0;
+    int32 Count=0;
+    for (auto& Emitter:Instance->GetEmitters()) Count+=Emitter->GetNumParticles();
+    return Count;
+}
 
