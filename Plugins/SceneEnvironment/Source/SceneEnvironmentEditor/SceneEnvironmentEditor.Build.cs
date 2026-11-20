@@ -4,6 +4,6 @@ public class SceneEnvironmentEditor : ModuleRules
     public SceneEnvironmentEditor(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-        PrivateDependencyModuleNames.AddRange(new[] { "Core", "CoreUObject", "Engine", "UnrealEd", "SceneEnvironment", "PropertyEditor", "Slate", "SlateCore" });
+        PrivateDependencyModuleNames.AddRange(new[] { "Core", "CoreUObject", "Engine", "UnrealEd", "SceneEnvironment", "PropertyEditor", "Slate", "SlateCore", "MeshDescription", "StaticMeshDescription", "RenderCore", "RHI", "AssetRegistry" });
     }
 }

@@ -35,7 +35,7 @@ void UCherryTreeGrowthComponent::ApplySizes()
     }
     if (LastLeaf!=LeafSize)
     {
-        for (auto Target:LeafTargets) if (UMeshComponent* C=Target.Get()) C->SetCustomPrimitiveDataFloat(31,LeafSize);
+        for (auto Target:LeafTargets) if (UMeshComponent* C=Target.Get()) C->SetCustomPrimitiveDataFloat(C->ComponentHasTag(TEXT("CherryGrowthMerged"))?30:31,LeafSize);
         LastLeaf=LeafSize;
     }
 }
