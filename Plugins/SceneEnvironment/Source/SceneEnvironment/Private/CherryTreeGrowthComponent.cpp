@@ -1,12 +1,13 @@
 #include "CherryTreeGrowthComponent.h"
 #include "Components/MeshComponent.h"
 #include "GameFramework/Actor.h"
+#include "UObject/UnrealType.h"
 
 UCherryTreeGrowthComponent::UCherryTreeGrowthComponent()
 {
-    PrimaryComponentTick.bCanEverTick=true;
+    PrimaryComponentTick.bCanEverTick=false;
 #if WITH_EDITOR
-    bTickInEditor=true;
+    bTickInEditor=false;
 #endif
 }
 void UCherryTreeGrowthComponent::OnRegister() { Super::OnRegister(); RefreshGrowthTargets(); }
@@ -40,9 +41,18 @@ void UCherryTreeGrowthComponent::ApplySizes()
 }
 void UCherryTreeGrowthComponent::SetFlowerSize(float Value) { FlowerSize=Value; ApplySizes(); }
 void UCherryTreeGrowthComponent::SetLeafSize(float Value) { LeafSize=Value; ApplySizes(); }
-void UCherryTreeGrowthComponent::TickComponent(float DeltaTime,ELevelTick TickType,FActorComponentTickFunction* TickFunction)
-{ Super::TickComponent(DeltaTime,TickType,TickFunction); ApplySizes(); }
 #if WITH_EDITOR
+static bool IsSizeEdit(const FProperty* P)
+{ return P && (P->GetFName()==TEXT("FlowerSize") || P->GetFName()==TEXT("LeafSize")); }
+void UCherryTreeGrowthComponent::PreEditChange(FProperty* Property)
+{
+    if (IsSizeEdit(Property)) UObject::PreEditChange(Property);
+    else Super::PreEditChange(Property);
+}
 void UCherryTreeGrowthComponent::PostEditChangeProperty(FPropertyChangedEvent& Event)
-{ Super::PostEditChangeProperty(Event); RefreshGrowthTargets(); }
+{
+    if (IsSizeEdit(Event.MemberProperty ? Event.MemberProperty : Event.Property))
+    { ApplySizes(); UObject::PostEditChangeProperty(Event); }
+    else Super::PostEditChangeProperty(Event);
+}
 #endif

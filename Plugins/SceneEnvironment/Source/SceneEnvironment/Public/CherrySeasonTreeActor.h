@@ -18,13 +18,14 @@ public:
     UFUNCTION(BlueprintCallable, Category="Tree Growth") void SetLeafSize(float Value);
     UFUNCTION(BlueprintCallable, CallInEditor, Category="Tree Growth") void RefreshTree();
     virtual void OnConstruction(const FTransform& Transform) override;
-    virtual void Tick(float DeltaSeconds) override;
+    virtual void PostRegisterAllComponents() override;
 #if WITH_EDITOR
-    virtual bool ShouldTickIfViewportsOnly() const override { return true; }
+    virtual void PostEditMove(bool bFinished) override;
     virtual void PreEditChange(FProperty* Property) override;
     virtual void PostEditChangeProperty(FPropertyChangedEvent& Event) override;
 #endif
 private:
     void ApplyControls();
     UPROPERTY() TObjectPtr<UCherryTreeGrowthComponent> GrowthDriver;
+    bool bInitialConstructionComplete=false;
 };

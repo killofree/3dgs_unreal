@@ -1,10 +1,21 @@
 #include "CherrySeasonTreeActor.h"
 #include "CherryTreeGrowthComponent.h"
 #include "UObject/UnrealType.h"
+#if WITH_EDITOR
+#include "AI/NavigationSystemBase.h"
+#include "EditorSupportDelegates.h"
+#include "Engine/Engine.h"
+#include "Engine/World.h"
+#include "Components/SceneComponent.h"
+#include "LevelUtils.h"
+#endif
 
 ACherrySeasonTreeActor::ACherrySeasonTreeActor()
 {
-    PrimaryActorTick.bCanEverTick=true;
+    PrimaryActorTick.bCanEverTick=false;
+#if WITH_EDITOR
+    bRunConstructionScriptOnDrag=false;
+#endif
     GrowthDriver=CreateDefaultSubobject<UCherryTreeGrowthComponent>(TEXT("GrowthDriver"));
 }
 void ACherrySeasonTreeActor::ApplyControls()
@@ -17,10 +28,39 @@ void ACherrySeasonTreeActor::SetLeafSize(float Value) { LeafSize=Value; ApplyCon
 void ACherrySeasonTreeActor::RefreshTree()
 { if (GrowthDriver) GrowthDriver->RefreshGrowthTargets(); ApplyControls(); }
 void ACherrySeasonTreeActor::OnConstruction(const FTransform& Transform)
-{ Super::OnConstruction(Transform); RefreshTree(); }
-void ACherrySeasonTreeActor::Tick(float DeltaSeconds)
-{ Super::Tick(DeltaSeconds); ApplyControls(); }
+{
+    Super::OnConstruction(Transform);
+    // SCS flower/leaf components exist only after construction completes.
+    // Cache them once here; PostRegisterAllComponents can occur earlier on spawn.
+    if (!bInitialConstructionComplete) { RefreshTree(); bInitialConstructionComplete=true; }
+}
+void ACherrySeasonTreeActor::PostRegisterAllComponents()
+{
+    Super::PostRegisterAllComponents();
+    // Initial load/spawn/explicit BP recompilation only; never polled per frame.
+    RefreshTree();
+}
 #if WITH_EDITOR
+void ACherrySeasonTreeActor::PostEditMove(bool bFinished)
+{
+    // The assembled tree has no construction-time placement to regenerate.
+    // Preserve editor notifications/culling/navigation without the base class
+    // unregistering and reconstructing every SCS instance component.
+    if (!FLevelUtils::IsMovingLevel() && GEngine) GEngine->BroadcastOnActorMoving(this);
+    if (bFinished)
+    {
+        if (UWorld* World=GetWorld())
+        {
+            World->UpdateCullDistanceVolumes(this);
+            World->bAreConstraintsDirty=true;
+        }
+        FEditorSupportDelegates::RefreshPropertyWindows.Broadcast();
+        if (GEngine) GEngine->BroadcastOnActorMoved(this);
+        FEditorSupportDelegates::UpdateUI.Broadcast();
+    }
+    if (RootComponent) RootComponent->PostEditComponentMove(bFinished);
+    if (bFinished) FNavigationSystem::OnPostEditActorMove(*this);
+}
 namespace
 {
 bool IsGrowthSizeProperty(const FProperty* Property)
@@ -53,6 +93,5 @@ void ACherrySeasonTreeActor::PostEditChangeProperty(FPropertyChangedEvent& Event
         return;
     }
     Super::PostEditChangeProperty(Event);
-    RefreshTree();
 }
 #endif

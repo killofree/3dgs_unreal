@@ -18,8 +18,9 @@ public:
     UFUNCTION(BlueprintCallable, Category="Tree Growth") void SetLeafSize(float Value);
     UFUNCTION(BlueprintCallable, CallInEditor, Category="Tree Growth") void RefreshGrowthTargets();
     virtual void OnRegister() override;
-    virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
+
 #if WITH_EDITOR
+    virtual void PreEditChange(FProperty* Property) override;
     virtual void PostEditChangeProperty(FPropertyChangedEvent& Event) override;
 #endif
 private:
